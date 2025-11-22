@@ -85,6 +85,14 @@ def create_spark_session():
         .config("spark.hadoop.fs.s3a.connection.establish.timeout", "60000")
         .config("spark.hadoop.fs.s3a.attempts.maximum", "10")
         .config("spark.hadoop.fs.s3a.connection.maximum", "100")
+        .config("spark.hadoop.fs.s3a.retry.limit", "10")
+        .config("spark.hadoop.fs.s3a.retry.interval", "500")
+        .config("spark.hadoop.fs.s3a.timeout.establish", "60000")
+        .config("spark.hadoop.fs.s3a.timeout.socket", "200000")
+        # Thread pool configuration (keepalivetime is the likely culprit for "60s" error)
+        .config("spark.hadoop.fs.s3a.threads.max", "50")
+        .config("spark.hadoop.fs.s3a.threads.keepalivetime", "60000")
+        .config("spark.hadoop.fs.s3a.max.total.tasks", "50")
         # Add PostgreSQL JDBC driver
         .config(
             "spark.jars.packages",
