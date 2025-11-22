@@ -56,3 +56,7 @@ spark-warehouse/
 # OS
 .DS_Store
 Thumbs.db
+
+# EMR Serverless - generated files with user-specific config
+run_emr_job.sh
+emr_config.txt

@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 from datetime import datetime
@@ -38,8 +39,51 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-# Load environment variables
-load_dotenv()
+
+def load_config():
+    """
+    Load configuration from either AWS Secrets Manager or .env file.
+
+    If SECRET_NAME environment variable is set, load from Secrets Manager.
+    Otherwise, fall back to .env file for local development.
+    """
+    secret_name = os.getenv("SECRET_NAME")
+
+    if secret_name:
+        # Load from AWS Secrets Manager (for EMR Serverless)
+        logger.info(f"Loading configuration from Secrets Manager: {secret_name}")
+        try:
+            import boto3
+            region = os.getenv("AWS_REGION", "us-east-1")
+            client = boto3.client("secretsmanager", region_name=region)
+            response = client.get_secret_value(SecretId=secret_name)
+            secret_string = response["SecretString"]
+
+            # Try to parse as JSON (structured secret)
+            try:
+                secrets = json.loads(secret_string)
+                # If JSON, set all key-value pairs as env vars
+                for key, value in secrets.items():
+                    os.environ[key] = str(value)
+                logger.success(f"Configuration loaded from Secrets Manager (JSON format)")
+            except json.JSONDecodeError:
+                # If not JSON, assume it's just the password
+                os.environ["POSTGRES_PASSWORD"] = secret_string
+                logger.success(f"Password loaded from Secrets Manager (plaintext format)")
+
+                # Also load .env for other configs
+                load_dotenv()
+
+        except Exception as e:
+            logger.error(f"Failed to load secrets from Secrets Manager: {e}")
+            raise
+    else:
+        # Load from .env file (for local development)
+        load_dotenv()
+
+
+# Load configuration
+load_config()
 
 # Configuration from environment
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
