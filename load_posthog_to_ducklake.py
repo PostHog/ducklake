@@ -93,6 +93,10 @@ def create_spark_session():
         .config("spark.hadoop.fs.s3a.threads.max", "50")
         .config("spark.hadoop.fs.s3a.threads.keepalivetime", "60000")
         .config("spark.hadoop.fs.s3a.max.total.tasks", "50")
+        # Multipart upload configuration (purge.age defaults to "24h" string)
+        .config("spark.hadoop.fs.s3a.multipart.size", "104857600")  # 100MB
+        .config("spark.hadoop.fs.s3a.multipart.threshold", "104857600")
+        .config("spark.hadoop.fs.s3a.multipart.purge.age", "86400000")  # 24h in ms
         # Add PostgreSQL JDBC driver
         .config(
             "spark.jars.packages",
