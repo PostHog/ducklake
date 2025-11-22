@@ -253,6 +253,256 @@ For better S3 performance, consider:
 - Configuring S3A settings for faster reads
 - Using AWS IAM roles instead of access keys
 
+## Running at Scale
+
+For petabyte-scale data loading, running on a single machine is not practical. Use AWS managed Spark services for production workloads.
+
+### Option 1: EMR (Recommended for Cost & Performance)
+
+**Best for**: Large-scale loads (100GB+), cost optimization, full Spark control
+
+**Pros:**
+- Most cost-effective (60-80% cheaper with spot instances)
+- Full control over Spark configuration
+- Best S3 performance in same region
+- Handles very long-running jobs
+- Dynamic cluster scaling
+
+**Example - Create EMR Cluster:**
+
+```bash
+aws emr create-cluster \
+  --name "PostHog-DuckLake-Loader" \
+  --release-label emr-7.0.0 \
+  --applications Name=Spark \
+  --instance-groups \
+    InstanceGroupType=MASTER,InstanceType=m5.xlarge,InstanceCount=1 \
+    InstanceGroupType=CORE,InstanceType=r5.4xlarge,InstanceCount=20,BidPrice=OnDemandPrice \
+  --ec2-attributes KeyName=mykey,SubnetId=subnet-xxx \
+  --use-default-roles \
+  --log-uri s3://my-bucket/emr-logs/ \
+  --bootstrap-actions Path=s3://my-bucket/bootstrap.sh
+```
+
+**Submit Job to EMR:**
+
+```bash
+# Load specific team and month
+aws emr add-steps \
+  --cluster-id j-xxxxx \
+  --steps Type=Spark,Name="Load Team 2 - May 2025",ActionOnFailure=CONTINUE,Args=[
+    --deploy-mode,cluster,
+    --conf,spark.driver.memory=16g,
+    --conf,spark.executor.memory=32g,
+    --conf,spark.executor.cores=8,
+    s3://my-bucket/load_posthog_to_ducklake.py,
+    --team-id,2,
+    --year,2025,
+    --month,5
+  ]
+```
+
+**Cost Estimate (EMR):**
+- Master: 1x m5.2xlarge on-demand: ~$0.38/hr
+- Workers: 20x r5.4xlarge spot (70% discount): ~$2-3/hr total
+- **Total: ~$3-4/hour** for a cluster that can process TBs/hour
+
+### Option 2: EMR Serverless (Easiest)
+
+**Best for**: Intermittent loads, no cluster management
+
+**Pros:**
+- Fully serverless - no cluster management
+- Auto-scales based on workload
+- Standard Spark (not Glue's fork)
+- Pay only for what you use
+
+**Cons:**
+- Slightly more expensive than EMR clusters
+- Cold start time (~1-2 minutes)
+
+**Example:**
+
+```bash
+# Create application (one time)
+aws emr-serverless create-application \
+  --name posthog-ducklake-loader \
+  --type SPARK \
+  --release-label emr-7.0.0
+
+# Submit job
+aws emr-serverless start-job-run \
+  --application-id app-xxxxx \
+  --execution-role-arn arn:aws:iam::xxx:role/EMRServerlessRole \
+  --job-driver '{
+    "sparkSubmit": {
+      "entryPoint": "s3://my-bucket/load_posthog_to_ducklake.py",
+      "entryPointArguments": ["--team-id", "2", "--year", "2025", "--month", "5"],
+      "sparkSubmitParameters": "--conf spark.executor.memory=32g --conf spark.executor.cores=8"
+    }
+  }' \
+  --configuration-overrides '{
+    "monitoringConfiguration": {
+      "s3MonitoringConfiguration": {
+        "logUri": "s3://my-bucket/emr-serverless-logs/"
+      }
+    }
+  }'
+```
+
+### Option 3: AWS Glue
+
+**Best for**: Small-to-medium loads (<10TB), AWS Glue ecosystem integration
+
+**Pros:**
+- Fully managed
+- Integrated with Glue Data Catalog
+- Simple setup
+
+**Cons:**
+- More expensive at scale
+- Uses modified Spark (some configs may not work)
+- Less control over Spark tuning
+
+### Parallel Loading Strategy
+
+For maximum throughput, load data in parallel by team and date partitions:
+
+**Shell Script Approach:**
+
+```bash
+#!/bin/bash
+# load_parallel.sh - Load multiple partitions in parallel
+
+TEAMS=(2 5 10 42)
+YEAR=2025
+
+for team_id in "${TEAMS[@]}"; do
+  for month in {1..12}; do
+    # Submit each job to EMR (they'll run in parallel)
+    aws emr add-steps \
+      --cluster-id j-xxxxx \
+      --steps Type=Spark,Name="Load Team $team_id - $YEAR-$month",ActionOnFailure=CONTINUE,Args=[
+        s3://bucket/load_posthog_to_ducklake.py,
+        --team-id,$team_id,
+        --year,$YEAR,
+        --month,$month
+      ]
+  done
+done
+```
+
+**Python Approach (Local Orchestration):**
+
+```python
+# run_parallel_loads.py
+import subprocess
+import concurrent.futures
+from datetime import datetime
+
+TEAMS = [2, 5, 10, 42]  # Your team IDs
+YEAR = 2025
+MONTHS = range(1, 13)
+
+def load_team_month(team_id, year, month):
+    """Load data for a specific team and month."""
+    cmd = [
+        "uv", "run", "python", "load_posthog_to_ducklake.py",
+        "--team-id", str(team_id),
+        "--year", str(year),
+        "--month", str(month)
+    ]
+
+    print(f"Starting: Team {team_id}, {year}-{month:02d}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print(f"✓ Completed: Team {team_id}, {year}-{month:02d}")
+    else:
+        print(f"✗ Failed: Team {team_id}, {year}-{month:02d}")
+        print(result.stderr)
+
+    return (team_id, year, month, result.returncode)
+
+# Run in parallel (adjust max_workers based on cluster size)
+with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    futures = []
+    for team_id in TEAMS:
+        for month in MONTHS:
+            future = executor.submit(load_team_month, team_id, YEAR, month)
+            futures.append(future)
+
+    # Wait for all to complete
+    results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+# Summary
+failed = [r for r in results if r[3] != 0]
+print(f"\n{'='*50}")
+print(f"Total: {len(results)}, Succeeded: {len(results)-len(failed)}, Failed: {len(failed)}")
+```
+
+### Cost Comparison (1 PB of data)
+
+| Service | Configuration | Estimated Cost | Duration |
+|---------|--------------|----------------|----------|
+| **EMR Spot** | 1 master + 20 workers (spot) | $500-1,000 | 10-20 hrs |
+| **EMR On-Demand** | 1 master + 20 workers | $2,000-3,000 | 10-20 hrs |
+| **EMR Serverless** | Auto-scaled | $1,500-2,500 | 10-20 hrs |
+| **AWS Glue** | DPU-based pricing | $3,000-5,000 | 15-30 hrs |
+
+*Estimates vary based on data characteristics, cluster configuration, and region*
+
+### Production Best Practices
+
+1. **Incremental Loading**: Load by team_id and date partitions to handle failures gracefully
+2. **Idempotency**: Use DuckLake's upsert capabilities or load to staging tables first
+3. **Monitoring**: Enable CloudWatch metrics and S3/Spark logs
+4. **Spot Instances**: Use spot instances for EMR workers (60-80% cost savings)
+5. **Same Region**: Run EMR in the same AWS region as your S3 bucket
+6. **Checkpointing**: For very large loads, consider Spark checkpointing to recover from failures
+
+### Scheduling with Airflow/Step Functions
+
+**Airflow DAG Example:**
+
+```python
+from airflow import DAG
+from airflow.providers.amazon.aws.operators.emr import EmrAddStepsOperator
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'data-team',
+    'depends_on_past': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5)
+}
+
+with DAG('posthog_ducklake_daily',
+         default_args=default_args,
+         schedule_interval='@daily',
+         start_date=datetime(2025, 1, 1)) as dag:
+
+    load_step = EmrAddStepsOperator(
+        task_id='load_posthog_data',
+        job_flow_id='j-xxxxx',  # Your EMR cluster ID
+        steps=[{
+            'Name': 'Load PostHog to DuckLake',
+            'ActionOnFailure': 'CONTINUE',
+            'HadoopJarStep': {
+                'Jar': 'command-runner.jar',
+                'Args': [
+                    'spark-submit',
+                    's3://bucket/load_posthog_to_ducklake.py',
+                    '--team-id', '{{ var.value.team_id }}',
+                    '--year', '{{ ds_nodash[:4] }}',
+                    '--month', '{{ ds_nodash[4:6] }}',
+                    '--day', '{{ ds_nodash[6:8] }}'
+                ]
+            }
+        }]
+    )
+```
+
 ## Troubleshooting
 
 ### Out of Memory Errors
