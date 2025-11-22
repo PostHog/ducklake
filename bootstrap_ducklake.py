@@ -81,8 +81,19 @@ def setup_ducklake_catalog():
 
     try:
         # Connect to DuckDB with DuckLake catalog
-        logger.info("Connecting to DuckLake catalog")
+        logger.info("Connecting to DuckDB")
         con = duckdb.connect()
+
+        # Install and load required extensions
+        logger.info("Installing PostgreSQL extension")
+        con.execute("INSTALL postgres")
+        logger.info("Loading PostgreSQL extension")
+        con.execute("LOAD postgres")
+
+        logger.info("Installing DuckLake extension")
+        con.execute("INSTALL ducklake")
+        logger.info("Loading DuckLake extension")
+        con.execute("LOAD ducklake")
 
         # Attach DuckLake catalog
         logger.info(f"Attaching DuckLake catalog with PostgreSQL at {POSTGRES_HOST}")
