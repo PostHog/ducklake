@@ -144,7 +144,7 @@ def build_s3_path(team_id=None, year=None, month=None, day=None, hour=None):
     elif team_id:
         s3_path += "/*/*/*/*/*.log.zst"
     else:
-        s3_path += "*/*/*/*/*/*.log.zst"
+        s3_path += "/*/*/*/*/*/*.log.zst"
 
     return s3_path
 
