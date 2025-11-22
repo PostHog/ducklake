@@ -26,15 +26,15 @@ from loguru import logger
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
+    current_timestamp,
     from_json,
     to_timestamp,
-    current_timestamp,
 )
 from pyspark.sql.types import (
-    StructType,
-    StructField,
-    StringType,
     IntegerType,
+    StringType,
+    StructField,
+    StructType,
     TimestampType,
 )
 
@@ -76,8 +76,15 @@ def create_spark_session():
         .config("spark.executor.cores", SPARK_EXECUTOR_CORES)
         # S3 configuration
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .config("spark.hadoop.fs.s3a.aws.credentials.provider",
-                "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
+        .config(
+            "spark.hadoop.fs.s3a.aws.credentials.provider",
+            "com.amazonaws.auth.DefaultAWSCredentialsProviderChain",
+        )
+        # S3A timeout configurations (in milliseconds, not with 's' suffix)
+        .config("spark.hadoop.fs.s3a.connection.timeout", "200000")
+        .config("spark.hadoop.fs.s3a.connection.establish.timeout", "60000")
+        .config("spark.hadoop.fs.s3a.attempts.maximum", "10")
+        .config("spark.hadoop.fs.s3a.connection.maximum", "100")
         # Add PostgreSQL JDBC driver
         .config(
             "spark.jars.packages",
@@ -248,7 +255,9 @@ def main():
     parser.add_argument("--month", type=int, help="Filter by month (1-12)")
     parser.add_argument("--day", type=int, help="Filter by day (1-31)")
     parser.add_argument("--hour", type=int, help="Filter by hour (0-23)")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be loaded without loading")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be loaded without loading"
+    )
 
     args = parser.parse_args()
 
