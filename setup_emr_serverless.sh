@@ -20,7 +20,6 @@ fi
 # Configuration
 REGION="${AWS_REGION:-us-east-1}"
 APP_NAME="posthog-ducklake-loader"
-IAM_ROLE_NAME="EMRServerlessDuckLakeRole"
 
 # Prompt for S3 bucket if not in .env
 if [ -z "$S3_BUCKET" ] || [ "$S3_BUCKET" = "sick-bucket-of-data" ]; then
@@ -69,79 +68,17 @@ aws s3 cp load_posthog_to_ducklake.py "s3://${S3_BUCKET}/${SCRIPT_PATH}" --regio
 echo "✓ Script uploaded"
 echo ""
 
-# Setup IAM role
-echo "Step 2: Setting up IAM role..."
-if aws iam get-role --role-name "$IAM_ROLE_NAME" &> /dev/null; then
-    echo "✓ IAM role $IAM_ROLE_NAME already exists"
-    ROLE_ARN=$(aws iam get-role --role-name "$IAM_ROLE_NAME" --query 'Role.Arn' --output text)
+# Get IAM role ARN
+echo "Step 2: IAM Role Configuration..."
+if [ -z "$EMR_ROLE_ARN" ]; then
+    echo "Enter your EMR Serverless IAM role ARN (managed via Terraform):"
+    echo "Example: arn:aws:iam::123456789012:role/EMRServerlessDuckLakeRole"
+    read -r ROLE_ARN
 else
-    echo "Creating IAM role..."
-
-    # Trust policy
-    cat > /tmp/trust-policy.json <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {"Service": "emr-serverless.amazonaws.com"},
-    "Action": "sts:AssumeRole"
-  }]
-}
-EOF
-
-    ROLE_ARN=$(aws iam create-role \
-        --role-name "$IAM_ROLE_NAME" \
-        --assume-role-policy-document file:///tmp/trust-policy.json \
-        --query 'Role.Arn' \
-        --output text)
-
-    # Get AWS account ID for policy
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-    # Permissions policy
-    cat > /tmp/role-policy.json <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::posthog-clickhouse-*/*",
-        "arn:aws:s3:::posthog-clickhouse-*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::${S3_BUCKET}/*",
-        "arn:aws:s3:::${S3_BUCKET}"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["secretsmanager:GetSecretValue"],
-      "Resource": "arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:${SECRET_NAME}*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-      "Resource": "arn:aws:logs:*:*:*"
-    }
-  ]
-}
-EOF
-
-    aws iam put-role-policy \
-        --role-name "$IAM_ROLE_NAME" \
-        --policy-name "EMRServerlessDuckLakePolicy" \
-        --policy-document file:///tmp/role-policy.json
-
-    echo "✓ Created IAM role: $ROLE_ARN"
-    echo "  Waiting for IAM propagation..."
-    sleep 10
+    echo "Using IAM role from .env: $EMR_ROLE_ARN"
+    ROLE_ARN="$EMR_ROLE_ARN"
 fi
+echo "✓ Using IAM role: $ROLE_ARN"
 echo ""
 
 # Verify Secrets Manager secret exists

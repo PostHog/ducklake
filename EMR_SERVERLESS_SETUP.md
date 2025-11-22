@@ -7,11 +7,51 @@ This setup uses AWS Secrets Manager to securely store credentials. The Spark job
 ## Prerequisites
 
 1. AWS CLI configured with credentials
-2. Permissions to create IAM roles, Secrets Manager secrets, and EMR Serverless applications
+2. Terraform (for IAM role management)
 3. S3 bucket for scripts and logs
 4. PostgreSQL database for DuckLake metadata
+5. Secrets Manager secret containing PostgreSQL password
 
 ## Setup Steps
+
+### 0. Create IAM Role with Terraform
+
+The IAM role is managed via Terraform for better infrastructure-as-code practices.
+
+1. **Copy the Terraform variables file:**
+
+```bash
+cp terraform.tfvars.example terraform.tfvars
+```
+
+2. **Edit `terraform.tfvars` with your values:**
+
+```hcl
+aws_region                  = "us-east-1"
+secrets_manager_secret_name = "ducklake-prod-rds-password"
+warehouse_s3_bucket         = "my-warehouse-bucket"
+```
+
+3. **Apply the Terraform configuration:**
+
+```bash
+terraform init
+terraform plan
+terraform apply
+```
+
+4. **Get the role ARN from Terraform output:**
+
+```bash
+terraform output emr_role_arn
+# Output: arn:aws:iam::123456789012:role/EMRServerlessDuckLakeRole
+```
+
+5. **Add the role ARN to your `.env` file:**
+
+```bash
+echo "EMR_ROLE_ARN=arn:aws:iam::123456789012:role/EMRServerlessDuckLakeRole" >> .env
+```
 
 ### 1. Run the Setup Script
 
@@ -20,10 +60,9 @@ This setup uses AWS Secrets Manager to securely store credentials. The Spark job
 ```
 
 This script will:
-- Prompt for your S3 bucket name (where scripts and logs will be stored)
-- Prompt for your Secrets Manager secret name (for PostgreSQL password)
+- Load configuration from `.env` (S3_BUCKET, SECRET_NAME, EMR_ROLE_ARN)
+- Prompt for any missing values
 - Upload `load_posthog_to_ducklake.py` to S3
-- Create an IAM role with necessary permissions
 - Verify your Secrets Manager secret exists
 - Create an EMR Serverless application
 - Generate a `run_emr_job.sh` helper script
@@ -152,25 +191,37 @@ aws emr-serverless get-application --application-id $APP_ID --region us-east-1
 
 ## Cleanup (Delete Everything)
 
+### Delete EMR Serverless Application
+
 ```bash
 # Get APP_ID from emr_config.txt or environment
 APP_ID="your-app-id"
 
 # Delete application
 aws emr-serverless delete-application --application-id $APP_ID --region us-east-1
+```
 
-# Delete secret (optional - only if you created it for this purpose)
-# aws secretsmanager delete-secret --secret-id YOUR_SECRET_NAME --force-delete-without-recovery --region us-east-1
+### Delete IAM Role (via Terraform)
 
-# Delete IAM role (first remove inline policies)
-aws iam delete-role-policy --role-name EMRServerlessDuckLakeRole --policy-name EMRServerlessDuckLakePolicy
-aws iam delete-role --role-name EMRServerlessDuckLakeRole
+```bash
+terraform destroy
+```
 
-# Clean up S3 (optional - removes logs and scripts)
+Or manually delete specific resources:
+
+```bash
+terraform destroy -target=aws_iam_role.emr_serverless_ducklake
+```
+
+### Clean Up S3 (Optional)
+
+```bash
 S3_BUCKET="your-bucket"
 aws s3 rm s3://$S3_BUCKET/ducklake_logs/ --recursive
 aws s3 rm s3://$S3_BUCKET/ducklake_scripts/ --recursive
 ```
+
+**Note:** The Secrets Manager secret is not deleted as it may be used elsewhere.
 
 ## Parallel Loading
 

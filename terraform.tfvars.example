@@ -1,0 +1,16 @@
+# Example Terraform variables for EMR Serverless IAM role
+# Copy this to terraform.tfvars and update with your values
+
+aws_region = "us-east-1"
+
+# Your Secrets Manager secret name
+secrets_manager_secret_name = "ducklake-prod-rds-password"
+
+# Your S3 bucket for scripts and logs
+warehouse_s3_bucket = "my-warehouse-bucket"
+
+# PostHog S3 bucket pattern (default works for most cases)
+# posthog_s3_bucket_pattern = "posthog-clickhouse-*"
+
+# IAM role name (optional, defaults to EMRServerlessDuckLakeRole)
+# role_name = "EMRServerlessDuckLakeRole"
