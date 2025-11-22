@@ -34,10 +34,10 @@ if not POSTGRES_PASSWORD:
     logger.error("POSTGRES_PASSWORD environment variable is required")
     sys.exit(1)
 
-# PostgreSQL connection string for DuckLake
-POSTGRES_CONN = (
-    f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@"
-    f"{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+# DuckLake connection string (uses ducklake:postgres: prefix)
+DUCKLAKE_CONN = (
+    f"ducklake:postgres:dbname={POSTGRES_DB} user={POSTGRES_USER} "
+    f"password={POSTGRES_PASSWORD} host={POSTGRES_HOST} port={POSTGRES_PORT}"
 )
 
 # PostHog events table schema
@@ -99,7 +99,7 @@ def setup_ducklake_catalog():
         logger.info(f"Attaching DuckLake catalog with PostgreSQL at {POSTGRES_HOST}")
         con.execute(
             f"""
-            ATTACH '{POSTGRES_CONN}' AS ducklake (TYPE ducklake, DATA_PATH '{DUCKLAKE_DATA_PATH}')
+            ATTACH '{DUCKLAKE_CONN}' AS ducklake (DATA_PATH '{DUCKLAKE_DATA_PATH}')
             """
         )
 
