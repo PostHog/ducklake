@@ -115,9 +115,14 @@ def build_s3_path(team_id=None, year=None, month=None, day=None, hour=None):
     """
     Build S3 path based on partition parameters.
 
-    Path format: s3a://bucket/prefix/{team_id}/{year}/{month}/{day}/{hour}/*.log.zst
+    Returns (path, use_recursive) tuple.
+    Path format: s3a://bucket/prefix/{team_id}/{year}/{month}/{day}/{hour}/
+
+    For broad queries (no team_id or only team_id), use directory path + recursive lookup.
+    For specific queries (month/day/hour), use wildcard patterns.
     """
     path_parts = [f"s3a://{S3_BUCKET}", S3_PREFIX.rstrip("/")]
+    use_recursive = False
 
     if team_id:
         path_parts.append(str(team_id))
@@ -132,24 +137,25 @@ def build_s3_path(team_id=None, year=None, month=None, day=None, hour=None):
 
     s3_path = "/".join(path_parts)
 
-    # Add wildcard pattern for files
+    # For specific hour/day, use wildcard patterns
+    # For broader queries, use directory + recursive lookup
     if hour:
         s3_path += "/*.log.zst"
     elif day:
         s3_path += "/*/*.log.zst"
     elif month:
         s3_path += "/*/*/*.log.zst"
-    elif year:
-        s3_path += "/*/*/*/*.log.zst"
-    elif team_id:
-        s3_path += "/*/*/*/*/*.log.zst"
     else:
-        s3_path += "/*/*/*/*/*/*.log.zst"
+        # For year, team_id only, or no filters: use recursive lookup
+        use_recursive = True
+        # Just use the directory path, no wildcards
+        if not s3_path.endswith("/"):
+            s3_path += "/"
 
-    return s3_path
+    return s3_path, use_recursive
 
 
-def load_data_from_s3(spark, s3_path, dry_run=False):
+def load_data_from_s3(spark, s3_path, use_recursive=False, dry_run=False):
     """
     Load PostHog event data from S3.
 
@@ -159,11 +165,22 @@ def load_data_from_s3(spark, s3_path, dry_run=False):
 
     if dry_run:
         logger.info("DRY RUN: Would load data from the above path")
+        if use_recursive:
+            logger.info("DRY RUN: Using recursive file lookup for .log.zst files")
         return None
 
     try:
         # Read JSON files (Spark automatically handles .zst compression)
-        df = spark.read.json(s3_path)
+        if use_recursive:
+            # For broad queries, use recursive lookup with path glob filter
+            df = (
+                spark.read.option("recursiveFileLookup", "true")
+                .option("pathGlobFilter", "*.log.zst")
+                .json(s3_path)
+            )
+        else:
+            # For specific paths with wildcards
+            df = spark.read.json(s3_path)
 
         row_count = df.count()
         logger.info(f"Loaded {row_count:,} events from S3")
@@ -277,7 +294,7 @@ def main():
     logger.info("=" * 50)
 
     # Build S3 path
-    s3_path = build_s3_path(
+    s3_path, use_recursive = build_s3_path(
         team_id=args.team_id,
         year=args.year,
         month=args.month,
@@ -290,7 +307,7 @@ def main():
 
     try:
         # Load data from S3
-        df = load_data_from_s3(spark, s3_path, dry_run=args.dry_run)
+        df = load_data_from_s3(spark, s3_path, use_recursive=use_recursive, dry_run=args.dry_run)
 
         if df is not None:
             # Transform data
