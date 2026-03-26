@@ -1,6 +1,19 @@
 # name: test/sql/transaction/transaction_retry_stale_changes.test
 # description: Test that commit retries recompute transaction_changes to avoid false conflicts from stale committed IDs
 # group: [transaction]
+#
+# Bug: GetTransactionChanges() was computed once before the retry loop in FlushChanges().
+# CommitChanges (GetNewTableInfo) and WriteSnapshotChanges (AddTableChanges) mutate
+# transaction_changes by adding committed IDs derived from next_catalog_id.
+# When the first commit attempt fails (duplicate snapshot_id), these stale IDs
+# persist. On retry, CheckForConflicts compares them against the other transaction's
+# changes — and since both derived IDs from the same next_catalog_id counter, the
+# IDs collide, producing false conflicts on completely unrelated tables.
+#
+# To trigger the bug deterministically, both transactions must create NEW tables
+# (so they derive committed IDs from next_catalog_id), and one must ALTER its
+# new table (populating altered_tables). The other transaction's stale
+# tables_inserted_into then collides with altered_tables on retry.
 
 require ducklake
 
@@ -16,24 +29,23 @@ ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/du
 statement ok
 SET immediate_transaction_mode=true
 
-# create two separate tables
-statement ok
-CREATE TABLE ducklake.t1(i INTEGER);
-
-statement ok
-CREATE TABLE ducklake.t2(j INTEGER);
-
-statement ok
-INSERT INTO ducklake.t1 VALUES (1);
-
-statement ok
-INSERT INTO ducklake.t2 VALUES (10);
-
-# Scenario: concurrent insert to t1 + alter on t2
-# Both start from the same snapshot. First committer wins; second must retry.
-# Bug: if transaction_changes is not recomputed on retry, the stale committed
-# table IDs from the first attempt can collide with the other transaction's IDs,
-# causing a false "insert into table while another transaction altered it" conflict.
+# ---------------------------------------------------------------------------
+# Scenario 1: CTAS + ALTER vs CTAS on different tables
+#
+# con1: CREATE TABLE alpha AS ... + ALTER TABLE alpha ADD COLUMN
+# con2: CREATE TABLE beta AS ...
+#
+# Both start from the same snapshot (same next_catalog_id). con1 commits first.
+# con2's first attempt fails (snapshot_id collision), retries.
+#
+# Without fix: con2's stale tables_inserted_into has committed ID N (for beta).
+# con1's changes_made has altered_table:N (for alpha, same ID from same counter).
+# CheckForConflicts: {N} ∩ altered_tables {N} → false conflict!
+#
+# With fix: GetTransactionChanges() recomputed — transaction-local beta is
+# skipped, tables_inserted_into is empty. No collision. Retry assigns a new
+# committed ID from the updated next_catalog_id.
+# ---------------------------------------------------------------------------
 statement ok con1
 BEGIN
 
@@ -41,30 +53,72 @@ statement ok con2
 BEGIN
 
 statement ok con1
-INSERT INTO ducklake.t1 VALUES (2);
+CREATE TABLE ducklake.alpha AS SELECT 1 AS x
+
+statement ok con1
+ALTER TABLE ducklake.alpha ADD COLUMN z INTEGER
 
 statement ok con2
-ALTER TABLE ducklake.t2 ADD COLUMN k INTEGER
+CREATE TABLE ducklake.beta AS SELECT 10 AS y
 
 statement ok con1
 COMMIT
 
-# This commit should succeed after retry — no conflict between different tables
+statement ok con2
+COMMIT
+
+query II
+SELECT x, z FROM ducklake.alpha ORDER BY x
+----
+1	NULL
+
+query I
+SELECT y FROM ducklake.beta ORDER BY y
+----
+10
+
+# ---------------------------------------------------------------------------
+# Scenario 2: reversed — CTAS vs CTAS + COMMENT ON different tables
+#
+# COMMENT ON TABLE also populates altered_tables, exercising the same
+# collision path with a different ALTER type.
+# ---------------------------------------------------------------------------
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+CREATE TABLE ducklake.gamma AS SELECT 100 AS a
+
+statement ok con2
+CREATE TABLE ducklake.delta AS SELECT 200 AS b
+
+statement ok con2
+COMMENT ON TABLE ducklake.delta IS 'test comment'
+
+statement ok con1
+COMMIT
+
 statement ok con2
 COMMIT
 
 query I
-SELECT i FROM ducklake.t1 ORDER BY i
+SELECT a FROM ducklake.gamma ORDER BY a
 ----
-1
-2
+100
 
-query II
-SELECT j, k FROM ducklake.t2 ORDER BY j
+query I
+SELECT b FROM ducklake.delta ORDER BY b
 ----
-10	NULL
+200
 
-# Same scenario reversed: alter first, insert second
+# ---------------------------------------------------------------------------
+# Scenario 3: CTAS + RENAME COLUMN vs CTAS
+#
+# RENAME COLUMN is another ALTER type tracked in altered_tables.
+# ---------------------------------------------------------------------------
 statement ok con1
 BEGIN
 
@@ -72,10 +126,13 @@ statement ok con2
 BEGIN
 
 statement ok con1
-ALTER TABLE ducklake.t1 ADD COLUMN m INTEGER
+CREATE TABLE ducklake.epsilon AS SELECT 'hello' AS old_name
+
+statement ok con1
+ALTER TABLE ducklake.epsilon RENAME COLUMN old_name TO new_name
 
 statement ok con2
-INSERT INTO ducklake.t2 VALUES (20, 200);
+CREATE TABLE ducklake.zeta AS SELECT 42 AS val
 
 statement ok con1
 COMMIT
@@ -83,40 +140,12 @@ COMMIT
 statement ok con2
 COMMIT
 
-query II
-SELECT i, m FROM ducklake.t1 ORDER BY i
+query I
+SELECT new_name FROM ducklake.epsilon
 ----
-1	NULL
-2	NULL
+hello
 
-query II
-SELECT j, k FROM ducklake.t2 ORDER BY j
+query I
+SELECT val FROM ducklake.zeta
 ----
-10	NULL
-20	200
-
-# Concurrent COMMENT ON different tables should not conflict with inserts
-statement ok con1
-BEGIN
-
-statement ok con2
-BEGIN
-
-statement ok con1
-INSERT INTO ducklake.t1 VALUES (3, 300);
-
-statement ok con2
-COMMENT ON TABLE ducklake.t2 IS 'test comment'
-
-statement ok con1
-COMMIT
-
-statement ok con2
-COMMIT
-
-query II
-SELECT i, m FROM ducklake.t1 ORDER BY i
-----
-1	NULL
-2	NULL
-3	300
+42
