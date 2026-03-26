@@ -78,10 +78,12 @@ SELECT y FROM ducklake.beta ORDER BY y
 10
 
 # ---------------------------------------------------------------------------
-# Scenario 2: reversed — CTAS vs CTAS + COMMENT ON different tables
+# Scenario 2: CTAS + COMMENT ON vs CTAS on different tables
 #
 # COMMENT ON TABLE also populates altered_tables, exercising the same
-# collision path with a different ALTER type.
+# collision path with a different ALTER type. The COMMENT must be on
+# con1 (first committer) so its altered_tables collides with con2's
+# stale tables_inserted_into on retry.
 # ---------------------------------------------------------------------------
 statement ok con1
 BEGIN
@@ -92,11 +94,11 @@ BEGIN
 statement ok con1
 CREATE TABLE ducklake.gamma AS SELECT 100 AS a
 
-statement ok con2
-CREATE TABLE ducklake.delta AS SELECT 200 AS b
+statement ok con1
+COMMENT ON TABLE ducklake.gamma IS 'test comment'
 
 statement ok con2
-COMMENT ON TABLE ducklake.delta IS 'test comment'
+CREATE TABLE ducklake.delta AS SELECT 200 AS b
 
 statement ok con1
 COMMIT
