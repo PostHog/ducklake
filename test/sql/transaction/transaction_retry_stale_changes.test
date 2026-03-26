@@ -1,0 +1,122 @@
+# name: test/sql/transaction/transaction_retry_stale_changes.test
+# description: Test that commit retries recompute transaction_changes to avoid false conflicts from stale committed IDs
+# group: [transaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_retry_stale_changes_files')
+
+statement ok
+SET immediate_transaction_mode=true
+
+# create two separate tables
+statement ok
+CREATE TABLE ducklake.t1(i INTEGER);
+
+statement ok
+CREATE TABLE ducklake.t2(j INTEGER);
+
+statement ok
+INSERT INTO ducklake.t1 VALUES (1);
+
+statement ok
+INSERT INTO ducklake.t2 VALUES (10);
+
+# Scenario: concurrent insert to t1 + alter on t2
+# Both start from the same snapshot. First committer wins; second must retry.
+# Bug: if transaction_changes is not recomputed on retry, the stale committed
+# table IDs from the first attempt can collide with the other transaction's IDs,
+# causing a false "insert into table while another transaction altered it" conflict.
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+INSERT INTO ducklake.t1 VALUES (2);
+
+statement ok con2
+ALTER TABLE ducklake.t2 ADD COLUMN k INTEGER
+
+statement ok con1
+COMMIT
+
+# This commit should succeed after retry — no conflict between different tables
+statement ok con2
+COMMIT
+
+query I
+SELECT i FROM ducklake.t1 ORDER BY i
+----
+1
+2
+
+query II
+SELECT j, k FROM ducklake.t2 ORDER BY j
+----
+10	NULL
+
+# Same scenario reversed: alter first, insert second
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+ALTER TABLE ducklake.t1 ADD COLUMN m INTEGER
+
+statement ok con2
+INSERT INTO ducklake.t2 VALUES (20, 200);
+
+statement ok con1
+COMMIT
+
+statement ok con2
+COMMIT
+
+query II
+SELECT i, m FROM ducklake.t1 ORDER BY i
+----
+1	NULL
+2	NULL
+
+query II
+SELECT j, k FROM ducklake.t2 ORDER BY j
+----
+10	NULL
+20	200
+
+# Concurrent COMMENT ON different tables should not conflict with inserts
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+INSERT INTO ducklake.t1 VALUES (3, 300);
+
+statement ok con2
+COMMENT ON TABLE ducklake.t2 IS 'test comment'
+
+statement ok con1
+COMMIT
+
+statement ok con2
+COMMIT
+
+query II
+SELECT i, m FROM ducklake.t1 ORDER BY i
+----
+1	NULL
+2	NULL
+3	300

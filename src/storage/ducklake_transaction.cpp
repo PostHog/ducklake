@@ -2441,11 +2441,14 @@ void DuckLakeTransaction::FlushChanges() {
 	}
 
 	auto transaction_snapshot = GetSnapshot();
-	auto transaction_changes = GetTransactionChanges();
 	SnapshotAndStats commit_stats_snapshot;
 	auto &commit_snapshot = commit_stats_snapshot.snapshot;
 	optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats;
 	for (idx_t i = 0; i < max_retry_count + 1; i++) {
+		// recompute each iteration - CommitChanges/WriteSnapshotChanges mutate
+		// transaction_changes by adding committed (remapped) table IDs, causing
+		// false conflicts on retry when stale IDs match another transaction's changes
+		auto transaction_changes = GetTransactionChanges();
 		bool can_retry;
 		try {
 			can_retry = false;
