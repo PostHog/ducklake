@@ -513,6 +513,13 @@ WHERE {SNAPSHOT_ID} >= begin_snapshot
 	return 0;
 }
 
+bool DuckLakeMetadataManager::InlinedDeletionTableExists(TableIndex, DuckLakeSnapshot snapshot,
+                                                         const string &table_name) {
+	auto query = StringUtil::Format("SELECT NULL FROM {METADATA_CATALOG}.%s LIMIT 1", table_name);
+	auto result = Query(snapshot, query);
+	return !result->HasError();
+}
+
 DuckLakeCatalogInfo DuckLakeMetadataManager::GetCatalogForSnapshot(DuckLakeSnapshot snapshot) {
 	auto &ducklake_catalog = transaction.GetCatalog();
 	auto &base_data_path = ducklake_catalog.DataPath();
@@ -901,7 +908,7 @@ LEFT JOIN {METADATA_CATALOG}.ducklake_table_column_stats USING (table_id)
 WHERE record_count IS NOT NULL AND file_size_bytes IS NOT NULL
 ORDER BY table_id;
 )";
-	auto result = Query(snapshot, query);
+	auto result = transaction.Query(snapshot, query);
 	return TransformGlobalStats(*result);
 }
 
@@ -1654,20 +1661,28 @@ LEFT JOIN LATERAL (
 	FROM {METADATA_CATALOG}.ducklake_delete_file
 	WHERE table_id = %d AND begin_snapshot < data.end_snapshot
 	ORDER BY data_file_id, begin_snapshot DESC
-) AS previous_delete
-USING (data_file_id), (
-	SELECT NULL path, NULL path_is_relative, NULL file_size_bytes, NULL footer_size, NULL encryption_key, NULL format
-) current_delete
-)",
+	) AS previous_delete
+	USING (data_file_id), (
+		SELECT
+			CAST(NULL AS VARCHAR) path,
+			CAST(NULL AS BOOLEAN) path_is_relative,
+			CAST(NULL AS BIGINT) file_size_bytes,
+			CAST(NULL AS BIGINT) footer_size,
+			CAST(NULL AS VARCHAR) encryption_key,
+			CAST(NULL AS VARCHAR) format
+	) current_delete
+	)",
 	                            select_list, table_id.index, table_id.index, start_snapshot.snapshot_id, table_id.index,
 	                            select_list, table_id.index, start_snapshot.snapshot_id, table_id.index);
 
 	if (has_inlined_table) {
-		string null_file_cols = "NULL path, NULL path_is_relative, NULL file_size_bytes, NULL footer_size";
+		string null_file_cols =
+		    "CAST(NULL AS VARCHAR) path, CAST(NULL AS BOOLEAN) path_is_relative, CAST(NULL AS BIGINT) file_size_bytes, "
+		    "CAST(NULL AS BIGINT) footer_size";
 		if (IsEncrypted()) {
-			null_file_cols += ", NULL encryption_key";
+			null_file_cols += ", CAST(NULL AS VARCHAR) encryption_key";
 		}
-		null_file_cols += ", NULL format";
+		null_file_cols += ", CAST(NULL AS VARCHAR) format";
 		query += StringUtil::Format(R"(
 UNION ALL
 
@@ -2676,12 +2691,10 @@ string DuckLakeMetadataManager::GetInlinedDeletionTableName(TableIndex table_id,
 	}
 
 	// Read path: table visibility implies it was committed, safe to cache at catalog level
-	auto query = StringUtil::Format("SELECT NULL FROM {METADATA_CATALOG}.%s LIMIT 1", table_name);
-	auto result = Query(snapshot, query);
 	// TODO: Using the error state to check for existence here is fragile.
 	// Even if the table exists, a transient error in the catalog query would lead us to assume it does not exist.
 	// Maybe persist the existence of the deletion inlining table on the table metadata instead?
-	if (!result->HasError()) {
+	if (InlinedDeletionTableExists(table_id, snapshot, table_name)) {
 		delete_inlined_table_cache.insert(table_id.index);
 		catalog.CacheInlinedDeletionTableResult(table_id, snapshot, true);
 		return table_name;

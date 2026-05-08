@@ -42,6 +42,7 @@ public:
 
 protected:
 	string GetLatestSnapshotQuery() const override;
+	bool InlinedDeletionTableExists(TableIndex table_id, DuckLakeSnapshot snapshot, const string &table_name) override;
 	string CastValueToTarget(const Value &val, const LogicalType &type) override;
 	string CastStatsToTarget(const string &stats, const LogicalType &type) override;
 	string GenerateConstantFilter(const ConstantFilter &constant_filter, const LogicalType &type,
@@ -53,6 +54,8 @@ private:
 	string GetPostgresIndexStatements();
 	string GetPostgresStatsType(const LogicalType &type);
 	bool CanCastStatsForValueComparison(const LogicalType &type);
+	bool IsPostgresTemporalStatsType(const LogicalType &type);
+	bool CanCastTemporalValueForValueComparison(const Value &val, const LogicalType &type);
 };
 
 } // namespace duckdb

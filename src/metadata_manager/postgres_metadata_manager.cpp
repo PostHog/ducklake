@@ -7,6 +7,16 @@
 
 namespace duckdb {
 
+static bool IsDigit(char c) {
+	return c >= '0' && c <= '9';
+}
+
+static bool HasFourDigitDatePrefix(const string &value) {
+	return value.size() >= 10 && IsDigit(value[0]) && IsDigit(value[1]) && IsDigit(value[2]) && IsDigit(value[3]) &&
+	       value[4] == '-' && IsDigit(value[5]) && IsDigit(value[6]) && value[7] == '-' && IsDigit(value[8]) &&
+	       IsDigit(value[9]);
+}
+
 PostgresMetadataManager::PostgresMetadataManager(DuckLakeTransaction &transaction)
     : DuckLakeMetadataManager(transaction) {
 }
@@ -120,13 +130,42 @@ string PostgresMetadataManager::GetPostgresStatsType(const LogicalType &type) {
 		return "REAL";
 	case LogicalTypeId::DOUBLE:
 		return "DOUBLE PRECISION";
+	case LogicalTypeId::DATE:
+		return "DATE";
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+		return "TIMESTAMP";
 	default:
 		return type.ToString();
 	}
 }
 
+bool PostgresMetadataManager::IsPostgresTemporalStatsType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool PostgresMetadataManager::CanCastTemporalValueForValueComparison(const Value &val, const LogicalType &type) {
+	auto value = val.ToString();
+	if (!HasFourDigitDatePrefix(value)) {
+		return false;
+	}
+	if (type.id() == LogicalTypeId::DATE) {
+		return value.size() == 10;
+	}
+	return IsPostgresTemporalStatsType(type);
+}
+
 bool PostgresMetadataManager::CanCastStatsForValueComparison(const LogicalType &type) {
-	return type.IsNumeric() || type.id() == LogicalTypeId::BOOLEAN;
+	return type.IsNumeric() || type.id() == LogicalTypeId::BOOLEAN || IsPostgresTemporalStatsType(type);
 }
 
 string PostgresMetadataManager::CastValueToTarget(const Value &val, const LogicalType &type) {
@@ -138,6 +177,9 @@ string PostgresMetadataManager::CastValueToTarget(const Value &val, const Logica
 		return val.ToString();
 	}
 	auto literal = DuckLakeUtil::SQLLiteralToString(val.ToString());
+	if (IsPostgresTemporalStatsType(type) && CanCastTemporalValueForValueComparison(val, type)) {
+		return literal + "::" + GetPostgresStatsType(type);
+	}
 	if (RequiresValueComparison(type) && CanCastStatsForValueComparison(type)) {
 		return literal + "::" + GetPostgresStatsType(type);
 	}
@@ -145,6 +187,17 @@ string PostgresMetadataManager::CastValueToTarget(const Value &val, const Logica
 }
 
 string PostgresMetadataManager::CastStatsToTarget(const string &stats, const LogicalType &type) {
+	if (IsPostgresTemporalStatsType(type)) {
+		string regex;
+		if (type.id() == LogicalTypeId::DATE) {
+			regex = "'^[0-9]{4}-(0[1-9]|1[0-2])-([0][1-9]|[12][0-9]|3[01])$'";
+		} else {
+			regex =
+			    "'^[0-9]{4}-(0[1-9]|1[0-2])-([0][1-9]|[12][0-9]|3[01])( [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?)?$'";
+		}
+		return StringUtil::Format("(CASE WHEN %s ~ %s THEN %s::%s END)", stats, regex, stats,
+		                          GetPostgresStatsType(type));
+	}
 	if (RequiresValueComparison(type) && CanCastStatsForValueComparison(type)) {
 		return stats + "::" + GetPostgresStatsType(type);
 	}
@@ -156,9 +209,17 @@ string PostgresMetadataManager::GenerateConstantFilter(const ConstantFilter &con
 	if (RequiresValueComparison(type) && !CanCastStatsForValueComparison(type)) {
 		return string();
 	}
+	if (IsPostgresTemporalStatsType(type) && !CanCastTemporalValueForValueComparison(constant_filter.constant, type)) {
+		return string();
+	}
 	auto constant_str = CastValueToTarget(constant_filter.constant, type);
 	auto min_value = CastStatsToTarget("min_value", type);
 	auto max_value = CastStatsToTarget("max_value", type);
+	if (IsPostgresTemporalStatsType(type)) {
+		auto postgres_type = GetPostgresStatsType(type);
+		min_value = StringUtil::Format("COALESCE(%s, '-infinity'::%s)", min_value, postgres_type);
+		max_value = StringUtil::Format("COALESCE(%s, 'infinity'::%s)", max_value, postgres_type);
+	}
 	switch (constant_filter.comparison_type) {
 	case ExpressionType::COMPARE_EQUAL:
 		referenced_stats.insert("min_value");
@@ -215,7 +276,12 @@ unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot s
 	query = StringUtil::Replace(query, "{DATA_PATH}", data_path);
 
 	auto passthrough_query = StringUtil::Format("CALL %s(%s, %s)", command, catalog_literal, SQLString(query));
-	return transaction.Query(passthrough_query);
+	auto result = transaction.Query(passthrough_query);
+	if (command == "postgres_execute" && !result->HasError()) {
+		while (result->Fetch()) {
+		}
+	}
+	return result;
 }
 
 unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(string &query, string command) {
@@ -241,12 +307,32 @@ unique_ptr<QueryResult> PostgresMetadataManager::Query(string &query) {
 
 string PostgresMetadataManager::GetLatestSnapshotQuery() const {
 	return R"(
-	SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL},
-		'SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
-		 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot WHERE snapshot_id = (
-		     SELECT MAX(snapshot_id) FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot
-		 );')
+		SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL},
+			'SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
+			 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot WHERE snapshot_id = (
+			     SELECT MAX(snapshot_id) FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot
+			 );')
 	)";
+}
+
+bool PostgresMetadataManager::InlinedDeletionTableExists(TableIndex, DuckLakeSnapshot snapshot,
+                                                         const string &table_name) {
+	auto query = StringUtil::Format(R"(
+SELECT EXISTS (
+	SELECT 1
+	FROM information_schema.tables
+	WHERE table_schema = {METADATA_SCHEMA_NAME_LITERAL}
+	  AND table_name = %s
+))",
+	                                DuckLakeUtil::SQLLiteralToString(table_name));
+	auto result = Query(snapshot, query);
+	if (result->HasError()) {
+		return false;
+	}
+	for (auto &row : *result) {
+		return row.GetValue<bool>(0);
+	}
+	return false;
 }
 
 // We need a specialized function here to do a reinterpret for postgres from BLOB to VARCHAR

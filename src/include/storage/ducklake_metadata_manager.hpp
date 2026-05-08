@@ -264,6 +264,7 @@ public:
 
 protected:
 	virtual string GetLatestSnapshotQuery() const;
+	virtual bool InlinedDeletionTableExists(TableIndex table_id, DuckLakeSnapshot snapshot, const string &table_name);
 
 	//! Wrap field selections with list aggregation of struct objects (DBMS-specific)
 	//! For DuckDB: LIST({'key1': val1, 'key2': val2, ...})
