@@ -134,8 +134,10 @@ public:
 	virtual DuckLakeMetadata LoadDuckLake();
 
 	virtual unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query);
+	virtual unique_ptr<QueryResult> Execute(string &query);
 
 	virtual unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query);
+	virtual unique_ptr<QueryResult> Query(string &query);
 	//! Get the catalog information for a specific snapshot
 	virtual DuckLakeCatalogInfo GetCatalogForSnapshot(DuckLakeSnapshot snapshot);
 	virtual vector<DuckLakeGlobalStatsInfo> GetGlobalTableStats(DuckLakeSnapshot snapshot);

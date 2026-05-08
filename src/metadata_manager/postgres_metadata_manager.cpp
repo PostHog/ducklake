@@ -1,6 +1,7 @@
 #include "metadata_manager/postgres_metadata_manager.hpp"
 #include "common/ducklake_util.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
 
@@ -77,6 +78,113 @@ string PostgresMetadataManager::GetColumnTypeInternal(const LogicalType &column_
 	}
 }
 
+string PostgresMetadataManager::GetPostgresIndexStatements() {
+	return R"(
+CREATE INDEX IF NOT EXISTS ducklake_data_file_table_snapshot_idx ON {METADATA_CATALOG}.ducklake_data_file(table_id, begin_snapshot, end_snapshot);
+CREATE INDEX IF NOT EXISTS ducklake_delete_file_table_snapshot_idx ON {METADATA_CATALOG}.ducklake_delete_file(table_id, begin_snapshot, end_snapshot);
+CREATE INDEX IF NOT EXISTS ducklake_file_column_stats_table_column_idx ON {METADATA_CATALOG}.ducklake_file_column_stats(table_id, column_id);
+CREATE INDEX IF NOT EXISTS ducklake_schema_versions_table_schema_version_idx ON {METADATA_CATALOG}.ducklake_schema_versions(table_id, schema_version);
+CREATE INDEX IF NOT EXISTS ducklake_column_table_snapshot_idx ON {METADATA_CATALOG}.ducklake_column(table_id, begin_snapshot, end_snapshot);
+CREATE INDEX IF NOT EXISTS ducklake_table_column_stats_table_column_idx ON {METADATA_CATALOG}.ducklake_table_column_stats(table_id, column_id);
+)";
+}
+
+void PostgresMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) {
+	DuckLakeMetadataManager::InitializeDuckLake(has_explicit_schema, encryption);
+	auto index_query = GetPostgresIndexStatements();
+	auto result = Execute(index_query);
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to initialize DuckLake Postgres metadata indexes: ");
+	}
+}
+
+string PostgresMetadataManager::GetPostgresStatsType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+		return "BOOLEAN";
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+		return "SMALLINT";
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+		return "INTEGER";
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UINTEGER:
+		return "BIGINT";
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT:
+		return "NUMERIC";
+	case LogicalTypeId::FLOAT:
+		return "REAL";
+	case LogicalTypeId::DOUBLE:
+		return "DOUBLE PRECISION";
+	default:
+		return type.ToString();
+	}
+}
+
+bool PostgresMetadataManager::CanCastStatsForValueComparison(const LogicalType &type) {
+	return type.IsNumeric() || type.id() == LogicalTypeId::BOOLEAN;
+}
+
+string PostgresMetadataManager::CastValueToTarget(const Value &val, const LogicalType &type) {
+	bool value_is_finite = true;
+	if (val.type().id() == LogicalTypeId::FLOAT || val.type().id() == LogicalTypeId::DOUBLE) {
+		value_is_finite = Value::IsFinite(val.GetValue<double>());
+	}
+	if (type.IsNumeric() && value_is_finite) {
+		return val.ToString();
+	}
+	auto literal = DuckLakeUtil::SQLLiteralToString(val.ToString());
+	if (RequiresValueComparison(type) && CanCastStatsForValueComparison(type)) {
+		return literal + "::" + GetPostgresStatsType(type);
+	}
+	return literal;
+}
+
+string PostgresMetadataManager::CastStatsToTarget(const string &stats, const LogicalType &type) {
+	if (RequiresValueComparison(type) && CanCastStatsForValueComparison(type)) {
+		return stats + "::" + GetPostgresStatsType(type);
+	}
+	return stats;
+}
+
+string PostgresMetadataManager::GenerateConstantFilter(const ConstantFilter &constant_filter, const LogicalType &type,
+                                                       unordered_set<string> &referenced_stats) {
+	if (RequiresValueComparison(type) && !CanCastStatsForValueComparison(type)) {
+		return string();
+	}
+	auto constant_str = CastValueToTarget(constant_filter.constant, type);
+	auto min_value = CastStatsToTarget("min_value", type);
+	auto max_value = CastStatsToTarget("max_value", type);
+	switch (constant_filter.comparison_type) {
+	case ExpressionType::COMPARE_EQUAL:
+		referenced_stats.insert("min_value");
+		referenced_stats.insert("max_value");
+		return StringUtil::Format("%s BETWEEN %s AND %s", constant_str, min_value, max_value);
+	case ExpressionType::COMPARE_NOTEQUAL:
+		referenced_stats.insert("min_value");
+		referenced_stats.insert("max_value");
+		return StringUtil::Format("NOT (%s = %s AND %s = %s)", min_value, constant_str, max_value, constant_str);
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		referenced_stats.insert("max_value");
+		return StringUtil::Format("%s >= %s", max_value, constant_str);
+	case ExpressionType::COMPARE_GREATERTHAN:
+		referenced_stats.insert("max_value");
+		return StringUtil::Format("%s > %s", max_value, constant_str);
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		referenced_stats.insert("min_value");
+		return StringUtil::Format("%s <= %s", min_value, constant_str);
+	case ExpressionType::COMPARE_LESSTHAN:
+		referenced_stats.insert("min_value");
+		return StringUtil::Format("%s < %s", min_value, constant_str);
+	default:
+		return string();
+	}
+}
+
 unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot snapshot, string &query,
                                                               string command) {
 	auto &commit_info = transaction.GetCommitInfo();
@@ -89,7 +197,6 @@ unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot s
 	query = StringUtil::Replace(query, "{COMMIT_MESSAGE}", commit_info.commit_message.ToSQLString());
 	query = StringUtil::Replace(query, "{COMMIT_EXTRA_INFO}", commit_info.commit_extra_info.ToSQLString());
 
-	auto &connection = transaction.GetConnection();
 	auto &ducklake_catalog = transaction.GetCatalog();
 	auto catalog_identifier = DuckLakeUtil::SQLIdentifierToString(ducklake_catalog.MetadataDatabaseName());
 	auto catalog_literal = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.MetadataDatabaseName());
@@ -107,14 +214,29 @@ unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot s
 	query = StringUtil::Replace(query, "{METADATA_PATH}", metadata_path);
 	query = StringUtil::Replace(query, "{DATA_PATH}", data_path);
 
-	return connection.Query(StringUtil::Format("CALL %s(%s, %s)", command, catalog_literal, SQLString(query)));
+	auto passthrough_query = StringUtil::Format("CALL %s(%s, %s)", command, catalog_literal, SQLString(query));
+	return transaction.Query(passthrough_query);
+}
+
+unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(string &query, string command) {
+	// Snapshot-less metadata queries must not contain snapshot placeholders.
+	DuckLakeSnapshot snapshot;
+	return ExecuteQuery(snapshot, query, std::move(command));
 }
 unique_ptr<QueryResult> PostgresMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
 	return ExecuteQuery(snapshot, query, "postgres_execute");
 }
 
+unique_ptr<QueryResult> PostgresMetadataManager::Execute(string &query) {
+	return ExecuteQuery(query, "postgres_execute");
+}
+
 unique_ptr<QueryResult> PostgresMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
 	return ExecuteQuery(snapshot, query, "postgres_query");
+}
+
+unique_ptr<QueryResult> PostgresMetadataManager::Query(string &query) {
+	return ExecuteQuery(query, "postgres_query");
 }
 
 string PostgresMetadataManager::GetLatestSnapshotQuery() const {
