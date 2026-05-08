@@ -45,6 +45,7 @@ jobs:
       with:
         key: ${{ github.job }}
         save: ${{ github.ref == 'refs/heads/main' || github.repository != 'duckdb/ducklake' }}
+        max-size: "1.5G"
 
     - name: Setup vcpkg
       uses: lukka/run-vcpkg@v11.1
