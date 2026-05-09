@@ -1,0 +1,38 @@
+# name: test/sql/metadata/postgres_metadata_passthrough.test
+# description: Hot PostgreSQL metadata reads should use postgres_query passthrough
+# group: [metadata]
+
+require ducklake
+
+require parquet
+
+require postgres_scanner
+
+require-env DUCKLAKE_CI
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:postgres:dbname=ducklakedb' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_postgres_passthrough', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE ducklake.test_tbl(id INTEGER, payload VARCHAR)
+
+statement ok
+INSERT INTO ducklake.test_tbl VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+statement ok
+CALL enable_logging('DuckLakeMetadata')
+
+query I
+SELECT count(*) FROM ducklake.test_tbl WHERE id >= 2
+----
+2
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs_parsed('DuckLakeMetadata')
+WHERE query LIKE '%postgres_query%'
+  AND query LIKE '%ducklake_file_column_stats%'
+----
+true

@@ -309,16 +309,18 @@ UPDATE {METADATA_CATALOG}.ducklake_metadata SET value = '1.0' WHERE key = 'versi
 }
 
 DuckLakeMetadata DuckLakeMetadataManager::LoadDuckLake() {
-	auto result = transaction.Query(R"(
+	string query = R"(
 SELECT key, value, scope, scope_id FROM {METADATA_CATALOG}.ducklake_metadata
-)");
+)";
+	auto result = Query(query);
 	if (result->HasError()) {
 		// preserve the original error in case the fallback also fails
 		auto original_error = result->GetErrorObject().RawMessage();
 		// we might be loading from a v0.1 database - if so we don't have scope yet
-		result = transaction.Query(R"(
+		query = R"(
 SELECT key, value FROM {METADATA_CATALOG}.ducklake_metadata
-)");
+)";
+		result = Query(query);
 		if (result->HasError()) {
 			auto fallback_error = result->GetErrorObject().RawMessage();
 			throw IOException("Failed to load existing DuckLake: %s\nFollowed by: %s", original_error, fallback_error);
@@ -429,7 +431,7 @@ SELECT begin_snapshot
 FROM {METADATA_CATALOG}.ducklake_table
 WHERE table_id = {TABLE_ID})";
 	query = StringUtil::Replace(query, "{TABLE_ID}", to_string(table_id.index)).c_str();
-	auto result = transaction.Query(query);
+	auto result = Query(query);
 	for (auto &row : *result) {
 		return row.GetValue<idx_t>(0);
 	}
@@ -443,7 +445,7 @@ FROM {METADATA_CATALOG}.ducklake_schema_versions
 WHERE table_id = {TABLE_ID} AND schema_version = {SCHEMA_VERSION})";
 	query = StringUtil::Replace(query, "{TABLE_ID}", to_string(table_id.index));
 	query = StringUtil::Replace(query, "{SCHEMA_VERSION}", to_string(schema_version));
-	auto result = transaction.Query(query);
+	auto result = Query(query);
 	for (auto &row : *result) {
 		return row.GetValue<idx_t>(0);
 	}
@@ -490,7 +492,7 @@ SELECT
   %s)",
 	                                  inlined_deletion_subquery);
 	query = StringUtil::Replace(query, "{TABLE_ID}", to_string(table_id.index));
-	auto result = transaction.Query(snapshot, query);
+	auto result = Query(snapshot, query);
 	for (auto &row : *result) {
 		return row.GetValue<idx_t>(0);
 	}
@@ -504,11 +506,18 @@ FROM {METADATA_CATALOG}.%s
 WHERE {SNAPSHOT_ID} >= begin_snapshot
   AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL))",
 	                                  inlined_table_name);
-	auto result = transaction.Query(snapshot, query);
+	auto result = Query(snapshot, query);
 	for (auto &row : *result) {
 		return row.GetValue<idx_t>(0);
 	}
 	return 0;
+}
+
+bool DuckLakeMetadataManager::InlinedDeletionTableExists(TableIndex, DuckLakeSnapshot snapshot,
+                                                         const string &table_name) {
+	auto query = StringUtil::Format("SELECT NULL FROM {METADATA_CATALOG}.%s LIMIT 1", table_name);
+	auto result = Query(snapshot, query);
+	return !result->HasError();
 }
 
 DuckLakeCatalogInfo DuckLakeMetadataManager::GetCatalogForSnapshot(DuckLakeSnapshot snapshot) {
@@ -892,13 +901,14 @@ vector<DuckLakeGlobalStatsInfo> TransformGlobalStats(QueryResult &result) {
 
 vector<DuckLakeGlobalStatsInfo> DuckLakeMetadataManager::GetGlobalTableStats(DuckLakeSnapshot snapshot) {
 	// query the most recent stats
-	auto result = transaction.Query(snapshot, R"(
+	string query = R"(
 SELECT table_id, column_id, record_count, next_row_id, file_size_bytes, contains_null, contains_nan, min_value, max_value, extra_stats
 FROM {METADATA_CATALOG}.ducklake_table_stats
 LEFT JOIN {METADATA_CATALOG}.ducklake_table_column_stats USING (table_id)
 WHERE record_count IS NOT NULL AND file_size_bytes IS NOT NULL
 ORDER BY table_id;
-)");
+)";
+	auto result = transaction.Query(snapshot, query);
 	return TransformGlobalStats(*result);
 }
 
@@ -1446,7 +1456,7 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 	}
 	// Add ORDER BY clause for Top-N optimization if generated
 	query += order_by_clause;
-	auto result = transaction.Query(snapshot, query);
+	auto result = Query(snapshot, query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get data file list from DuckLake: ");
 	}
@@ -1530,7 +1540,7 @@ WHERE data.table_id=%d AND data.begin_snapshot <= {SNAPSHOT_ID} AND (
 		)",
 	                       select_list, table_id.index, start_snapshot.snapshot_id, start_snapshot.snapshot_id);
 
-	auto result = transaction.Query(end_snapshot, query);
+	auto result = Query(end_snapshot, query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get table insertion file list from DuckLake: ");
 	}
@@ -1651,20 +1661,28 @@ LEFT JOIN LATERAL (
 	FROM {METADATA_CATALOG}.ducklake_delete_file
 	WHERE table_id = %d AND begin_snapshot < data.end_snapshot
 	ORDER BY data_file_id, begin_snapshot DESC
-) AS previous_delete
-USING (data_file_id), (
-	SELECT NULL path, NULL path_is_relative, NULL file_size_bytes, NULL footer_size, NULL encryption_key, NULL format
-) current_delete
-)",
+	) AS previous_delete
+	USING (data_file_id), (
+		SELECT
+			CAST(NULL AS VARCHAR) path,
+			CAST(NULL AS BOOLEAN) path_is_relative,
+			CAST(NULL AS BIGINT) file_size_bytes,
+			CAST(NULL AS BIGINT) footer_size,
+			CAST(NULL AS VARCHAR) encryption_key,
+			CAST(NULL AS VARCHAR) format
+	) current_delete
+	)",
 	                            select_list, table_id.index, table_id.index, start_snapshot.snapshot_id, table_id.index,
 	                            select_list, table_id.index, start_snapshot.snapshot_id, table_id.index);
 
 	if (has_inlined_table) {
-		string null_file_cols = "NULL path, NULL path_is_relative, NULL file_size_bytes, NULL footer_size";
+		string null_file_cols =
+		    "CAST(NULL AS VARCHAR) path, CAST(NULL AS BOOLEAN) path_is_relative, CAST(NULL AS BIGINT) file_size_bytes, "
+		    "CAST(NULL AS BIGINT) footer_size";
 		if (IsEncrypted()) {
-			null_file_cols += ", NULL encryption_key";
+			null_file_cols += ", CAST(NULL AS VARCHAR) encryption_key";
 		}
-		null_file_cols += ", NULL format";
+		null_file_cols += ", CAST(NULL AS VARCHAR) format";
 		query += StringUtil::Format(R"(
 UNION ALL
 
@@ -1701,7 +1719,9 @@ FROM main_results
 )";
 	}
 
-	auto result = transaction.Query(end_snapshot, query);
+	// The inlined-deletion branch returns LIST(STRUCT_PACK(...)), which is DuckDB syntax.
+	// Keep that mixed-shape query local until the nested result is converted to Postgres SQL.
+	auto result = has_inlined_table ? transaction.Query(end_snapshot, query) : Query(end_snapshot, query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get table deletion file list from DuckLake: ");
 	}
@@ -1784,7 +1804,7 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 		query += "\nAND " + where_clause;
 	}
 
-	auto result = transaction.Query(snapshot, query);
+	auto result = Query(snapshot, query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get extended data file list from DuckLake: ");
 	}
@@ -1885,7 +1905,7 @@ ORDER BY data.begin_snapshot, data.row_id_start, data.data_file_id, del.begin_sn
 		)",
 	                                table_id.index, select_list, table_id.index, table_id.index,
 	                                deletion_threshold_clause, file_size_filter_clause);
-	auto result = transaction.Query(query);
+	auto result = Query(query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get compaction file list from DuckLake: ");
 	}
@@ -2049,8 +2069,16 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::Execute(DuckLakeSnapshot snapsh
 	return transaction.Query(snapshot, query);
 }
 
+unique_ptr<QueryResult> DuckLakeMetadataManager::Execute(string &query) {
+	return transaction.Query(query);
+}
+
 unique_ptr<QueryResult> DuckLakeMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
 	return transaction.Query(snapshot, query);
+}
+
+unique_ptr<QueryResult> DuckLakeMetadataManager::Query(string &query) {
+	return transaction.Query(query);
 }
 
 string DuckLakeMetadataManager::DropMacros(const set<MacroIndex> &ids) {
@@ -2406,7 +2434,7 @@ WHERE table_id = %d AND schema_version=(
     WHERE table_id=%d
 );)",
 			                                entry.table_id.index, entry.table_id.index);
-			auto result = transaction.Query(commit_snapshot, query);
+			auto result = Query(commit_snapshot, query);
 			for (auto &row : *result) {
 				inlined_table_name = row.GetValue<string>(0);
 				insert_inlined_table_name_cache[entry.table_id.index] = inlined_table_name;
@@ -2560,7 +2588,7 @@ map<idx_t, set<idx_t>> DuckLakeMetadataManager::ReadInlinedFileDeletions(TableIn
 	auto query = StringUtil::Format("SELECT file_id, row_id FROM {METADATA_CATALOG}.%s WHERE begin_snapshot <= "
 	                                "{SNAPSHOT_ID}",
 	                                inlined_table_name);
-	auto query_result = transaction.Query(snapshot, query);
+	auto query_result = Query(snapshot, query);
 	if (query_result->HasError()) {
 		query_result->GetErrorObject().Throw("Failed to read inlined file deletions from DuckLake: ");
 	}
@@ -2595,7 +2623,7 @@ unordered_set<idx_t> DuckLakeMetadataManager::GetFileIdsWithInlinedDeletions(Tab
 	auto query = StringUtil::Format("SELECT DISTINCT file_id FROM {METADATA_CATALOG}.%s WHERE file_id IN (%s) AND "
 	                                "begin_snapshot <= {SNAPSHOT_ID}",
 	                                inlined_table_name, file_id_list);
-	auto query_result = transaction.Query(snapshot, query);
+	auto query_result = Query(snapshot, query);
 	if (query_result->HasError()) {
 		query_result->GetErrorObject().Throw("Failed to read inlined file deletion IDs from DuckLake: ");
 	}
@@ -2616,7 +2644,7 @@ DuckLakeMetadataManager::ReadInlinedFileDeletionsForRange(TableIndex table_id, D
 	auto query = StringUtil::Format("SELECT file_id, row_id, begin_snapshot FROM {METADATA_CATALOG}.%s "
 	                                "WHERE begin_snapshot >= %d AND begin_snapshot <= {SNAPSHOT_ID}",
 	                                inlined_table_name, start_snapshot.snapshot_id);
-	auto query_result = transaction.Query(end_snapshot, query);
+	auto query_result = Query(end_snapshot, query);
 	if (query_result->HasError()) {
 		query_result->GetErrorObject().Throw("Failed to read inlined file deletions for range from DuckLake: ");
 	}
@@ -2653,7 +2681,7 @@ string DuckLakeMetadataManager::GetInlinedDeletionTableName(TableIndex table_id,
 		auto create_query = StringUtil::Format(
 		    "CREATE TABLE IF NOT EXISTS {METADATA_CATALOG}.%s(file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT);",
 		    table_name);
-		auto create_result = transaction.Query(snapshot, create_query);
+		auto create_result = Execute(snapshot, create_query);
 		if (create_result->HasError()) {
 			create_result->GetErrorObject().Throw("Failed to create inlined deletion table: ");
 		}
@@ -2663,12 +2691,10 @@ string DuckLakeMetadataManager::GetInlinedDeletionTableName(TableIndex table_id,
 	}
 
 	// Read path: table visibility implies it was committed, safe to cache at catalog level
-	auto query = StringUtil::Format("SELECT NULL FROM {METADATA_CATALOG}.%s LIMIT 1", table_name);
-	auto result = transaction.Query(snapshot, query);
 	// TODO: Using the error state to check for existence here is fragile.
 	// Even if the table exists, a transient error in the catalog query would lead us to assume it does not exist.
 	// Maybe persist the existence of the deletion inlining table on the table metadata instead?
-	if (!result->HasError()) {
+	if (InlinedDeletionTableExists(table_id, snapshot, table_name)) {
 		delete_inlined_table_cache.insert(table_id.index);
 		catalog.CacheInlinedDeletionTableResult(table_id, snapshot, true);
 		return table_name;
@@ -2715,12 +2741,13 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::ReadInlinedData(DuckLakeSnapsho
                                                                  const string &inlined_table_name,
                                                                  const vector<string> &columns_to_read) {
 	auto projection = GetProjection(columns_to_read);
-	auto result = transaction.Query(snapshot, StringUtil::Format(R"(
+	auto query = StringUtil::Format(R"(
 SELECT %s
 FROM {METADATA_CATALOG}.%s inlined_data
 WHERE {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)
 ORDER BY row_id;)",
-	                                                             projection, inlined_table_name));
+	                                projection, inlined_table_name);
+	auto result = transaction.Query(snapshot, query);
 	return result;
 }
 
@@ -2729,12 +2756,12 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::ReadInlinedDataInsertions(DuckL
                                                                            const string &inlined_table_name,
                                                                            const vector<string> &columns_to_read) {
 	auto projection = GetProjection(columns_to_read);
-	auto result =
-	    transaction.Query(end_snapshot, StringUtil::Format(R"(
+	auto query = StringUtil::Format(R"(
 SELECT %s
 FROM {METADATA_CATALOG}.%s inlined_data
 WHERE inlined_data.begin_snapshot >= %d AND inlined_data.begin_snapshot <= {SNAPSHOT_ID};)",
-	                                                       projection, inlined_table_name, start_snapshot.snapshot_id));
+	                                projection, inlined_table_name, start_snapshot.snapshot_id);
+	auto result = transaction.Query(end_snapshot, query);
 	return result;
 }
 
@@ -2743,12 +2770,12 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::ReadInlinedDataDeletions(DuckLa
                                                                           const string &inlined_table_name,
                                                                           const vector<string> &columns_to_read) {
 	auto projection = GetProjection(columns_to_read);
-	auto result =
-	    transaction.Query(end_snapshot, StringUtil::Format(R"(
+	auto query = StringUtil::Format(R"(
 SELECT %s
 FROM {METADATA_CATALOG}.%s inlined_data
 WHERE inlined_data.end_snapshot >= %d AND inlined_data.end_snapshot <= {SNAPSHOT_ID};)",
-	                                                       projection, inlined_table_name, start_snapshot.snapshot_id));
+	                                projection, inlined_table_name, start_snapshot.snapshot_id);
+	auto result = transaction.Query(end_snapshot, query);
 	return result;
 }
 
@@ -2756,12 +2783,13 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::ReadAllInlinedDataForFlush(Duck
                                                                             const string &inlined_table_name,
                                                                             const vector<string> &columns_to_read) {
 	auto projection = GetProjection(columns_to_read);
-	auto result = transaction.Query(snapshot, StringUtil::Format(R"(
+	auto query = StringUtil::Format(R"(
 SELECT %s
 FROM {METADATA_CATALOG}.%s inlined_data
 WHERE {SNAPSHOT_ID} >= begin_snapshot
 ORDER BY row_id, begin_snapshot;)",
-	                                                             projection, inlined_table_name));
+	                                projection, inlined_table_name);
+	auto result = transaction.Query(snapshot, query);
 	return result;
 }
 
@@ -3604,13 +3632,14 @@ unique_ptr<DuckLakeSnapshot> DuckLakeMetadataManager::GetSnapshot(BoundAtClause 
 	const string timestamp_order = bound == SnapshotBound::LOWER_BOUND ? "ASC" : "DESC";
 	const string timestamp_condition = bound == SnapshotBound::LOWER_BOUND ? ">" : "<";
 	if (StringUtil::CIEquals(unit, "version")) {
-		result = transaction.Query(StringUtil::Format(R"(
+		auto query = StringUtil::Format(R"(
 SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
 FROM {METADATA_CATALOG}.ducklake_snapshot
 WHERE snapshot_id = %llu;)",
-		                                              val.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>()));
+		                                val.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>());
+		result = Query(query);
 	} else if (StringUtil::CIEquals(unit, "timestamp")) {
-		result = transaction.Query(StringUtil::Format(
+		auto query = StringUtil::Format(
 		    R"(
 SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
 FROM {METADATA_CATALOG}.ducklake_snapshot
@@ -3620,7 +3649,8 @@ WHERE snapshot_id = (
 	WHERE snapshot_time::TIMESTAMPTZ %s= %s
 	ORDER BY snapshot_time::TIMESTAMPTZ %s
 	LIMIT 1);)",
-		    timestamp_condition, val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString(), timestamp_order));
+		    timestamp_condition, val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString(), timestamp_order);
+		result = Query(query);
 	} else {
 		throw InvalidInputException("Unsupported AT clause unit - %s", unit);
 	}
@@ -3987,14 +4017,15 @@ static timestamp_tz_t GetTimestampTZFromRow(ClientContext &context, const T &row
 }
 
 vector<DuckLakeSnapshotInfo> DuckLakeMetadataManager::GetAllSnapshots(const string &filter) {
-	auto res = transaction.Query(StringUtil::Format(R"(
+	auto query = StringUtil::Format(R"(
 SELECT snapshot_id, snapshot_time, schema_version, changes_made, author, commit_message, commit_extra_info
 FROM {METADATA_CATALOG}.ducklake_snapshot
 LEFT JOIN {METADATA_CATALOG}.ducklake_snapshot_changes USING (snapshot_id)
 %s %s
 ORDER BY snapshot_id
 )",
-	                                                filter.empty() ? "" : "WHERE", filter));
+	                                filter.empty() ? "" : "WHERE", filter);
+	auto res = Query(query);
 	if (res->HasError()) {
 		res->GetErrorObject().Throw("Failed to get snapshot information from DuckLake: ");
 	}
@@ -4020,7 +4051,7 @@ vector<DuckLakeFileForCleanup> DuckLakeMetadataManager::GetOldFilesForCleanup(co
 SELECT data_file_id, path, path_is_relative, schedule_start
 FROM {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion
 )" + filter;
-	auto res = transaction.Query(query);
+	auto res = Query(query);
 	if (res->HasError()) {
 		res->GetErrorObject().Throw("Failed to get files scheduled for deletion from DuckLake: ");
 	}
@@ -4115,23 +4146,25 @@ void DuckLakeMetadataManager::RemoveFilesScheduledForCleanup(const vector<DuckLa
 		}
 		deleted_file_ids += to_string(file.id.index);
 	}
-	auto result = transaction.Query(StringUtil::Format(R"(
+	auto query = StringUtil::Format(R"(
 DELETE FROM {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion
 WHERE data_file_id IN (%s);
 )",
-	                                                   deleted_file_ids));
+	                                deleted_file_ids);
+	auto result = Execute(query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to delete scheduled cleanup files in DuckLake: ");
 	}
 }
 
 idx_t DuckLakeMetadataManager::GetNextColumnId(TableIndex table_id) {
-	auto result = transaction.Query(StringUtil::Format(R"(
+	auto query = StringUtil::Format(R"(
 	SELECT MAX(column_id)
 	FROM {METADATA_CATALOG}.ducklake_column
 	WHERE table_id=%d
 )",
-	                                                   table_id.index));
+	                                table_id.index);
+	auto result = Query(query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get next column id in DuckLake: ");
 	}
