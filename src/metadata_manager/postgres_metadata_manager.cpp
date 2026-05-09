@@ -329,10 +329,8 @@ SELECT EXISTS (
 	if (result->HasError()) {
 		return false;
 	}
-	for (auto &row : *result) {
-		return row.GetValue<bool>(0);
-	}
-	return false;
+	auto chunk = result->Fetch();
+	return chunk && chunk->size() > 0 && chunk->GetValue(0, 0).GetValue<bool>();
 }
 
 // We need a specialized function here to do a reinterpret for postgres from BLOB to VARCHAR

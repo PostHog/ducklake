@@ -64,9 +64,6 @@ void DuckLakeInitializer::Initialize() {
 		error_obj.Throw("Failed to attach DuckLake MetaData \"" + catalog.MetadataDatabaseName() + "\" at path + \"" +
 		                catalog.MetadataPath() + "\"");
 	}
-	if (catalog.MetadataType() == "postgres" || catalog.MetadataType() == "postgres_scanner") {
-		transaction.Query("SET pg_connection_cache=false");
-	}
 	// explicitly load all secrets - work-around to secret initialization bug
 	transaction.Query("FROM duckdb_secrets()");
 
