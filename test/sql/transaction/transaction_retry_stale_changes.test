@@ -1,0 +1,153 @@
+# name: test/sql/transaction/transaction_retry_stale_changes.test
+# description: Test that commit retries recompute transaction_changes to avoid false conflicts from stale committed IDs
+# group: [transaction]
+#
+# Bug: GetTransactionChanges() was computed once before the retry loop in FlushChanges().
+# CommitChanges (GetNewTableInfo) and WriteSnapshotChanges (AddTableChanges) mutate
+# transaction_changes by adding committed IDs derived from next_catalog_id.
+# When the first commit attempt fails (duplicate snapshot_id), these stale IDs
+# persist. On retry, CheckForConflicts compares them against the other transaction's
+# changes — and since both derived IDs from the same next_catalog_id counter, the
+# IDs collide, producing false conflicts on completely unrelated tables.
+#
+# To trigger the bug deterministically, both transactions must create NEW tables
+# (so they derive committed IDs from next_catalog_id), and one must ALTER its
+# new table (populating altered_tables). The other transaction's stale
+# tables_inserted_into then collides with altered_tables on retry.
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_retry_stale_changes_files')
+
+statement ok
+SET immediate_transaction_mode=true
+
+# ---------------------------------------------------------------------------
+# Scenario 1: CTAS + ALTER vs CTAS on different tables
+#
+# con1: CREATE TABLE alpha AS ... + ALTER TABLE alpha ADD COLUMN
+# con2: CREATE TABLE beta AS ...
+#
+# Both start from the same snapshot (same next_catalog_id). con1 commits first.
+# con2's first attempt fails (snapshot_id collision), retries.
+#
+# Without fix: con2's stale tables_inserted_into has committed ID N (for beta).
+# con1's changes_made has altered_table:N (for alpha, same ID from same counter).
+# CheckForConflicts: {N} ∩ altered_tables {N} → false conflict!
+#
+# With fix: GetTransactionChanges() recomputed — transaction-local beta is
+# skipped, tables_inserted_into is empty. No collision. Retry assigns a new
+# committed ID from the updated next_catalog_id.
+# ---------------------------------------------------------------------------
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+CREATE TABLE ducklake.alpha AS SELECT 1 AS x
+
+statement ok con1
+ALTER TABLE ducklake.alpha ADD COLUMN z INTEGER
+
+statement ok con2
+CREATE TABLE ducklake.beta AS SELECT 10 AS y
+
+statement ok con1
+COMMIT
+
+statement ok con2
+COMMIT
+
+query II
+SELECT x, z FROM ducklake.alpha ORDER BY x
+----
+1	NULL
+
+query I
+SELECT y FROM ducklake.beta ORDER BY y
+----
+10
+
+# ---------------------------------------------------------------------------
+# Scenario 2: CTAS + COMMENT ON vs CTAS on different tables
+#
+# COMMENT ON TABLE also populates altered_tables, exercising the same
+# collision path with a different ALTER type. The COMMENT must be on
+# con1 (first committer) so its altered_tables collides with con2's
+# stale tables_inserted_into on retry.
+# ---------------------------------------------------------------------------
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+CREATE TABLE ducklake.gamma AS SELECT 100 AS a
+
+statement ok con1
+COMMENT ON TABLE ducklake.gamma IS 'test comment'
+
+statement ok con2
+CREATE TABLE ducklake.delta AS SELECT 200 AS b
+
+statement ok con1
+COMMIT
+
+statement ok con2
+COMMIT
+
+query I
+SELECT a FROM ducklake.gamma ORDER BY a
+----
+100
+
+query I
+SELECT b FROM ducklake.delta ORDER BY b
+----
+200
+
+# ---------------------------------------------------------------------------
+# Scenario 3: CTAS + RENAME COLUMN vs CTAS
+#
+# RENAME COLUMN is another ALTER type tracked in altered_tables.
+# ---------------------------------------------------------------------------
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+CREATE TABLE ducklake.epsilon AS SELECT 'hello' AS old_name
+
+statement ok con1
+ALTER TABLE ducklake.epsilon RENAME COLUMN old_name TO new_name
+
+statement ok con2
+CREATE TABLE ducklake.zeta AS SELECT 42 AS val
+
+statement ok con1
+COMMIT
+
+statement ok con2
+COMMIT
+
+query I
+SELECT new_name FROM ducklake.epsilon
+----
+hello
+
+query I
+SELECT val FROM ducklake.zeta
+----
+42
