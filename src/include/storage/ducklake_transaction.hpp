@@ -166,8 +166,16 @@ public:
 	DuckLakeSnapshotCommit &GetCommitInfo() {
 		return commit_info;
 	}
-	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string query);
-	unique_ptr<QueryResult> Query(string query);
+	//! Execute metadata DDL/DML.
+	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string query);
+	unique_ptr<QueryResult> Execute(string query);
+	//! Read metadata rows visible at the supplied DuckLake snapshot.
+	unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string query);
+	//! Read current metadata state.
+	unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string query);
+	unique_ptr<QueryResult> CurrentQuery(string query);
+	//! Execute a local DuckDB connection utility query, not a semantic metadata read/write.
+	unique_ptr<QueryResult> RawQuery(string query);
 	Connection &GetConnection();
 
 	DuckLakeSnapshot GetSnapshot();
@@ -338,6 +346,9 @@ private:
 	case_insensitive_map_t<unique_ptr<DuckLakeCatalogSet>> &GetNewMacroMap(CatalogType type);
 
 private:
+	unique_ptr<QueryResult> RunQuery(DuckLakeSnapshot snapshot, string query);
+	unique_ptr<QueryResult> RunQuery(string query);
+
 	DuckLakeCatalog &ducklake_catalog;
 	DuckLakeSnapshotCommit commit_info;
 	DatabaseInstance &db;

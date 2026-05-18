@@ -133,11 +133,15 @@ public:
 	virtual void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption);
 	virtual DuckLakeMetadata LoadDuckLake();
 
+	//! Execute metadata DDL/DML.
 	virtual unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query);
 	virtual unique_ptr<QueryResult> Execute(string &query);
 
-	virtual unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query);
-	virtual unique_ptr<QueryResult> Query(string &query);
+	//! Read metadata rows visible at the supplied DuckLake snapshot.
+	virtual unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string &query);
+	//! Read current metadata state.
+	virtual unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string &query);
+	virtual unique_ptr<QueryResult> CurrentQuery(string &query);
 	//! Get the catalog information for a specific snapshot
 	virtual DuckLakeCatalogInfo GetCatalogForSnapshot(DuckLakeSnapshot snapshot);
 	virtual vector<DuckLakeGlobalStatsInfo> GetGlobalTableStats(DuckLakeSnapshot snapshot);
