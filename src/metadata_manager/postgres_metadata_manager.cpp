@@ -276,7 +276,7 @@ unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot s
 	query = StringUtil::Replace(query, "{DATA_PATH}", data_path);
 
 	auto passthrough_query = StringUtil::Format("CALL %s(%s, %s)", command, catalog_literal, SQLString(query));
-	auto result = transaction.Query(passthrough_query);
+	auto result = transaction.RawQuery(passthrough_query);
 	if (command == "postgres_execute" && !result->HasError()) {
 		while (result->Fetch()) {
 		}
@@ -297,11 +297,15 @@ unique_ptr<QueryResult> PostgresMetadataManager::Execute(string &query) {
 	return ExecuteQuery(query, "postgres_execute");
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
+unique_ptr<QueryResult> PostgresMetadataManager::SnapshotQuery(DuckLakeSnapshot snapshot, string &query) {
 	return ExecuteQuery(snapshot, query, "postgres_query");
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::Query(string &query) {
+unique_ptr<QueryResult> PostgresMetadataManager::CurrentQuery(DuckLakeSnapshot snapshot, string &query) {
+	return ExecuteQuery(snapshot, query, "postgres_query");
+}
+
+unique_ptr<QueryResult> PostgresMetadataManager::CurrentQuery(string &query) {
 	return ExecuteQuery(query, "postgres_query");
 }
 
@@ -325,7 +329,7 @@ SELECT EXISTS (
 	  AND table_name = %s
 ))",
 	                                DuckLakeUtil::SQLLiteralToString(table_name));
-	auto result = Query(snapshot, query);
+	auto result = SnapshotQuery(snapshot, query);
 	if (result->HasError()) {
 		return false;
 	}
