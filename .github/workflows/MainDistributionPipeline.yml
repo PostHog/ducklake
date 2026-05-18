@@ -35,18 +35,6 @@ jobs:
       runners: |
         {"linux_amd64": "depot-ubuntu-24.04-16", "linux_arm64": "depot-ubuntu-24.04-arm-16"}
 
-  duckdb-next-deploy:
-    name: Deploy extension binaries
-    needs: [get-duckdb-version, duckdb-next-build]
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@main
-    secrets: inherit
-    with:
-      extension_name: ducklake
-      duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: main
-      deploy_latest: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
-      deploy_versioned: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
-
   publish-github-release:
     name: Publish GitHub Release assets
     runs-on: ubuntu-latest
