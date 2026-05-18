@@ -23,6 +23,12 @@ struct SnapshotChangeInformation {
 	case_insensitive_map_t<case_insensitive_map_t<string>> created_scalar_macros;
 	case_insensitive_map_t<case_insensitive_map_t<string>> created_table_macros;
 	set<TableIndex> altered_tables;
+	//! Subset of altered_tables for alters that physically affect data layout
+	//! (currently SET PARTITION KEY). Used to gate concurrent INSERT conflicts:
+	//! INSERTs against a table whose partition key just changed must still
+	//! conflict, because the inserted file lacks partition_value rows for the
+	//! new key.
+	set<TableIndex> partition_key_changed_tables;
 	set<TableIndex> altered_views;
 	set<TableIndex> dropped_tables;
 	set<TableIndex> dropped_views;

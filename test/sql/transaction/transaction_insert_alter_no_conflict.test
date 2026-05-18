@@ -104,3 +104,37 @@ SELECT i, j, k, n FROM ducklake.test ORDER BY i
 2	20	NULL	NULL
 3	30	300	NULL
 4	40	400	4000
+
+# concurrent insert and SET PARTITIONED BY: MUST still conflict.
+# A file written without partition values for the new key has no rows in
+# ducklake_file_partition_value, so reading it under the new partition
+# scheme would produce incorrect/missing partition metadata.
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+ALTER TABLE ducklake.test SET PARTITIONED BY (i)
+
+statement ok con2
+INSERT INTO ducklake.test VALUES (5, 50, 500, 5000)
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+Transaction conflict
+
+# data after the failed insert: existing rows preserved, the partition scheme
+# is now applied to future writes; con2's INSERT of (5,...) did not land.
+query IIII
+SELECT i, j, k, n FROM ducklake.test ORDER BY i
+----
+1	10	NULL	NULL
+2	20	NULL	NULL
+3	30	300	NULL
+4	40	400	4000

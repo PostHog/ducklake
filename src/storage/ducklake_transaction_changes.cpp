@@ -23,7 +23,9 @@ enum class ChangeType {
 	CREATED_SCALAR_MACRO,
 	CREATED_TABLE_MACRO,
 	DROPPED_SCALAR_MACRO,
-	DROPPED_TABLE_MACRO
+	DROPPED_TABLE_MACRO,
+	PARTITION_KEY_CHANGED,
+	UNKNOWN
 };
 
 struct ChangeInfo {
@@ -80,8 +82,12 @@ ChangeType ParseChangeType(const string &changes_made, idx_t &pos) {
 	} else if (StringUtil::CIEquals(change_type_str, "flushed_inlined") ||
 	           StringUtil::CIEquals(change_type_str, "inline_flush")) {
 		return ChangeType::FLUSHED_INLINE_DATA_FOR_TABLE;
+	} else if (StringUtil::CIEquals(change_type_str, "partition_key_change")) {
+		return ChangeType::PARTITION_KEY_CHANGED;
 	} else {
-		throw InvalidInputException("Unsupported change type %s", change_type_str);
+		// Forward-compat: skip unknown change types so newer writers can add
+		// new tags without breaking older readers.
+		return ChangeType::UNKNOWN;
 	}
 }
 
@@ -206,6 +212,12 @@ SnapshotChangeInformation SnapshotChangeInformation::ParseChangesMade(const stri
 			break;
 		case ChangeType::FLUSHED_INLINE_DATA_FOR_TABLE:
 			result.tables_flushed_inlined.insert(TableIndex(StringUtil::ToUnsigned(entry.change_value)));
+			break;
+		case ChangeType::PARTITION_KEY_CHANGED:
+			result.partition_key_changed_tables.insert(TableIndex(StringUtil::ToUnsigned(entry.change_value)));
+			break;
+		case ChangeType::UNKNOWN:
+			// Forward-compat: ignore unknown tags emitted by newer writers.
 			break;
 		default:
 			throw InternalException("Unsupported change type in ParseChangesMade");

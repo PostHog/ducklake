@@ -767,6 +767,12 @@ struct TransactionChangeInformation {
 
 	set<TableIndex> altered_tables;
 	set<TableIndex> altered_tables_with_schema_version_changes;
+	// Subset of altered_tables for alters that physically affect data layout
+	// (currently SET PARTITION KEY). Concurrent INSERTs against such tables must
+	// still conflict because the inserted file would be missing partition_value
+	// rows for the new key, while column-shape alters (ADD/RENAME/DROP COLUMN,
+	// etc.) are safe because each file carries its own mapping_id.
+	set<TableIndex> partition_key_changed_tables;
 	set<TableIndex> altered_views;
 	set<TableIndex> dropped_tables;
 	set<TableIndex> dropped_views;
@@ -786,7 +792,17 @@ void GetTransactionTableChanges(reference<CatalogEntry> table_entry, Transaction
 	while (true) {
 		auto &table = table_entry.get().Cast<DuckLakeTableEntry>();
 		switch (table.GetLocalChange().type) {
-		case LocalChangeType::SET_PARTITION_KEY:
+		case LocalChangeType::SET_PARTITION_KEY: {
+			// partition key change physically affects data layout: concurrent inserts
+			// would produce files with no partition_value rows for the new key
+			auto table_id = table.GetTableId();
+			if (!table_id.IsTransactionLocal()) {
+				changes.altered_tables.insert(table_id);
+				changes.altered_tables_with_schema_version_changes.insert(table_id);
+				changes.partition_key_changed_tables.insert(table_id);
+			}
+			break;
+		}
 		case LocalChangeType::SET_NULL:
 		case LocalChangeType::DROP_NULL:
 		case LocalChangeType::RENAME_COLUMN:
@@ -1127,6 +1143,7 @@ string DuckLakeTransaction::WriteSnapshotChanges(DuckLakeCommitState &commit_sta
 	AddChangeInfo(commit_state, change_info, changes.tables_inserted_into, "inserted_into_table");
 	AddChangeInfo(commit_state, change_info, changes.tables_deleted_from, "deleted_from_table");
 	AddChangeInfo(commit_state, change_info, changes.altered_tables, "altered_table");
+	AddChangeInfo(commit_state, change_info, changes.partition_key_changed_tables, "partition_key_change");
 	AddChangeInfo(commit_state, change_info, changes.altered_views, "altered_view");
 	AddChangeInfo(commit_state, change_info, changes.tables_inserted_inlined, "inlined_insert");
 	AddChangeInfo(commit_state, change_info, changes.tables_deleted_inlined, "inlined_delete");
@@ -1271,10 +1288,16 @@ void DuckLakeTransaction::CheckForConflicts(const TransactionChangeInformation &
 	}
 	for (auto &table_id : changes.tables_inserted_into) {
 		ConflictCheck(table_id, other_changes.dropped_tables, "insert into table", "dropped it");
-		// NOTE: insert-vs-alter is safe because each data file carries its own mapping_id
-		// that describes the column layout at write time. The multi-file reader uses
-		// this mapping to correctly read files written under older schemas, even after
-		// ALTER TABLE ADD/DROP/RENAME COLUMN operations.
+		// NOTE: insert-vs-alter is generally safe because each data file carries its own
+		// mapping_id describing the column layout at write time. The multi-file reader
+		// uses this mapping to correctly read files written under older schemas, even
+		// after ALTER TABLE ADD/DROP/RENAME COLUMN operations.
+		//
+		// EXCEPTION: SET PARTITION KEY physically affects data layout. A file written
+		// before the partition key changes has no entries in ducklake_file_partition_value
+		// for the new key, so we still conflict on those.
+		ConflictCheck(table_id, other_changes.partition_key_changed_tables, "insert into table",
+		              "changed its partition key");
 		ConflictCheck(table_id, other_changes.tables_deleted_from, "insert into table", "deleted from it");
 		ConflictCheck(table_id, other_changes.tables_deleted_inlined, "insert into table",
 		              "deleted inlined data from it");
@@ -1641,6 +1664,7 @@ void DuckLakeTransaction::GetNewTableInfo(DuckLakeCommitState &commit_state, Duc
 
 			transaction_changes.altered_tables.insert(table_id);
 			transaction_changes.altered_tables_with_schema_version_changes.insert(table_id);
+			transaction_changes.partition_key_changed_tables.insert(table_id);
 			column_schema_change = true;
 			break;
 		}
