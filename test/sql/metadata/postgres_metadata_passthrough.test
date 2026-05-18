@@ -36,3 +36,18 @@ WHERE query LIKE '%postgres_query%'
   AND query LIKE '%ducklake_file_column_stats%'
 ----
 true
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs_parsed('DuckLakeMetadata')
+WHERE query LIKE '%postgres_query%'
+  AND query LIKE '%ducklake_table_stats%'
+----
+true
+
+query I
+SELECT count(*)
+FROM duckdb_logs_parsed('DuckLakeMetadata')
+WHERE query LIKE '%FROM "__ducklake_metadata_ducklake"."public".ducklake_table_stats%'
+----
+0

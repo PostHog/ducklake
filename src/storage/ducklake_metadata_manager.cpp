@@ -938,7 +938,7 @@ WHERE table_id = %llu
 ORDER BY table_id;
 )", table_id.index);
 
-	auto result = transaction.Query(snapshot, query);
+	auto result = Query(snapshot, query);
 	return TransformGlobalStats(*result);
 }
 
