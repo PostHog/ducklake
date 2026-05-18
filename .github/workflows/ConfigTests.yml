@@ -35,6 +35,10 @@ jobs:
         fetch-depth: 0
         submodules: 'true'
 
+    - name: Check metadata query intent
+      run: |
+        python3 scripts/check_metadata_query_intent.py
+
     - name: Checkout DuckDB to version
       run: |
         cd duckdb
