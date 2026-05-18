@@ -17,6 +17,9 @@ statement ok
 SET immediate_transaction_mode=true
 
 statement ok
+SET ducklake_default_data_inlining_row_limit=0
+
+statement ok
 CREATE TABLE ducklake.test(i INTEGER, j INTEGER);
 
 statement ok
