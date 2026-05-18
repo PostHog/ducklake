@@ -202,13 +202,6 @@ CREATE TABLE {METADATA_CATALOG}.ducklake_macro_impl(macro_id BIGINT, impl_id BIG
 CREATE TABLE {METADATA_CATALOG}.ducklake_macro_parameters(macro_id BIGINT, impl_id BIGINT,column_id BIGINT, parameter_name VARCHAR, parameter_type VARCHAR, default_value VARCHAR, default_value_type VARCHAR, PRIMARY KEY (macro_id, impl_id, column_id));
 CREATE TABLE {METADATA_CATALOG}.ducklake_sort_info(sort_id BIGINT, table_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT);
 CREATE TABLE {METADATA_CATALOG}.ducklake_sort_expression(sort_id BIGINT, table_id BIGINT, sort_key_index BIGINT, expression VARCHAR, dialect VARCHAR, sort_direction VARCHAR, null_order VARCHAR);
-CREATE INDEX idx_data_file_table_snapshot ON {METADATA_CATALOG}.ducklake_data_file(table_id, begin_snapshot, end_snapshot);
-CREATE INDEX idx_delete_file_table_snapshot ON {METADATA_CATALOG}.ducklake_delete_file(table_id, begin_snapshot, end_snapshot);
-CREATE INDEX idx_column_table ON {METADATA_CATALOG}.ducklake_column(table_id, end_snapshot);
-CREATE INDEX idx_file_column_stats_table ON {METADATA_CATALOG}.ducklake_file_column_stats(table_id, column_id);
-CREATE INDEX idx_partition_info_table ON {METADATA_CATALOG}.ducklake_partition_info(table_id);
-CREATE INDEX idx_partition_column_table ON {METADATA_CATALOG}.ducklake_partition_column(table_id);
-CREATE INDEX idx_file_partition_value_table ON {METADATA_CATALOG}.ducklake_file_partition_value(table_id);
 INSERT INTO {METADATA_CATALOG}.ducklake_snapshot VALUES (0, NOW(), 0, 1, 0);
 INSERT INTO {METADATA_CATALOG}.ducklake_snapshot_changes VALUES (0, 'created_schema:"main"',  NULL, NULL, NULL);
 INSERT INTO {METADATA_CATALOG}.ducklake_metadata (key, value) VALUES ('version', '1.0'), ('created_by', 'DuckDB %s'), ('data_path', %s), ('encrypted', '%s');
