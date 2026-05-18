@@ -1281,6 +1281,7 @@ void DuckLakeTransaction::CheckForConflicts(const TransactionChangeInformation &
 	}
 	for (auto &table_id : changes.tables_inserted_inlined) {
 		ConflictCheck(table_id, other_changes.dropped_tables, "insert into table", "dropped it");
+		ConflictCheck(table_id, other_changes.altered_tables, "insert into table", "altered it");
 		ConflictCheck(table_id, other_changes.tables_deleted_from, "insert into table", "deleted from it");
 		ConflictCheck(table_id, other_changes.tables_deleted_inlined, "insert into table",
 		              "deleted inlined data from it");
