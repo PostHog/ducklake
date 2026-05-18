@@ -33,19 +33,6 @@ jobs:
       ci_tools_version: main
       extension_name: ducklake
 
-  duckdb-next-deploy:
-    name: Deploy extension binaries
-    needs: [get-duckdb-version, duckdb-next-build]
-    if: github.ref != 'refs/heads/main'
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@main
-    secrets: inherit
-    with:
-      extension_name: ducklake
-      duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: main
-      deploy_latest: ${{ startsWith(github.ref, 'refs/heads/v') }}
-      deploy_versioned: ${{ startsWith(github.ref, 'refs/heads/v') }}
-
   publish-github-release:
     name: Publish GitHub Release assets
     runs-on: ubuntu-latest
