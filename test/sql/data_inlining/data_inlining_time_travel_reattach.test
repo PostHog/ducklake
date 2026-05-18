@@ -1,0 +1,63 @@
+# name: test/sql/data_inlining/data_inlining_time_travel_reattach.test
+# description: old snapshot reads ignore newer inlined-data registry rows after schema evolution and reattach
+# group: [data_inlining]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ducklake_inlining_time_travel_reattach.db' AS ducklake (DATA_PATH '__TEST_DIR__/ducklake_inlining_time_travel_reattach', METADATA_CATALOG 'ducklake_meta', DATA_INLINING_ROW_LIMIT 10)
+
+statement ok
+CREATE TABLE ducklake.test(i INTEGER)
+
+statement ok
+INSERT INTO ducklake.test VALUES (1), (2)
+
+query TI
+SELECT filename, i FROM ducklake.test AT (VERSION => 2) ORDER BY i
+----
+ducklake_inlined_data_1_1	1
+ducklake_inlined_data_1_1	2
+
+statement ok
+ALTER TABLE ducklake.test ADD COLUMN j INTEGER
+
+statement ok
+INSERT INTO ducklake.test VALUES (3, 30)
+
+query T
+SELECT table_name FROM ducklake_meta.ducklake_inlined_data_tables ORDER BY schema_version
+----
+ducklake_inlined_data_1_1
+ducklake_inlined_data_1_2
+
+# Leave the future registry row in place but remove the future inlined table.
+# Old snapshot reads should not depend on this newer registry entry.
+statement ok
+DROP TABLE ducklake_meta.ducklake_inlined_data_1_2
+
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ducklake_inlining_time_travel_reattach.db' AS ducklake (DATA_PATH '__TEST_DIR__/ducklake_inlining_time_travel_reattach', METADATA_CATALOG 'ducklake_meta', DATA_INLINING_ROW_LIMIT 10)
+
+query TI
+SELECT filename, i FROM ducklake.test AT (VERSION => 2) ORDER BY i
+----
+ducklake_inlined_data_1_1	1
+ducklake_inlined_data_1_1	2
+
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/ducklake_inlining_time_travel_reattach.db' AS ducklake (DATA_PATH '__TEST_DIR__/ducklake_inlining_time_travel_reattach', METADATA_CATALOG 'ducklake_meta', SNAPSHOT_VERSION 2)
+
+query TI
+SELECT filename, i FROM ducklake.test ORDER BY i
+----
+ducklake_inlined_data_1_1	1
+ducklake_inlined_data_1_1	2

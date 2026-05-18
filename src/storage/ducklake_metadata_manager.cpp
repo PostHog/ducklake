@@ -576,6 +576,7 @@ SELECT schema_id, tbl.table_id, table_uuid::VARCHAR, table_name,
 		SELECT %s
 		FROM {METADATA_CATALOG}.ducklake_inlined_data_tables inlined_data_tables
 		WHERE inlined_data_tables.table_id = tbl.table_id
+		  AND inlined_data_tables.schema_version <= {SCHEMA_VERSION}
 	) AS inlined_data_tables,
 	path, path_is_relative,
 	col.column_id, column_name, column_type, initial_default, default_value, nulls_allowed, parent_column,
