@@ -27,7 +27,7 @@ jobs:
   duckdb-next-build:
     name: Build extension binaries
     needs: get-duckdb-version
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@344397bb848aac786d260daf396ad09fc6a1d21f # v1.5.2
     with:
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
       ci_tools_version: main
@@ -37,7 +37,7 @@ jobs:
     name: Deploy extension binaries
     needs: [get-duckdb-version, duckdb-next-build]
     if: github.ref != 'refs/heads/main'
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@main
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@344397bb848aac786d260daf396ad09fc6a1d21f # v1.5.2
     secrets: inherit
     with:
       extension_name: ducklake

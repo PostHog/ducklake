@@ -52,13 +52,13 @@ jobs:
         git checkout $(cat ../.github/duckdb-version)
 
     - name: Setup Ccache
-      uses: hendrikmuhs/ccache-action@main
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
       with:
         key: ${{ github.job }}
         save: ${{ github.ref == 'refs/heads/main' || github.repository != 'duckdb/ducklake' }}
 
     - name: Setup vcpkg
-      uses: lukka/run-vcpkg@v11.1
+      uses: lukka/run-vcpkg@abed23940f9d7bc267b0e1a21ee7b699a3794baa # v11.1
       with:
         vcpkgGitCommitId: a42af01b72c28a8e1d7b48107b33e4f286a55ef6
 
