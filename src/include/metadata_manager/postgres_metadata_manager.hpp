@@ -47,6 +47,7 @@ protected:
 	string CastStatsToTarget(const string &stats, const LogicalType &type) override;
 	string GenerateConstantFilter(const ConstantFilter &constant_filter, const LogicalType &type,
 	                              unordered_set<string> &referenced_stats) override;
+	string GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
 
 private:
 	unique_ptr<QueryResult> ExecuteQuery(DuckLakeSnapshot snapshot, string &query, string command);

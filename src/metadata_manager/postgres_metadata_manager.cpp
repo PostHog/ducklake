@@ -4,6 +4,7 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
+#include "storage/ducklake_metadata_info.hpp"
 
 namespace duckdb {
 
@@ -298,7 +299,7 @@ unique_ptr<QueryResult> PostgresMetadataManager::Execute(string &query) {
 }
 
 unique_ptr<QueryResult> PostgresMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
-	return ExecuteQuery(snapshot, query, "postgres_query");
+	return DuckLakeMetadataManager::Query(snapshot, query);
 }
 
 unique_ptr<QueryResult> PostgresMetadataManager::Query(string &query) {
@@ -331,6 +332,18 @@ SELECT EXISTS (
 	}
 	auto chunk = result->Fetch();
 	return chunk && chunk->size() > 0 && chunk->GetValue(0, 0).GetValue<bool>();
+}
+
+string PostgresMetadataManager::GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) {
+	string select_list = "data_file_id";
+	for (const auto &stat : req.referenced_stats) {
+		select_list += ", " + stat;
+	}
+	return StringUtil::Format("  SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL},\n"
+	                          "    'SELECT %s\n"
+	                          "     FROM {METADATA_SCHEMA_ESCAPED}.ducklake_file_column_stats\n"
+	                          "     WHERE column_id = %d AND table_id = %d')\n",
+	                          select_list, req.column_field_index, table_id.index);
 }
 
 // We need a specialized function here to do a reinterpret for postgres from BLOB to VARCHAR
