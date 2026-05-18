@@ -908,7 +908,7 @@ LEFT JOIN {METADATA_CATALOG}.ducklake_table_column_stats USING (table_id)
 WHERE record_count IS NOT NULL AND file_size_bytes IS NOT NULL
 ORDER BY table_id;
 )";
-	auto result = transaction.Query(snapshot, query);
+	auto result = Query(snapshot, query);
 	return TransformGlobalStats(*result);
 }
 
