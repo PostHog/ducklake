@@ -246,8 +246,9 @@ string PostgresMetadataManager::GenerateConstantFilter(const ConstantFilter &con
 	}
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot snapshot, string &query,
-                                                              string command) {
+unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot snapshot, string &query, string command,
+                                                              bool use_snapshot_query,
+                                                              bool use_explicit_metadata_transaction) {
 	auto &commit_info = transaction.GetCommitInfo();
 
 	query = StringUtil::Replace(query, "{SNAPSHOT_ID}", to_string(snapshot.snapshot_id));
@@ -276,7 +277,11 @@ unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot s
 	query = StringUtil::Replace(query, "{DATA_PATH}", data_path);
 
 	auto passthrough_query = StringUtil::Format("CALL %s(%s, %s)", command, catalog_literal, SQLString(query));
-	auto result = transaction.RawQuery(passthrough_query);
+	auto result = use_snapshot_query
+	                  ? (use_explicit_metadata_transaction
+	                         ? transaction.SnapshotQueryInTransaction(snapshot, passthrough_query)
+	                         : transaction.SnapshotQuery(snapshot, passthrough_query))
+	                  : transaction.RawQuery(passthrough_query);
 	if (command == "postgres_execute" && !result->HasError()) {
 		while (result->Fetch()) {
 		}
@@ -298,7 +303,11 @@ unique_ptr<QueryResult> PostgresMetadataManager::Execute(string &query) {
 }
 
 unique_ptr<QueryResult> PostgresMetadataManager::SnapshotQuery(DuckLakeSnapshot snapshot, string &query) {
-	return ExecuteQuery(snapshot, query, "postgres_query");
+	return ExecuteQuery(snapshot, query, "postgres_query", true);
+}
+
+unique_ptr<QueryResult> PostgresMetadataManager::SnapshotQueryInTransaction(DuckLakeSnapshot snapshot, string &query) {
+	return ExecuteQuery(snapshot, query, "postgres_query", true, true);
 }
 
 unique_ptr<QueryResult> PostgresMetadataManager::CurrentQuery(DuckLakeSnapshot snapshot, string &query) {
@@ -319,8 +328,8 @@ string PostgresMetadataManager::GetLatestSnapshotQuery() const {
 	)";
 }
 
-bool PostgresMetadataManager::InlinedDeletionTableExists(TableIndex, DuckLakeSnapshot snapshot,
-                                                         const string &table_name) {
+bool PostgresMetadataManager::InlinedDeletionTableExists(TableIndex, DuckLakeSnapshot snapshot, const string &table_name,
+                                                         bool use_explicit_metadata_transaction) {
 	auto query = StringUtil::Format(R"(
 SELECT EXISTS (
 	SELECT 1
@@ -329,7 +338,8 @@ SELECT EXISTS (
 	  AND table_name = %s
 ))",
 	                                DuckLakeUtil::SQLLiteralToString(table_name));
-	auto result = SnapshotQuery(snapshot, query);
+	auto result = use_explicit_metadata_transaction ? SnapshotQueryInTransaction(snapshot, query)
+	                                                : SnapshotQuery(snapshot, query);
 	if (result->HasError()) {
 		return false;
 	}

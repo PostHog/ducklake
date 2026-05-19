@@ -146,7 +146,7 @@ SinkFinalizeType DuckLakeFlushData::Finalize(Pipeline &pipeline, Event &event, C
 				order_by = sort_order_sql + ", row_id, begin_snapshot";
 			}
 			auto deleted_rows_result =
-			    transaction.SnapshotQuery(snapshot, StringUtil::Format(R"(
+			    transaction.SnapshotQueryInTransaction(snapshot, StringUtil::Format(R"(
 				WITH all_rows AS (
 					SELECT end_snapshot, ROW_NUMBER() OVER (ORDER BY %s) - 1 AS output_position
 					FROM {METADATA_CATALOG}.%s
@@ -420,14 +420,14 @@ static void FlushInlinedFileDeletions(ClientContext &context, DuckLakeCatalog &c
 	auto snapshot = transaction.GetSnapshot();
 
 	// Check if this table has an inlined deletion table
-	auto inlined_table_name = metadata_manager.GetInlinedDeletionTableName(table_id, snapshot);
+	auto inlined_table_name = metadata_manager.GetInlinedDeletionTableName(table_id, snapshot, false, true);
 	if (inlined_table_name.empty()) {
 		// No inlined deletions for this table, skiddadle
 		return;
 	}
 
 	// Query the inlined deletions with file paths and existing delete file info
-	auto deletions_result = transaction.SnapshotQuery(snapshot, StringUtil::Format(R"(
+	auto deletions_result = transaction.SnapshotQueryInTransaction(snapshot, StringUtil::Format(R"(
 SELECT del.file_id, data.path, data.path_is_relative, del.row_id, del.begin_snapshot,
        existing_del.delete_file_id, existing_del.path as del_path, existing_del.path_is_relative as del_path_is_relative,
        existing_del.begin_snapshot as del_begin_snapshot, existing_del.encryption_key as del_encryption_key,

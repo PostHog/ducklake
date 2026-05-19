@@ -1,0 +1,115 @@
+# name: test/sql/metadata/snapshot_reads_stay_pinned_after_commits.test
+# description: Snapshot reads stay pinned even after another connection commits newer metadata
+# group: [metadata]
+
+require ducklake
+
+require parquet
+
+test-env FILE_DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env INLINE_DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok con1
+ATTACH 'ducklake:${FILE_DUCKLAKE_CONNECTION}' AS file_reader (DATA_PATH '${DATA_PATH}/ducklake_snapshot_pinned_files', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok con1
+CREATE TABLE file_reader.file_tbl(id INTEGER, payload VARCHAR)
+
+statement ok con1
+INSERT INTO file_reader.file_tbl VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+statement ok con1
+CALL enable_logging('DuckLakeMetadata')
+
+statement ok con1
+SET VARIABLE file_snapshot = (SELECT max(snapshot_id) FROM ducklake_snapshots('file_reader'))
+
+statement ok con2
+DELETE FROM file_reader.file_tbl WHERE id = 1
+
+statement ok con2
+INSERT INTO file_reader.file_tbl VALUES (4, 'd')
+
+statement ok con2
+ALTER TABLE file_reader.file_tbl ADD COLUMN future_col VARCHAR DEFAULT 'future'
+
+query IT con1
+SELECT * FROM file_reader.file_tbl AT (VERSION => getvariable('file_snapshot')) ORDER BY id
+----
+1	a
+2	b
+3	c
+
+query II con1
+SELECT count(*), sum(id) FROM file_reader.file_tbl AT (VERSION => getvariable('file_snapshot'))
+----
+3	6
+
+query II con1
+SELECT count(*), sum(id) FROM file_reader.file_tbl
+----
+3	9
+
+statement ok con1
+ATTACH 'ducklake:${INLINE_DUCKLAKE_CONNECTION}' AS inline_reader (DATA_PATH '${DATA_PATH}/ducklake_snapshot_pinned_inlined', DATA_INLINING_ROW_LIMIT 10)
+
+statement ok con1
+CREATE TABLE inline_reader.inline_tbl(id INTEGER, payload VARCHAR)
+
+statement ok con1
+INSERT INTO inline_reader.inline_tbl VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+statement ok con1
+SET VARIABLE inline_snapshot = (SELECT max(snapshot_id) FROM ducklake_snapshots('inline_reader'))
+
+statement ok con2
+DELETE FROM inline_reader.inline_tbl WHERE id = 1
+
+statement ok con2
+ALTER TABLE inline_reader.inline_tbl ADD COLUMN future_col VARCHAR DEFAULT 'future'
+
+statement ok con2
+INSERT INTO inline_reader.inline_tbl VALUES (4, 'd', 'future')
+
+query IT con1
+SELECT * FROM inline_reader.inline_tbl AT (VERSION => getvariable('inline_snapshot')) ORDER BY id
+----
+1	a
+2	b
+3	c
+
+query II con1
+SELECT count(*), sum(id) FROM inline_reader.inline_tbl AT (VERSION => getvariable('inline_snapshot'))
+----
+3	6
+
+query II con1
+SELECT count(*), sum(id) FROM inline_reader.inline_tbl
+----
+3	9
+
+query I con1
+SELECT count(*) > 0
+FROM duckdb_logs_parsed('DuckLakeMetadata')
+WHERE metadata_api = 'SnapshotQuery'
+----
+true
+
+query I con1
+SELECT count(*) = 0
+FROM duckdb_logs_parsed('DuckLakeMetadata')
+WHERE metadata_api = 'SnapshotQuery'
+  AND ducklake_explicit_metadata_transaction
+----
+true
+
+query I con1
+SELECT count(*) > 0
+FROM duckdb_logs_parsed('DuckLakeMetadata')
+WHERE metadata_api = 'SnapshotQuery'
+  AND query LIKE '%ducklake_inlined_data%'
+----
+true

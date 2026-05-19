@@ -57,7 +57,7 @@ ALLOWED_MEMBER_QUERY_CALLS = [
     {
         "path": "src/storage/ducklake_transaction.cpp",
         "function": re.compile(
-            r"\bunique_ptr\s*<\s*QueryResult\s*>\s+DuckLakeTransaction::RunQuery\s*\(\s*string\s+query\s*\)\s*\{"
+            r"\bunique_ptr\s*<\s*QueryResult\s*>\s+DuckLakeTransaction::RunQuery\s*\(\s*Connection\s*&\s*connection\s*,\s*string\s+query\s*,\s*const\s+string\s*&\s*metadata_api\s*,\s*bool\s+use_explicit_metadata_transaction\s*\)\s*\{"
         ),
         "pattern": re.compile(r"\bconnection\s*\.\s*Query\s*\(\s*query\s*\)", re.DOTALL),
         "max_count": 1,
