@@ -7,38 +7,34 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-QUERY_IMPLEMENTATION = re.compile(r"\b[A-Za-z_][A-Za-z0-9_:<>]*::Query\s*\(")
-MEMBER_QUERY_CALL = re.compile(r"(?:\b[A-Za-z_][A-Za-z0-9_]*|\))\s*(?:->|\.)\s*Query\s*\(")
+QUERY_IMPLEMENTATION = re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_:<>]*\s*::\s*)+Query\s*\(")
+MEMBER_QUERY_CALL = re.compile(r"(?:->|\.)\s*Query\s*\(")
 
 FORBIDDEN_DECLARATION = re.compile(
-    r"^\s*(?:virtual\s+)?unique_ptr<QueryResult>\s+Query\s*\(",
+    r"^\s*(?:virtual\s+)?unique_ptr\s*<\s*QueryResult\s*>\s+Query\s*\(",
     re.MULTILINE,
 )
 
-DECLARATION_HEADERS = [
-    "src/include/storage/ducklake_transaction.hpp",
-    "src/include/storage/ducklake_metadata_manager.hpp",
-    "src/include/metadata_manager/postgres_metadata_manager.hpp",
-]
+SOURCE_ROOTS = ["src"]
 
-SOURCE_ROOTS = [
-    "src/include",
-    "src/functions",
-    "src/metadata_manager",
-    "src/storage",
+ALLOWED_MEMBER_QUERY_CALLS = [
+    {
+        "path": "src/storage/ducklake_checkpoint.cpp",
+        "function": re.compile(
+            r"\bvoid\s+DuckLakeTransactionManager::Checkpoint\s*\(\s*ClientContext\s*&\s*context\s*,\s*bool\s+force\s*\)\s*\{"
+        ),
+        "pattern": re.compile(r"\bconn\s*->\s*Query\s*\(\s*checkpoint_query\s*\)", re.DOTALL),
+        "max_count": 1,
+    },
+    {
+        "path": "src/storage/ducklake_transaction.cpp",
+        "function": re.compile(
+            r"\bunique_ptr\s*<\s*QueryResult\s*>\s+DuckLakeTransaction::RunQuery\s*\(\s*string\s+query\s*\)\s*\{"
+        ),
+        "pattern": re.compile(r"\bconnection\s*\.\s*Query\s*\(\s*query\s*\)", re.DOTALL),
+        "max_count": 1,
+    },
 ]
-
-ALLOWED_MEMBER_QUERY_CALLS = {
-    # Raw DuckDB Connection::Query call for checkpointing.
-    "src/storage/ducklake_checkpoint.cpp": [
-        re.compile(r"\bconn\s*->\s*Query\s*\(\s*checkpoint_query\s*\)"),
-    ],
-    # The single low-level DuckLake metadata runner. Higher-level metadata code
-    # must go through Execute, SnapshotQuery, CurrentQuery, or RawQuery.
-    "src/storage/ducklake_transaction.cpp": [
-        re.compile(r"\bconnection\s*\.\s*Query\s*\(\s*query\s*\)"),
-    ],
-}
 
 
 def iter_source_files():
@@ -122,33 +118,93 @@ def strip_comments_and_literals(text):
     return "".join(result)
 
 
-def is_allowed_member_query(path, line):
+def find_matching_brace(code_text, open_brace):
+    depth = 0
+    for pos in range(open_brace, len(code_text)):
+        char = code_text[pos]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return pos + 1
+    return None
+
+
+def find_function_span(code_text, function_pattern):
+    matches = list(function_pattern.finditer(code_text))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    open_brace = code_text.find("{", match.start(), match.end())
+    if open_brace == -1:
+        return None
+    close_brace = find_matching_brace(code_text, open_brace)
+    if close_brace is None:
+        return None
+    return match.start(), close_brace
+
+
+def build_allowed_spans(path, code_text, matches):
     rel_path = path.relative_to(ROOT).as_posix()
-    return any(pattern.search(line) for pattern in ALLOWED_MEMBER_QUERY_CALLS.get(rel_path, []))
+    spans = []
+    for index, allowed in enumerate(ALLOWED_MEMBER_QUERY_CALLS):
+        if allowed["path"] != rel_path:
+            continue
+        function_span = find_function_span(code_text, allowed["function"])
+        if function_span is None:
+            continue
+        start, end = function_span
+        function_text = code_text[start:end]
+        allowed_matches = list(allowed["pattern"].finditer(function_text))
+        matches.append_allowed_count(index, len(allowed_matches))
+        for allowed_match in allowed_matches:
+            spans.append((index, start + allowed_match.start(), start + allowed_match.end()))
+    return spans
 
 
-def add_matches(matches, path, pattern, reason, allow_member_queries=False):
+def is_allowed_member_query(match, allowed_spans, allowed_counts):
+    for index, start, end in allowed_spans:
+        if match.start() < start or match.end() > end:
+            continue
+        current_count = allowed_counts.get(index, 0)
+        if current_count >= ALLOWED_MEMBER_QUERY_CALLS[index]["max_count"]:
+            return False
+        allowed_counts[index] = current_count + 1
+        return True
+    return False
+
+
+class MatchList(list):
+    def __init__(self):
+        super().__init__()
+        self.allowed_totals = {}
+
+    def append_allowed_count(self, index, count):
+        self.allowed_totals[index] = self.allowed_totals.get(index, 0) + count
+
+
+def add_matches(matches, path, pattern, reason, allow_member_queries=False, allowed_counts=None):
     original_text = path.read_text(errors="replace")
     code_text = strip_comments_and_literals(original_text)
     original_lines = original_text.splitlines()
     code_lines = code_text.splitlines()
+    allowed_spans = build_allowed_spans(path, code_text, matches) if allow_member_queries else []
     for match in pattern.finditer(code_text):
         line_no = code_text.count("\n", 0, match.start()) + 1
         code_line = code_lines[line_no - 1] if line_no <= len(code_lines) else ""
-        if allow_member_queries and is_allowed_member_query(path, code_line):
+        if allow_member_queries and is_allowed_member_query(match, allowed_spans, allowed_counts):
             continue
         original_line = original_lines[line_no - 1] if line_no <= len(original_lines) else code_line
         matches.append((path, line_no, reason, original_line.strip()))
 
 
 def main():
-    matches = []
-    for rel_path in DECLARATION_HEADERS:
-        path = ROOT / rel_path
-        if path.exists():
-            add_matches(matches, path, FORBIDDEN_DECLARATION, "ambiguous metadata Query declaration")
+    matches = MatchList()
+    allowed_counts = {}
 
     for path in iter_source_files():
+        add_matches(matches, path, FORBIDDEN_DECLARATION, "ambiguous metadata Query declaration")
         add_matches(matches, path, QUERY_IMPLEMENTATION, "ambiguous Query implementation")
         add_matches(
             matches,
@@ -156,7 +212,20 @@ def main():
             MEMBER_QUERY_CALL,
             "direct Query call outside the low-level raw DuckDB execution allowlist",
             allow_member_queries=True,
+            allowed_counts=allowed_counts,
         )
+
+    for index, allowed in enumerate(ALLOWED_MEMBER_QUERY_CALLS):
+        count = matches.allowed_totals.get(index, 0)
+        if count != allowed["max_count"]:
+            matches.append(
+                (
+                    ROOT / allowed["path"],
+                    1,
+                    "raw Query allowlist does not match the expected number of calls",
+                    f"{allowed['function'].pattern}: expected {allowed['max_count']}, found {count}",
+                )
+            )
 
     if not matches:
         return 0
