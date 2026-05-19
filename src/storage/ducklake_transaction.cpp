@@ -2692,7 +2692,31 @@ void DuckLakeTransaction::MarkInlinedDataForDeletion(DuckLakeInlinedTableInfo in
 	flushed_inlined_tables.push_back({std::move(inlined_table), flush_snapshot_id});
 }
 
-unique_ptr<QueryResult> DuckLakeTransaction::Query(string query) {
+unique_ptr<QueryResult> DuckLakeTransaction::Execute(DuckLakeSnapshot snapshot, string query) {
+	return RunQuery(snapshot, std::move(query));
+}
+
+unique_ptr<QueryResult> DuckLakeTransaction::Execute(string query) {
+	return RunQuery(std::move(query));
+}
+
+unique_ptr<QueryResult> DuckLakeTransaction::SnapshotQuery(DuckLakeSnapshot snapshot, string query) {
+	return RunQuery(snapshot, std::move(query));
+}
+
+unique_ptr<QueryResult> DuckLakeTransaction::CurrentQuery(DuckLakeSnapshot snapshot, string query) {
+	return RunQuery(snapshot, std::move(query));
+}
+
+unique_ptr<QueryResult> DuckLakeTransaction::CurrentQuery(string query) {
+	return RunQuery(std::move(query));
+}
+
+unique_ptr<QueryResult> DuckLakeTransaction::RawQuery(string query) {
+	return RunQuery(std::move(query));
+}
+
+unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(string query) {
 	auto &connection = GetConnection();
 	auto catalog_identifier = DuckLakeUtil::SQLIdentifierToString(ducklake_catalog.MetadataDatabaseName());
 	auto catalog_literal = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.MetadataDatabaseName());
@@ -2723,7 +2747,7 @@ unique_ptr<QueryResult> DuckLakeTransaction::Query(string query) {
 	return result;
 }
 
-unique_ptr<QueryResult> DuckLakeTransaction::Query(DuckLakeSnapshot snapshot, string query) {
+unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(DuckLakeSnapshot snapshot, string query) {
 	query = StringUtil::Replace(query, "{SNAPSHOT_ID}", to_string(snapshot.snapshot_id));
 	query = StringUtil::Replace(query, "{SCHEMA_VERSION}", to_string(snapshot.schema_version));
 	query = StringUtil::Replace(query, "{NEXT_CATALOG_ID}", to_string(snapshot.next_catalog_id));
@@ -2732,7 +2756,7 @@ unique_ptr<QueryResult> DuckLakeTransaction::Query(DuckLakeSnapshot snapshot, st
 	query = StringUtil::Replace(query, "{COMMIT_MESSAGE}", commit_info.commit_message.ToSQLString());
 	query = StringUtil::Replace(query, "{COMMIT_EXTRA_INFO}", commit_info.commit_extra_info.ToSQLString());
 
-	return Query(std::move(query));
+	return RunQuery(std::move(query));
 }
 
 string DuckLakeTransaction::GetDefaultSchemaName() {
