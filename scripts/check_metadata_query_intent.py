@@ -1,4 +1,32 @@
 #!/usr/bin/env python3
+"""Guardrail for the DuckLake metadata query-intent split.
+
+Purpose:
+    Fail CI when DuckLake metadata code reintroduces ambiguous `Query()` calls
+    or declarations. Metadata execution must say what kind of operation it is:
+    `Execute` for metadata DDL/DML, `SnapshotQuery` for reads pinned to a
+    DuckLake snapshot, `CurrentQuery` for reads that intentionally inspect
+    current metadata state inside transaction semantics, and `RawQuery` only for
+    explicitly audited local DuckDB utility passthrough cases.
+
+Context:
+    DuckLake currently has metadata reads that are logically pinned by a
+    DuckLake snapshot, but can still run through long-lived metadata transaction
+    paths. For PostgreSQL-backed metadata, that can keep repeatable-read
+    transactions open longer than normal catalog or scan reads need. The API
+    split makes the ownership boundary explicit: snapshot-pinned reads can later
+    use a shorter/no-transaction implementation, while writes and current-state
+    reads continue to use explicit transaction semantics. This check keeps that
+    boundary from eroding while the implementation changes underneath it.
+
+When to Retire:
+    Keep this check until the snapshot-read execution path has been changed and
+    tested so normal snapshot-safe metadata reads no longer depend on
+    long-lived DuckLake/PostgreSQL metadata transactions. After that, retire or
+    replace it only if another permanent enforcement mechanism prevents both
+    risks this script guards: accidental `Query()` reintroduction and unaudited
+    expansion of `RawQuery`.
+"""
 
 import re
 import sys
