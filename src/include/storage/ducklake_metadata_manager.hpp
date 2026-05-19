@@ -139,11 +139,13 @@ public:
 
 	//! Read metadata rows visible at the supplied DuckLake snapshot.
 	virtual unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string &query);
+	virtual unique_ptr<QueryResult> SnapshotQueryInTransaction(DuckLakeSnapshot snapshot, string &query);
 	//! Read current metadata state.
 	virtual unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string &query);
 	virtual unique_ptr<QueryResult> CurrentQuery(string &query);
 	//! Get the catalog information for a specific snapshot
-	virtual DuckLakeCatalogInfo GetCatalogForSnapshot(DuckLakeSnapshot snapshot);
+	virtual DuckLakeCatalogInfo GetCatalogForSnapshot(DuckLakeSnapshot snapshot,
+	                                                  bool use_explicit_metadata_transaction = false);
 	virtual vector<DuckLakeGlobalStatsInfo> GetGlobalTableStats(DuckLakeSnapshot snapshot);
 	virtual vector<DuckLakeFileListEntry> GetFilesForTable(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
 	                                                       const FilterPushdownInfo *filter_info = nullptr);
@@ -196,7 +198,8 @@ public:
 	                                          const vector<DuckLakeInlinedFileDeletionInfo> &new_deletes);
 	//! Get the name of the inlined deletion table for a given table ID
 	virtual string GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
-	                                           bool create_if_not_exists = false);
+	                                           bool create_if_not_exists = false,
+	                                           bool use_explicit_metadata_transaction = false);
 	virtual string WriteNewInlinedTables(DuckLakeSnapshot commit_snapshot, const vector<DuckLakeTableInfo> &tables);
 	virtual string GetInlinedTableQueries(DuckLakeSnapshot commit_snapshot, const DuckLakeTableInfo &table,
 	                                      string &inlined_tables, string &inlined_table_queries);
@@ -268,7 +271,8 @@ public:
 
 protected:
 	virtual string GetLatestSnapshotQuery() const;
-	virtual bool InlinedDeletionTableExists(TableIndex table_id, DuckLakeSnapshot snapshot, const string &table_name);
+	virtual bool InlinedDeletionTableExists(TableIndex table_id, DuckLakeSnapshot snapshot, const string &table_name,
+	                                        bool use_explicit_metadata_transaction = false);
 
 	//! Wrap field selections with list aggregation of struct objects (DBMS-specific)
 	//! For DuckDB: LIST({'key1': val1, 'key2': val2, ...})
@@ -333,10 +337,13 @@ private:
 	virtual string GenerateConstantFilterDouble(const ConstantFilter &constant_filter, const LogicalType &type,
 	                                            unordered_set<string> &referenced_stats);
 	virtual string GenerateFilterPushdown(const TableFilter &filter, unordered_set<string> &referenced_stats);
+	unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string query,
+	                                      bool use_explicit_metadata_transaction);
 
 public:
 	//! Read inlined file deletions for regular table scans (no snapshot info per row)
-	map<idx_t, set<idx_t>> ReadInlinedFileDeletions(TableIndex table_id, DuckLakeSnapshot snapshot);
+	map<idx_t, set<idx_t>> ReadInlinedFileDeletions(TableIndex table_id, DuckLakeSnapshot snapshot,
+	                                                bool use_explicit_metadata_transaction = false);
 	//! Clear inlined table caches (needed after rollback so retry re-creates the tables)
 	void ClearInlinedTableCaches();
 
@@ -346,7 +353,8 @@ private:
 
 	//! Check which file IDs have inlined deletions (returns set of file IDs that have deletions)
 	unordered_set<idx_t> GetFileIdsWithInlinedDeletions(TableIndex table_id, DuckLakeSnapshot snapshot,
-	                                                    const vector<idx_t> &file_ids);
+	                                                    const vector<idx_t> &file_ids,
+	                                                    bool use_explicit_metadata_transaction = false);
 	//! Read inlined file deletions for deletion scans (includes snapshot info per row)
 	map<idx_t, unordered_map<idx_t, idx_t>> ReadInlinedFileDeletionsForRange(TableIndex table_id,
 	                                                                         DuckLakeSnapshot start_snapshot,

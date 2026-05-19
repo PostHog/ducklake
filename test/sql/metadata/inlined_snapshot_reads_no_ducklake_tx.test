@@ -1,0 +1,49 @@
+# name: test/sql/metadata/inlined_snapshot_reads_no_ducklake_tx.test
+# description: Snapshot-safe inlined-data reads should not use DuckLake's explicit metadata transaction path
+# group: [metadata]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_inlined_snapshot_reads_no_tx', DATA_INLINING_ROW_LIMIT 10)
+
+statement ok
+CREATE TABLE ducklake.test_tbl(id INTEGER, payload VARCHAR)
+
+statement ok
+INSERT INTO ducklake.test_tbl VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+statement ok
+CALL enable_logging('DuckLakeMetadata')
+
+query I
+SELECT count(*) FROM ducklake.test_tbl WHERE id >= 2
+----
+2
+
+query II
+SELECT id, payload FROM ducklake.test_tbl WHERE id = 1
+----
+1	a
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs_parsed('DuckLakeMetadata')
+WHERE metadata_api = 'SnapshotQuery'
+  AND query LIKE '%ducklake_inlined_data%'
+----
+true
+
+query I
+SELECT count(*) = 0
+FROM duckdb_logs_parsed('DuckLakeMetadata')
+WHERE metadata_api = 'SnapshotQuery'
+  AND ducklake_explicit_metadata_transaction
+----
+true

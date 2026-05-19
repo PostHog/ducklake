@@ -712,24 +712,34 @@ void DuckLakeTransaction::Rollback() {
 	local_changes.Clear();
 }
 
+void DuckLakeTransaction::ConfigureMetadataConnection(Connection &metadata_connection) {
+	// set the search path to the metadata catalog
+	auto &client_data = ClientData::Get(*metadata_connection.context);
+	// ensure we are only looking in the ducklake catalog schema during querying
+	CatalogSearchEntry metadata_entry(ducklake_catalog.MetadataDatabaseName(), ducklake_catalog.MetadataSchemaName());
+	if (metadata_entry.schema.empty()) {
+		metadata_entry.schema = "main";
+	}
+	client_data.catalog_search_path->Set(metadata_entry, CatalogSetPathType::SET_DIRECTLY);
+
+	// set max error reporting to 0 so that during error reporting we don't traverse other schemas / catalogs
+	auto &client_config = ClientConfig::GetConfig(*metadata_connection.context);
+	client_config.user_settings.SetUserSetting(CatalogErrorMaxSchemasSetting::SettingIndex, Value::UBIGINT(0));
+}
+
+unique_ptr<Connection> DuckLakeTransaction::CreateMetadataConnection(bool start_transaction) {
+	auto metadata_connection = make_uniq<Connection>(db);
+	ConfigureMetadataConnection(*metadata_connection);
+	if (start_transaction) {
+		metadata_connection->BeginTransaction();
+	}
+	return metadata_connection;
+}
+
 Connection &DuckLakeTransaction::GetConnection() {
 	lock_guard<mutex> lock(connection_lock);
 	if (!connection) {
-		connection = make_uniq<Connection>(db);
-		// set the search path to the metadata catalog
-		auto &client_data = ClientData::Get(*connection->context);
-		// ensure we are only looking in the ducklake catalog schema during querying
-		CatalogSearchEntry metadata_entry(ducklake_catalog.MetadataDatabaseName(),
-		                                  ducklake_catalog.MetadataSchemaName());
-		if (metadata_entry.schema.empty()) {
-			metadata_entry.schema = "main";
-		}
-		client_data.catalog_search_path->Set(metadata_entry, CatalogSetPathType::SET_DIRECTLY);
-
-		// set max error reporting to 0 so that during error reporting we don't traverse other schemas / catalogs
-		auto &client_config = ClientConfig::GetConfig(*connection->context);
-		client_config.user_settings.SetUserSetting(CatalogErrorMaxSchemasSetting::SettingIndex, Value::UBIGINT(0));
-		connection->BeginTransaction();
+		connection = CreateMetadataConnection(true);
 	}
 	return *connection;
 }
@@ -2693,31 +2703,44 @@ void DuckLakeTransaction::MarkInlinedDataForDeletion(DuckLakeInlinedTableInfo in
 }
 
 unique_ptr<QueryResult> DuckLakeTransaction::Execute(DuckLakeSnapshot snapshot, string query) {
-	return RunQuery(snapshot, std::move(query));
+	return RunQuery(snapshot, std::move(query), "Execute", true);
 }
 
 unique_ptr<QueryResult> DuckLakeTransaction::Execute(string query) {
-	return RunQuery(std::move(query));
+	return RunQuery(std::move(query), "Execute", true);
 }
 
 unique_ptr<QueryResult> DuckLakeTransaction::SnapshotQuery(DuckLakeSnapshot snapshot, string query) {
-	return RunQuery(snapshot, std::move(query));
+	return RunQuery(snapshot, std::move(query), "SnapshotQuery", false);
+}
+
+unique_ptr<QueryResult> DuckLakeTransaction::SnapshotQueryInTransaction(DuckLakeSnapshot snapshot, string query) {
+	return RunQuery(snapshot, std::move(query), "SnapshotQuery", true);
 }
 
 unique_ptr<QueryResult> DuckLakeTransaction::CurrentQuery(DuckLakeSnapshot snapshot, string query) {
-	return RunQuery(snapshot, std::move(query));
+	return RunQuery(snapshot, std::move(query), "CurrentQuery", true);
 }
 
 unique_ptr<QueryResult> DuckLakeTransaction::CurrentQuery(string query) {
-	return RunQuery(std::move(query));
+	return RunQuery(std::move(query), "CurrentQuery", true);
 }
 
 unique_ptr<QueryResult> DuckLakeTransaction::RawQuery(string query) {
-	return RunQuery(std::move(query));
+	return RunQuery(std::move(query), "RawQuery", true);
 }
 
-unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(string query) {
-	auto &connection = GetConnection();
+unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(string query, const string &metadata_api,
+                                                      bool use_explicit_metadata_transaction) {
+	if (use_explicit_metadata_transaction) {
+		return RunQuery(GetConnection(), std::move(query), metadata_api, true);
+	}
+	auto connection = CreateMetadataConnection(false);
+	return RunQuery(*connection, std::move(query), metadata_api, false);
+}
+
+unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(Connection &connection, string query, const string &metadata_api,
+                                                      bool use_explicit_metadata_transaction) {
 	auto catalog_identifier = DuckLakeUtil::SQLIdentifierToString(ducklake_catalog.MetadataDatabaseName());
 	auto catalog_literal = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.MetadataDatabaseName());
 	auto schema_identifier = DuckLakeUtil::SQLIdentifierToString(ducklake_catalog.MetadataSchemaName());
@@ -2738,7 +2761,8 @@ unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(string query) {
 	auto end = std::chrono::steady_clock::now();
 	auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-	DUCKDB_LOG(db, DuckLakeMetadataLogType, ducklake_catalog.GetName(), query, elapsed_ms);
+	DUCKDB_LOG(db, DuckLakeMetadataLogType, ducklake_catalog.GetName(), query, elapsed_ms, metadata_api,
+	           use_explicit_metadata_transaction);
 
 	auto &cb = ducklake_catalog.GetQueryCallback();
 	if (cb) {
@@ -2747,7 +2771,8 @@ unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(string query) {
 	return result;
 }
 
-unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(DuckLakeSnapshot snapshot, string query) {
+unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(DuckLakeSnapshot snapshot, string query, const string &metadata_api,
+                                                      bool use_explicit_metadata_transaction) {
 	query = StringUtil::Replace(query, "{SNAPSHOT_ID}", to_string(snapshot.snapshot_id));
 	query = StringUtil::Replace(query, "{SCHEMA_VERSION}", to_string(snapshot.schema_version));
 	query = StringUtil::Replace(query, "{NEXT_CATALOG_ID}", to_string(snapshot.next_catalog_id));
@@ -2756,7 +2781,7 @@ unique_ptr<QueryResult> DuckLakeTransaction::RunQuery(DuckLakeSnapshot snapshot,
 	query = StringUtil::Replace(query, "{COMMIT_MESSAGE}", commit_info.commit_message.ToSQLString());
 	query = StringUtil::Replace(query, "{COMMIT_EXTRA_INFO}", commit_info.commit_extra_info.ToSQLString());
 
-	return RunQuery(std::move(query));
+	return RunQuery(std::move(query), metadata_api, use_explicit_metadata_transaction);
 }
 
 string DuckLakeTransaction::GetDefaultSchemaName() {

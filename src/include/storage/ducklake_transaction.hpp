@@ -171,6 +171,8 @@ public:
 	unique_ptr<QueryResult> Execute(string query);
 	//! Read metadata rows visible at the supplied DuckLake snapshot.
 	unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string query);
+	//! Read snapshot metadata using DuckLake's explicit metadata transaction.
+	unique_ptr<QueryResult> SnapshotQueryInTransaction(DuckLakeSnapshot snapshot, string query);
 	//! Read current metadata state.
 	unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string query);
 	unique_ptr<QueryResult> CurrentQuery(string query);
@@ -346,8 +348,13 @@ private:
 	case_insensitive_map_t<unique_ptr<DuckLakeCatalogSet>> &GetNewMacroMap(CatalogType type);
 
 private:
-	unique_ptr<QueryResult> RunQuery(DuckLakeSnapshot snapshot, string query);
-	unique_ptr<QueryResult> RunQuery(string query);
+	unique_ptr<Connection> CreateMetadataConnection(bool start_transaction);
+	void ConfigureMetadataConnection(Connection &connection);
+	unique_ptr<QueryResult> RunQuery(DuckLakeSnapshot snapshot, string query, const string &metadata_api,
+	                                 bool use_explicit_metadata_transaction);
+	unique_ptr<QueryResult> RunQuery(string query, const string &metadata_api, bool use_explicit_metadata_transaction);
+	unique_ptr<QueryResult> RunQuery(Connection &connection, string query, const string &metadata_api,
+	                                 bool use_explicit_metadata_transaction);
 
 	DuckLakeCatalog &ducklake_catalog;
 	DuckLakeSnapshotCommit commit_info;

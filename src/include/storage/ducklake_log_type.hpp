@@ -20,7 +20,8 @@ public:
 	DuckLakeMetadataLogType();
 
 	static LogicalType GetLogType();
-	static string ConstructLogMessage(const string &catalog_name, const string &query, int64_t elapsed_ms);
+	static string ConstructLogMessage(const string &catalog_name, const string &query, int64_t elapsed_ms,
+	                                  const string &metadata_api, bool ducklake_explicit_metadata_transaction);
 };
 
 } // namespace duckdb

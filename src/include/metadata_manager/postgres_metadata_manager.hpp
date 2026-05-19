@@ -38,19 +38,23 @@ public:
 	unique_ptr<QueryResult> Execute(string &query) override;
 
 	unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string &query) override;
+	unique_ptr<QueryResult> SnapshotQueryInTransaction(DuckLakeSnapshot snapshot, string &query) override;
 	unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string &query) override;
 	unique_ptr<QueryResult> CurrentQuery(string &query) override;
 
 protected:
 	string GetLatestSnapshotQuery() const override;
-	bool InlinedDeletionTableExists(TableIndex table_id, DuckLakeSnapshot snapshot, const string &table_name) override;
+	bool InlinedDeletionTableExists(TableIndex table_id, DuckLakeSnapshot snapshot, const string &table_name,
+	                                bool use_explicit_metadata_transaction = false) override;
 	string CastValueToTarget(const Value &val, const LogicalType &type) override;
 	string CastStatsToTarget(const string &stats, const LogicalType &type) override;
 	string GenerateConstantFilter(const ConstantFilter &constant_filter, const LogicalType &type,
 	                              unordered_set<string> &referenced_stats) override;
 
 private:
-	unique_ptr<QueryResult> ExecuteQuery(DuckLakeSnapshot snapshot, string &query, string command);
+	unique_ptr<QueryResult> ExecuteQuery(DuckLakeSnapshot snapshot, string &query, string command,
+	                                     bool use_snapshot_query = false,
+	                                     bool use_explicit_metadata_transaction = false);
 	unique_ptr<QueryResult> ExecuteQuery(string &query, string command);
 	string GetPostgresIndexStatements();
 	string GetPostgresStatsType(const LogicalType &type);
