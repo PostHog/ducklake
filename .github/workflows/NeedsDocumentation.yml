@@ -1,4 +1,5 @@
 name: Create Documentation issue for the Needs Documentation label
+# nosemgrep: semgrep.rules.github-actions-pull-request-target
 on:
   discussion:
     types:
