@@ -2302,10 +2302,6 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::Query(string &query) {
 	return transaction.ExecuteRaw(query);
 }
 
-unique_ptr<QueryResult> DuckLakeMetadataManager::Query(string &query) {
-	return transaction.Query(query);
-}
-
 string DuckLakeMetadataManager::DropMacros(const set<MacroIndex> &ids) {
 	return FlushDrop("ducklake_macro", "macro_id", ids);
 }
