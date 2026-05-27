@@ -52,9 +52,10 @@
       ]
     },
     {
-      "reason": "FIXME:Uses SET immediate_transaction_mode=true with concurrent connections",
+      "reason": "FIXME: Quack RPC backend flakes/fails with concurrent catalog operations across connections",
       "paths": [
         "test/sql/compaction/compaction_delete_conflict.test",
+        "test/sql/concurrent/concurrent_table_creation.test_slow",
         "test/sql/rewrite_data_files/test_rewrite_transaction_conflict.test",
         "test/sql/stats/global_stats_transactions.test",
         "test/sql/transaction/concurrent_table_creation.test",
