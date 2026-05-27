@@ -314,12 +314,18 @@ unique_ptr<QueryResult> PostgresMetadataManager::CurrentQuery(string &query) {
 }
 
 string PostgresMetadataManager::GetLatestSnapshotQuery() const {
+	// Materialize the postgres_query() result: as a streaming scan it cannot coexist with an
+	// insert/CTAS in the same query (DuckDB v1.5.3 "multiple streaming scans" restriction), and
+	// GetSnapshot() is called during write statements.
 	return R"(
-		SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL},
-			'SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
-			 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot WHERE snapshot_id = (
-			     SELECT MAX(snapshot_id) FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot
-			 );')
+		WITH __latest_snapshot AS MATERIALIZED (
+			SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL},
+				'SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
+				 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot WHERE snapshot_id = (
+				     SELECT MAX(snapshot_id) FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot
+				 );')
+		)
+		SELECT * FROM __latest_snapshot;
 	)";
 }
 

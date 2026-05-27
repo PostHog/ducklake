@@ -1380,7 +1380,10 @@ DuckLakeMetadataManager::GenerateCTESectionFromRequirements(const unordered_map<
 		}
 		first_cte = false;
 
-		string materialized_hint = (req.reference_count > 1) ? " AS MATERIALIZED" : " AS NOT MATERIALIZED";
+		// Always MATERIALIZED: the Postgres backend embeds postgres_query() in this CTE, and multiple
+		// streaming postgres_query scans (or one alongside an insert/CTAS) are rejected by DuckDB
+		// v1.5.3. Materializing is negligible-cost for the small metadata stats result.
+		string materialized_hint = " AS MATERIALIZED";
 		cte_section += StringUtil::Format("col_%d_stats%s (\n", req.column_field_index, materialized_hint.c_str());
 		cte_section += GenerateFileColumnStatsCTEBody(req, table_id);
 		cte_section += ")";
