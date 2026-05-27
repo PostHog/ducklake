@@ -1,9 +1,11 @@
-# postgres_scanner needs DONT_LINK because it depends on libpq/OpenSSL
+# Source-build of postgres_scanner, used only for LOCAL/manual builds that set ENABLE_POSTGRES_SCANNER
+# (see extension_config.cmake). CI does NOT build it from source -- the Postgres test job installs the
+# released extension via `INSTALL postgres FROM core` (see .github/workflows/Catalogs.yml), because a
+# source build streams multi-table scans, which DuckDB v1.5.3 rejects.
+#
+# When building from source, pin to the postgres_scanner shipped with the DuckDB v1.5.3 release
+# (6b2b12c), which materializes those scans. postgres_scanner needs DONT_LINK (depends on libpq/OpenSSL).
 if (NOT MINGW AND NOT ${WASM_ENABLED})
-    # Pin to the postgres_scanner shipped with the DuckDB v1.5.3 release (extension network).
-    # Older commits (c0e9256 / #5's dd71d196) stream multi-table scans, which DuckDB v1.5.3 rejects
-    # ("Multiple streaming scans ... not currently supported"); 6b2b12c materializes them. This is
-    # 29 commits ahead of dd71d196, so it keeps #5's connection-pool work.
     duckdb_extension_load(postgres_scanner
             DONT_LINK
             GIT_URL https://github.com/duckdb/duckdb-postgres
