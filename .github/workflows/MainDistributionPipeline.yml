@@ -27,10 +27,15 @@ jobs:
   duckdb-next-build:
     name: Build extension binaries
     needs: get-duckdb-version
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@344397bb848aac786d260daf396ad09fc6a1d21f
+    # PostHog fork of extension-ci-tools: internal actions are pinned to SHAs.
+    # The org ruleset rejects unpinned action refs transitively (even inside a
+    # SHA-referenced reusable workflow), so duckdb/extension-ci-tools cannot run
+    # here. The fork's main also exposes the `runners` input.
+    uses: PostHog/extension-ci-tools/.github/workflows/_extension_distribution.yml@d3e0ee09e2e392941f2e390e6cbab108a095daa4
     with:
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: main
+      ci_tools_version: d3e0ee09e2e392941f2e390e6cbab108a095daa4
+      override_ci_tools_repository: PostHog/extension-ci-tools
       extension_name: ducklake
       runners: |
         {"linux_amd64": "depot-ubuntu-24.04-16", "linux_arm64": "depot-ubuntu-24.04-arm-16"}
