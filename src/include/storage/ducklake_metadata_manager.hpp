@@ -154,14 +154,14 @@ public:
 	virtual unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query);
 	virtual unique_ptr<QueryResult> Execute(string &query);
 
-	virtual unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query);
-	virtual unique_ptr<QueryResult> Query(string &query);
+	virtual unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string &query);
+	virtual unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string &query);
+	virtual unique_ptr<QueryResult> CurrentQuery(string &query);
 
-protected:
+	//! Placeholder substitution used by raw transaction-level metadata queries.
 	void SubstituteCatalogPlaceholders(string &query) const;
 	void SubstituteSnapshotPlaceholders(DuckLakeSnapshot snapshot, string &query) const;
 
-public:
 	//! Get the catalog information for a specific snapshot
 	virtual DuckLakeCatalogInfo GetCatalogForSnapshot(DuckLakeSnapshot snapshot);
 	virtual vector<DuckLakeGlobalStatsInfo> GetGlobalTableStats(DuckLakeSnapshot snapshot, TableIndex table_id);

@@ -146,7 +146,7 @@ SinkFinalizeType DuckLakeFlushData::Finalize(Pipeline &pipeline, Event &event, C
 				order_by = sort_order_sql + ", row_id ASC NULLS LAST, begin_snapshot ASC NULLS LAST";
 			}
 			auto deleted_rows_result =
-			    transaction.Query(snapshot, StringUtil::Format(R"(
+			    transaction.SnapshotQuery(snapshot, StringUtil::Format(R"(
 				WITH all_rows AS (
 					SELECT end_snapshot, ROW_NUMBER() OVER (ORDER BY %s) - 1 AS output_position
 					FROM {METADATA_CATALOG}.%s
@@ -427,7 +427,7 @@ static void FlushInlinedFileDeletions(ClientContext &context, DuckLakeCatalog &c
 	}
 
 	// Query the inlined deletions with file paths and existing delete file info
-	auto deletions_result = transaction.Query(snapshot, StringUtil::Format(R"(
+	auto deletions_result = transaction.SnapshotQuery(snapshot, StringUtil::Format(R"(
 SELECT del.file_id, data.path, data.path_is_relative, del.row_id, del.begin_snapshot,
        existing_del.delete_file_id, existing_del.path as del_path, existing_del.path_is_relative as del_path_is_relative,
        existing_del.begin_snapshot as del_begin_snapshot, existing_del.encryption_key as del_encryption_key,
@@ -572,7 +572,7 @@ LEFT JOIN (
 
 	// Delete the flushed inlined deletions
 	auto delete_result =
-	    transaction.Query(snapshot, StringUtil::Format("DELETE FROM {METADATA_CATALOG}.%s", inlined_table_name));
+	    transaction.Execute(snapshot, StringUtil::Format("DELETE FROM {METADATA_CATALOG}.%s", inlined_table_name));
 	if (delete_result->HasError()) {
 		delete_result->GetErrorObject().Throw("Failed to delete inlined file deletions after flush: ");
 	}

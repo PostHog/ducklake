@@ -12,7 +12,7 @@ namespace duckdb {
 QuackMetadataManager::QuackMetadataManager(DuckLakeTransaction &transaction) : DuckLakeMetadataManager(transaction) {
 }
 
-unique_ptr<QueryResult> QuackMetadataManager::Query(string &query) {
+unique_ptr<QueryResult> QuackMetadataManager::CurrentQuery(string &query) {
 	auto &ducklake_catalog = transaction.GetCatalog();
 	auto schema_identifier = DuckLakeUtil::SQLIdentifierToString(ducklake_catalog.MetadataSchemaName());
 	query = StringUtil::Replace(query, "{METADATA_CATALOG}", schema_identifier);
@@ -28,6 +28,11 @@ unique_ptr<QueryResult> QuackMetadataManager::Query(string &query) {
 		transaction.ExecuteRaw(reset);
 	}
 	return result;
+}
+
+// Quack is an in-process metadata backend: reads and writes both go through the quack passthrough.
+unique_ptr<QueryResult> QuackMetadataManager::Execute(string &query) {
+	return CurrentQuery(query);
 }
 
 unique_ptr<QueryResult> QuackMetadataManager::AttachMetadata(const string &attach_query) {
@@ -49,13 +54,19 @@ unique_ptr<QueryResult> QuackMetadataManager::AttachMetadata(const string &attac
 	return result;
 }
 
-unique_ptr<QueryResult> QuackMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
+unique_ptr<QueryResult> QuackMetadataManager::SnapshotQuery(DuckLakeSnapshot snapshot, string &query) {
 	SubstituteSnapshotPlaceholders(snapshot, query);
-	return Query(query);
+	return CurrentQuery(query);
+}
+
+unique_ptr<QueryResult> QuackMetadataManager::CurrentQuery(DuckLakeSnapshot snapshot, string &query) {
+	SubstituteSnapshotPlaceholders(snapshot, query);
+	return CurrentQuery(query);
 }
 
 unique_ptr<QueryResult> QuackMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
-	return Query(snapshot, query);
+	SubstituteSnapshotPlaceholders(snapshot, query);
+	return CurrentQuery(query);
 }
 
 string QuackMetadataManager::MetadataExistsQuery() const {
@@ -70,7 +81,7 @@ void QuackMetadataManager::ClearCache() {
 
 bool QuackMetadataManager::MetadataExists() {
 	auto query = MetadataExistsQuery();
-	auto result = Query(query);
+	auto result = CurrentQuery(query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to probe DuckLake metadata: ");
 	}
