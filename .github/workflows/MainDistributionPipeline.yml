@@ -18,7 +18,7 @@ jobs:
     outputs:
       duckdb_version: ${{ steps.version.outputs.duckdb_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           sparse-checkout: .github
       - id: version
@@ -27,20 +27,67 @@ jobs:
   duckdb-next-build:
     name: Build extension binaries
     needs: get-duckdb-version
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    # PostHog fork of extension-ci-tools: internal actions are pinned to SHAs.
+    # The org ruleset rejects unpinned action refs transitively (even inside a
+    # SHA-referenced reusable workflow), so duckdb/extension-ci-tools cannot run
+    # here. The fork's main also exposes the `runners` input.
+    uses: PostHog/extension-ci-tools/.github/workflows/_extension_distribution.yml@d3e0ee09e2e392941f2e390e6cbab108a095daa4
     with:
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: main
+      ci_tools_version: d3e0ee09e2e392941f2e390e6cbab108a095daa4
+      override_ci_tools_repository: PostHog/extension-ci-tools
       extension_name: ducklake
+      # arm64 on GitHub-hosted (public repo, free); the depot arm64 runner
+      # was unresponsive (job lost at the 10-min runner timeout). amd64 stays
+      # on the working depot runner.
+      runners: |
+        {"linux_amd64": "depot-ubuntu-24.04-16", "linux_arm64": "ubuntu-24.04-arm"}
 
-  duckdb-next-deploy:
-    name: Deploy extension binaries
+  publish-github-release:
+    name: Publish GitHub Release assets
+    runs-on: ubuntu-latest
     needs: [get-duckdb-version, duckdb-next-build]
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@main
-    secrets: inherit
-    with:
-      extension_name: ducklake
-      duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: main
-      deploy_latest: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
-      deploy_versioned: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      DUCKDB_VERSION: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
+    steps:
+      - name: Download linux amd64 extension
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ducklake-${{ env.DUCKDB_VERSION }}-extension-linux_amd64
+          path: release-assets/linux_amd64
+
+      - name: Download linux arm64 extension
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ducklake-${{ env.DUCKDB_VERSION }}-extension-linux_arm64
+          path: release-assets/linux_arm64
+
+      - name: Stage release assets
+        run: |
+          mkdir -p release-assets/staged
+          cp release-assets/linux_amd64/ducklake.duckdb_extension release-assets/staged/ducklake-linux-amd64.duckdb_extension
+          cp release-assets/linux_arm64/ducklake.duckdb_extension release-assets/staged/ducklake-linux-arm64.duckdb_extension
+          cd release-assets/staged
+          sha256sum ducklake-linux-amd64.duckdb_extension ducklake-linux-arm64.duckdb_extension > SHA256SUMS
+
+      - name: Create or update GitHub Release
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --notes "PostHog DuckLake extension binaries for DuckDB ${DUCKDB_VERSION}."
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            release-assets/staged/ducklake-linux-amd64.duckdb_extension \
+            release-assets/staged/ducklake-linux-arm64.duckdb_extension \
+            release-assets/staged/SHA256SUMS \
+            --clobber

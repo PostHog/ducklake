@@ -166,8 +166,17 @@ public:
 	DuckLakeSnapshotCommit &GetCommitInfo() {
 		return commit_info;
 	}
-	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string query);
-	unique_ptr<QueryResult> Query(string query);
+	//! Execute metadata DDL/DML (writes).
+	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string query);
+	unique_ptr<QueryResult> Execute(string query);
+	//! Read metadata rows visible at the supplied DuckLake snapshot.
+	unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string query);
+	//! Read current metadata state (still within transaction semantics).
+	unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string query);
+	unique_ptr<QueryResult> CurrentQuery(string query);
+	//! Run a local DuckDB utility query directly on the metadata connection (no metadata-manager
+	//! passthrough). Only for audited local helpers (ATTACH, duckdb_secrets, the passthrough CALL).
+	unique_ptr<QueryResult> RawQuery(string query);
 	//! Execute SQL on the metadata connection without placeholder substitution or metadata-manager wrapping.
 	unique_ptr<QueryResult> ExecuteRaw(string query);
 	Connection &GetConnection();

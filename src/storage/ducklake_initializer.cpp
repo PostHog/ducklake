@@ -67,7 +67,9 @@ void DuckLakeInitializer::Initialize() {
 		                catalog.MetadataPath() + "\"");
 	}
 	// explicitly load all secrets - work-around to secret initialization bug
-	transaction.Query("FROM duckdb_secrets()");
+	// Run as a local DuckDB utility query (duckdb_secrets() is not valid metadata-backend SQL,
+	// so it must not be routed through the Postgres metadata passthrough).
+	transaction.ExecuteRaw("FROM duckdb_secrets()");
 
 	bool has_explicit_schema = !options.metadata_schema.empty();
 	if (options.metadata_schema.empty()) {
