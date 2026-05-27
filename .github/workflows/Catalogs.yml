@@ -24,7 +24,10 @@ jobs:
       GEN: Ninja
       VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
       ENABLE_SQLITE_SCANNER: ON
-      ENABLE_POSTGRES_SCANNER: ON
+      # Do NOT statically build postgres_scanner from source: the source build streams multi-table
+      # postgres scans, which DuckDB v1.5.3 rejects ("Multiple streaming scans ..."). The official
+      # prebuilt postgres_scanner (installed in the Test Postgres step) materializes them. The full
+      # Postgres suite passes locally with the prebuilt extension.
       ENABLE_QUACK: ON
       BUILD_EXTENSION_TEST_DEPS: full
 
@@ -89,15 +92,11 @@ jobs:
       env:
         PGSERVICE: postgres
       run: |
-        # Pre-install postgres_scanner so LOAD finds it without autoloading
-        # (autoloading is disabled to prevent loading wrong ducklake version)
-        # Find the actual extension folder - CMake uses the git hash for dev builds
-        # and the version string for release builds
-        REPO_DIR=$(dirname $(find build/release/repository -name "postgres_scanner.duckdb_extension" | head -1))
-        DUCKDB_VER=$(basename $(dirname "$REPO_DIR"))
-        EXT_DIR="$HOME/.duckdb/extensions/$DUCKDB_VER/${{ matrix.arch }}"
-        mkdir -p "$EXT_DIR"
-        cp "$REPO_DIR/postgres_scanner.duckdb_extension" "$EXT_DIR/"
+        # Install the official prebuilt postgres_scanner for this DuckDB version (autoloading is
+        # disabled in the test config). We deliberately do NOT build it from source: the source
+        # build streams multi-table postgres scans, which DuckDB v1.5.3 rejects, whereas the
+        # released extension materializes them.
+        build/release/duckdb -unsigned -c "INSTALL postgres FROM core; LOAD postgres;"
         createdb ducklakedb
         build/release/test/unittest --test-config test/configs/postgres.json --test-dir ./ "test/sql/*"
 
