@@ -301,17 +301,6 @@ unique_ptr<QueryResult> PostgresMetadataManager::Execute(string &query) {
 	return ExecuteQuery(query, "postgres_execute");
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::AttachMetadata(const string &attach_query) {
-	auto result = DuckLakeMetadataManager::AttachMetadata(attach_query);
-	// DuckLake metadata queries scan several attached Postgres tables in one statement. DuckDB
-	// v1.5.3 rejects multiple streaming postgres_scanner scans (and streaming + insert) in a query.
-	// postgres_scanner only streams when max_threads > 1, and max_threads = pages / pg_pages_per_task,
-	// so forcing pg_pages_per_task very large pins max_threads to 1 and makes these reads materialize.
-	string pin_threads = "SET pg_pages_per_task = 1152921504606846976";
-	transaction.ExecuteRaw(pin_threads);
-	return result;
-}
-
 unique_ptr<QueryResult> PostgresMetadataManager::SnapshotQuery(DuckLakeSnapshot snapshot, string &query) {
 	return ExecuteQuery(snapshot, query, "postgres_query");
 }
