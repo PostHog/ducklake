@@ -343,7 +343,7 @@ DuckLakeMetadata DuckLakeMetadataManager::LoadDuckLake() {
 	string query = R"(
 SELECT key, value, scope, scope_id FROM {METADATA_CATALOG}.ducklake_metadata
 )";
-	auto result = CurrentQuery(query);
+	auto result = CurrentCatalogQuery(std::move(query));
 	if (result->HasError()) {
 		// preserve the original error in case the fallback also fails
 		auto original_error = result->GetErrorObject().RawMessage();
@@ -462,7 +462,7 @@ SELECT begin_snapshot
 FROM {METADATA_CATALOG}.ducklake_table
 WHERE table_id = {TABLE_ID})";
 	query = StringUtil::Replace(query, "{TABLE_ID}", to_string(table_id.index)).c_str();
-	auto result = CurrentQuery(query);
+	auto result = CurrentCatalogQuery(std::move(query));
 	for (auto &row : *result) {
 		return row.GetValue<idx_t>(0);
 	}
@@ -1638,7 +1638,7 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 	}
 	// Add ORDER BY clause for Top-N optimization if generated
 	query += order_by_clause;
-	auto result = transaction.SnapshotQuery(snapshot, query);
+	auto result = SnapshotCatalogQuery(snapshot, std::move(query));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get data file list from DuckLake: ");
 	}
@@ -1997,7 +1997,7 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 		query += "\nAND " + where_clause;
 	}
 
-	auto result = transaction.SnapshotQuery(snapshot, query);
+	auto result = SnapshotCatalogQuery(snapshot, std::move(query));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get extended data file list from DuckLake: ");
 	}
@@ -2318,6 +2318,12 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::SnapshotCatalogQuery(DuckLakeSn
 	// translates the DuckDB-specific syntax used by the catalog-load queries. Correct for DuckDB and
 	// Postgres (postgres_scanner materializes the multi-table scan). Quack overrides this.
 	return transaction.SnapshotQuery(snapshot, std::move(query));
+}
+
+unique_ptr<QueryResult> DuckLakeMetadataManager::CurrentCatalogQuery(string query) {
+	// Current-state sibling of SnapshotCatalogQuery (see that method). Default runs raw; quack
+	// overrides to route the (multi-table) read through its materializing server-side passthrough.
+	return transaction.CurrentQuery(std::move(query));
 }
 
 string DuckLakeMetadataManager::DropMacros(const set<MacroIndex> &ids) {
@@ -3061,7 +3067,7 @@ WHERE schema_id = %d;)",
 }
 
 bool DuckLakeMetadataManager::IsColumnCreatedWithTable(const string &table_name, const string &column_name) {
-	auto result = transaction.CurrentQuery(StringUtil::Format(R"(
+	auto result = CurrentCatalogQuery(StringUtil::Format(R"(
 SELECT TRUE
 FROM {METADATA_CATALOG}.ducklake_table t
 INNER JOIN {METADATA_CATALOG}.ducklake_column c
@@ -3655,14 +3661,15 @@ vector<DuckLakeColumnMappingInfo> DuckLakeMetadataManager::GetColumnMappings(opt
 	if (start_from.IsValid()) {
 		filter = "WHERE mapping_id >= " + to_string(start_from.GetIndex());
 	}
-	auto result = transaction.CurrentQuery(StringUtil::Format(R"(
+	auto query = StringUtil::Format(R"(
 SELECT mapping_id, table_id, type, column_id, source_name, target_field_id, parent_column, is_partition
 FROM {METADATA_CATALOG}.ducklake_column_mapping
 JOIN {METADATA_CATALOG}.ducklake_name_mapping USING (mapping_id)
 %s
 ORDER BY mapping_id, parent_column NULLS FIRST
 )",
-	                                                   filter));
+	                                filter);
+	auto result = CurrentCatalogQuery(std::move(query));
 	vector<DuckLakeColumnMappingInfo> column_maps;
 	for (auto &row : *result) {
 		MappingIndex mapping_id(row.GetValue<idx_t>(0));
@@ -4364,7 +4371,7 @@ FROM {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion f
 )
 )" + filter;
 	query = StringUtil::Replace(query, "{SEPARATOR}", separator);
-	auto res = transaction.CurrentQuery(query);
+	auto res = CurrentCatalogQuery(std::move(query));
 	if (res->HasError()) {
 		res->GetErrorObject().Throw("Failed to get files scheduled for deletion from DuckLake: ");
 	}
@@ -4894,7 +4901,7 @@ string DuckLakeMetadataManager::InsertNewSchema(const DuckLakeSnapshot &snapshot
 
 vector<DuckLakeTableSizeInfo> DuckLakeMetadataManager::GetTableSizes(DuckLakeSnapshot snapshot) {
 	vector<DuckLakeTableSizeInfo> table_sizes;
-	auto result = transaction.SnapshotQuery(snapshot, R"(
+	auto result = SnapshotCatalogQuery(snapshot, R"(
 SELECT
 	schema_id, table_id, table_name, table_uuid,
 	data_file_info.file_count AS data_file_count,

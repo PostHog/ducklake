@@ -79,6 +79,11 @@ unique_ptr<QueryResult> QuackMetadataManager::SnapshotCatalogQuery(DuckLakeSnaps
 	return CurrentQuery(query);
 }
 
+unique_ptr<QueryResult> QuackMetadataManager::CurrentCatalogQuery(string query) {
+	// See SnapshotCatalogQuery: route current-state multi-table reads through the quack passthrough.
+	return CurrentQuery(query);
+}
+
 string QuackMetadataManager::MetadataExistsQuery() const {
 	return "SELECT COUNT(*) FROM information_schema.tables "
 	       "WHERE table_name = 'ducklake_metadata' AND table_schema = {METADATA_SCHEMA_NAME_LITERAL}";

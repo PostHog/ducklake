@@ -167,6 +167,8 @@ public:
 	//! this to route the read through a materializing server-side passthrough that still speaks DuckDB
 	//! SQL.
 	virtual unique_ptr<QueryResult> SnapshotCatalogQuery(DuckLakeSnapshot snapshot, string query);
+	//! Current-state catalog read counterpart of SnapshotCatalogQuery (same raw-vs-passthrough split).
+	virtual unique_ptr<QueryResult> CurrentCatalogQuery(string query);
 
 	//! Placeholder substitution used by raw transaction-level metadata queries.
 	void SubstituteCatalogPlaceholders(string &query) const;
