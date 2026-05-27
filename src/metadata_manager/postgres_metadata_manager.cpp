@@ -277,7 +277,10 @@ unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot s
 	query = StringUtil::Replace(query, "{DATA_PATH}", data_path);
 
 	auto passthrough_query = StringUtil::Format("CALL %s(%s, %s)", command, catalog_literal, SQLString(query));
-	auto result = transaction.Query(passthrough_query);
+	// Run the fully-formed passthrough call directly on the metadata connection. Routing it back
+	// through transaction.Query() would re-enter PostgresMetadataManager::Query and wrap the query
+	// in another CALL postgres_query(...) indefinitely (v1.5.3 delegates transaction.Query -> manager).
+	auto result = transaction.ExecuteRaw(passthrough_query);
 	if (command == "postgres_execute" && !result->HasError()) {
 		while (result->Fetch()) {
 		}
