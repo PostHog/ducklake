@@ -56,6 +56,7 @@
       "paths": [
         "test/sql/compaction/compaction_delete_conflict.test",
         "test/sql/concurrent/concurrent_table_creation.test_slow",
+        "test/sql/deletion_inlining/test_deletion_inlining_concurrent_retry.test",
         "test/sql/rewrite_data_files/test_rewrite_transaction_conflict.test",
         "test/sql/stats/global_stats_transactions.test",
         "test/sql/transaction/concurrent_table_creation.test",
