@@ -556,7 +556,7 @@ DuckLakeCatalogInfo DuckLakeMetadataManager::GetCatalogForSnapshot(DuckLakeSnaps
 	auto &base_data_path = ducklake_catalog.DataPath();
 	DuckLakeCatalogInfo catalog;
 	// load the schema information
-	auto result = transaction.SnapshotQuery(snapshot, R"(
+	auto result = SnapshotCatalogQuery(snapshot, R"(
 SELECT schema_id, schema_uuid::VARCHAR, schema_name, path, path_is_relative
 FROM {METADATA_CATALOG}.ducklake_schema
 WHERE {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)
@@ -595,7 +595,7 @@ WHERE {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR end_s
 	};
 
 	// load the table information
-	result = transaction.SnapshotQuery(snapshot, StringUtil::Format(R"(
+	result = SnapshotCatalogQuery(snapshot, StringUtil::Format(R"(
 SELECT schema_id, tbl.table_id, table_uuid::VARCHAR, table_name,
 	(
 		SELECT %s
@@ -712,7 +712,7 @@ ORDER BY table_id, parent_column NULLS FIRST, column_order
 		}
 	}
 	// load view information
-	result = transaction.SnapshotQuery(snapshot, StringUtil::Format(R"(
+	result = SnapshotCatalogQuery(snapshot, StringUtil::Format(R"(
 SELECT view_id, view_uuid, schema_id, view_name, dialect, sql, column_aliases,
 	(
 		SELECT %s
@@ -761,7 +761,7 @@ WHERE {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < view.end_snapshot OR 
 	    {"dialect", "dialect"}, {"sql", "sql"}, {"type", "type"}, {"params", macro_param_query}};
 
 	// load macro information
-	result = transaction.SnapshotQuery(snapshot, StringUtil::Format(R"(
+	result = SnapshotCatalogQuery(snapshot, StringUtil::Format(R"(
 SELECT schema_id, ducklake_macro.macro_id, macro_name, (
 		SELECT %s
 		FROM {METADATA_CATALOG}.ducklake_macro_impl
@@ -786,7 +786,7 @@ WHERE  {SNAPSHOT_ID} >= ducklake_macro.begin_snapshot AND ({SNAPSHOT_ID} < duckl
 	}
 
 	// load partition information
-	result = transaction.SnapshotQuery(snapshot, R"(
+	result = SnapshotCatalogQuery(snapshot, R"(
 SELECT partition_id, part.table_id, partition_key_index, column_id, transform
 FROM {METADATA_CATALOG}.ducklake_partition_info part
 JOIN {METADATA_CATALOG}.ducklake_partition_column part_col USING (partition_id)
@@ -817,7 +817,7 @@ ORDER BY part.table_id, partition_id, partition_key_index
 	}
 
 	// load sort information
-	result = transaction.SnapshotQuery(snapshot, R"(
+	result = SnapshotCatalogQuery(snapshot, R"(
 SELECT sort.sort_id, sort.table_id, sort_expr.sort_key_index, sort_expr.expression, sort_expr.dialect, sort_expr.sort_direction, sort_expr.null_order
 FROM {METADATA_CATALOG}.ducklake_sort_info sort
 JOIN {METADATA_CATALOG}.ducklake_sort_expression sort_expr USING (sort_id)
@@ -2311,6 +2311,13 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::CurrentQuery(DuckLakeSnapshot s
 unique_ptr<QueryResult> DuckLakeMetadataManager::CurrentQuery(string &query) {
 	SubstituteCatalogPlaceholders(query);
 	return transaction.ExecuteRaw(query);
+}
+
+unique_ptr<QueryResult> DuckLakeMetadataManager::SnapshotCatalogQuery(DuckLakeSnapshot snapshot, string query) {
+	// Default: run raw on the metadata connection so DuckDB scans the attached catalog directly and
+	// translates the DuckDB-specific syntax used by the catalog-load queries. Correct for DuckDB and
+	// Postgres (postgres_scanner materializes the multi-table scan). Quack overrides this.
+	return transaction.SnapshotQuery(snapshot, std::move(query));
 }
 
 string DuckLakeMetadataManager::DropMacros(const set<MacroIndex> &ids) {

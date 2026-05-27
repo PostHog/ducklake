@@ -69,6 +69,16 @@ unique_ptr<QueryResult> QuackMetadataManager::Execute(DuckLakeSnapshot snapshot,
 	return CurrentQuery(query);
 }
 
+unique_ptr<QueryResult> QuackMetadataManager::SnapshotCatalogQuery(DuckLakeSnapshot snapshot, string query) {
+	// Quack's optimizer rejects multiple streaming quack scans in a single query, which is exactly
+	// what a raw scan of the attached quack catalog produces for the multi-table catalog-load reads
+	// (schema/table/view/...). Route them through the quack passthrough instead: quack_query_by_name
+	// runs the SQL server-side in a real DuckDB (so the DuckDB-specific syntax is understood) and
+	// returns a materialized result.
+	SubstituteSnapshotPlaceholders(snapshot, query);
+	return CurrentQuery(query);
+}
+
 string QuackMetadataManager::MetadataExistsQuery() const {
 	return "SELECT COUNT(*) FROM information_schema.tables "
 	       "WHERE table_name = 'ducklake_metadata' AND table_schema = {METADATA_SCHEMA_NAME_LITERAL}";

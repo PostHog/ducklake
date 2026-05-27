@@ -158,6 +158,16 @@ public:
 	virtual unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string &query);
 	virtual unique_ptr<QueryResult> CurrentQuery(string &query);
 
+	//! Snapshot-pinned catalog read used while loading a DuckLake snapshot's schema/table/view/etc.
+	//! information (see GetCatalogForSnapshot). These queries use DuckDB-specific syntax (uuid casts,
+	//! LIST/STRUCT aggregation) and must be executed where that syntax is understood. The default runs
+	//! the query raw on the metadata connection (DuckDB scans the attached catalog directly), which is
+	//! correct for the DuckDB and Postgres backends. Backends whose raw multi-table scans cannot be
+	//! streamed (e.g. quack, whose optimizer rejects multiple streaming scans in one query) override
+	//! this to route the read through a materializing server-side passthrough that still speaks DuckDB
+	//! SQL.
+	virtual unique_ptr<QueryResult> SnapshotCatalogQuery(DuckLakeSnapshot snapshot, string query);
+
 	//! Placeholder substitution used by raw transaction-level metadata queries.
 	void SubstituteCatalogPlaceholders(string &query) const;
 	void SubstituteSnapshotPlaceholders(DuckLakeSnapshot snapshot, string &query) const;
