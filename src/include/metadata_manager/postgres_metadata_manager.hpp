@@ -42,7 +42,6 @@ public:
 	unique_ptr<QueryResult> CurrentQuery(string &query) override;
 
 protected:
-	string GetLatestSnapshotQuery() const override;
 	string GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
 	bool InlinedDeletionTableExists(TableIndex table_id, DuckLakeSnapshot snapshot, const string &table_name) override;
 	string CastValueToTarget(const Value &val, const LogicalType &type) override;

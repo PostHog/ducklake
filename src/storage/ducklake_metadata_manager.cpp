@@ -1380,10 +1380,7 @@ DuckLakeMetadataManager::GenerateCTESectionFromRequirements(const unordered_map<
 		}
 		first_cte = false;
 
-		// Always MATERIALIZED: the Postgres backend embeds postgres_query() in this CTE, and multiple
-		// streaming postgres_query scans (or one alongside an insert/CTAS) are rejected by DuckDB
-		// v1.5.3. Materializing is negligible-cost for the small metadata stats result.
-		string materialized_hint = " AS MATERIALIZED";
+		string materialized_hint = (req.reference_count > 1) ? " AS MATERIALIZED" : " AS NOT MATERIALIZED";
 		cte_section += StringUtil::Format("col_%d_stats%s (\n", req.column_field_index, materialized_hint.c_str());
 		cte_section += GenerateFileColumnStatsCTEBody(req, table_id);
 		cte_section += ")";
@@ -3852,7 +3849,12 @@ string DuckLakeMetadataManager::GetLatestSnapshotQuery() const {
 }
 
 unique_ptr<DuckLakeSnapshot> DuckLakeMetadataManager::GetSnapshot() {
-	auto result = transaction.CurrentQuery(GetLatestSnapshotQuery());
+	// Use the metadata-manager passthrough (CALL postgres_query) rather than a raw embedded
+	// SELECT * FROM postgres_query() scan: GetSnapshot() runs during write statements, and a
+	// streaming postgres_query scan cannot coexist with the insert/CTAS in v1.5.3. The CALL form
+	// returns a materialized result. (Matches GetSnapshot(at_clause) below.)
+	auto query = GetLatestSnapshotQuery();
+	auto result = CurrentQuery(query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to query most recent snapshot for DuckLake: ");
 	}
