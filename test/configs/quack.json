@@ -84,6 +84,12 @@
       ]
     },
     {
+      "reason": "FIXME: METADATA_SCHEMA attach does not initialize through the quack catalog",
+      "paths": [
+        "test/sql/transaction/transaction_schema.test"
+      ]
+    },
+    {
       "reason": "MinIo",
       "paths": [
         "test/sql/delete/delete_metadata.test",

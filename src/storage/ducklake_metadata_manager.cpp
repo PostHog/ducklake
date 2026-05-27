@@ -1902,8 +1902,9 @@ FROM main_results
 	}
 
 	// The inlined-deletion branch returns LIST(STRUCT_PACK(...)), which is DuckDB syntax.
-	// Keep that mixed-shape query local until the nested result is converted to Postgres SQL.
-	auto result = has_inlined_table ? transaction.SnapshotQuery(end_snapshot, query) : SnapshotQuery(end_snapshot, query);
+	// SnapshotCatalogQuery keeps the default raw execution for DuckDB/Postgres while letting
+	// Quack materialize the multi-table read server-side.
+	auto result = has_inlined_table ? SnapshotCatalogQuery(end_snapshot, query) : SnapshotQuery(end_snapshot, query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get table deletion file list from DuckLake: ");
 	}
@@ -3051,7 +3052,7 @@ string DuckLakeMetadataManager::GetPathForSchema(SchemaIndex schema_id,
 			return FromRelativePath(path);
 		}
 	}
-	auto result = transaction.CurrentQuery(StringUtil::Format(R"(
+	auto result = CurrentCatalogQuery(StringUtil::Format(R"(
 SELECT path, path_is_relative
 FROM {METADATA_CATALOG}.ducklake_schema
 WHERE schema_id = %d;)",
@@ -3088,7 +3089,7 @@ string DuckLakeMetadataManager::GetPathForTable(TableIndex table_id, const vecto
 	for (const auto &new_table : new_tables) {
 		if (new_table.id == table_id) {
 			// This is a table not yet in the catalog
-			auto result = transaction.CurrentQuery(StringUtil::Format(R"(
+			auto result = CurrentCatalogQuery(StringUtil::Format(R"(
 SELECT s.path, s.path_is_relative
 FROM {METADATA_CATALOG}.ducklake_schema s
 WHERE schema_id = %d;)",
@@ -3119,7 +3120,7 @@ WHERE schema_id = %d;)",
 			}
 		}
 	}
-	auto result = transaction.CurrentQuery(StringUtil::Format(R"(
+	auto result = CurrentCatalogQuery(StringUtil::Format(R"(
 SELECT
 	s.path AS s_path,
 	s.path_is_relative AS s_path_is_relative,
@@ -4543,17 +4544,18 @@ void DuckLakeMetadataManager::DeleteSnapshots(const vector<DuckLakeSnapshotInfo>
 	}
 	vector<string> tables_to_delete_from {"ducklake_snapshot", "ducklake_snapshot_changes"};
 	for (auto &delete_tbl : tables_to_delete_from) {
-		result = transaction.Execute(StringUtil::Format(R"(
-DELETE FROM {METADATA_CATALOG}.%s
-WHERE snapshot_id IN (%s);
-)",
-		                                              delete_tbl, snapshot_ids));
+		auto query = StringUtil::Format(R"(
+	DELETE FROM {METADATA_CATALOG}.%s
+	WHERE snapshot_id IN (%s);
+	)",
+		                                delete_tbl, snapshot_ids);
+		result = Execute(query);
 		if (result->HasError()) {
 			result->GetErrorObject().Throw("Failed to delete snapshots in DuckLake: ");
 		}
 	}
 	// get a list of tables that are no longer required after these deletions
-	result = transaction.CurrentQuery(R"(
+	result = CurrentCatalogQuery(R"(
 SELECT table_id
 FROM {METADATA_CATALOG}.ducklake_table t
 WHERE end_snapshot IS NOT NULL AND NOT EXISTS (
@@ -4588,7 +4590,7 @@ AND NOT EXISTS (
 		table_id_filter = StringUtil::Format("table_id IN (%s) OR", deleted_table_ids);
 	}
 
-	result = transaction.CurrentQuery(StringUtil::Format(R"(
+	result = CurrentCatalogQuery(StringUtil::Format(R"(
 SELECT data_file_id, table_id, path, path_is_relative
 FROM {METADATA_CATALOG}.ducklake_data_file
 WHERE %s (end_snapshot IS NOT NULL AND NOT EXISTS(
@@ -4630,21 +4632,23 @@ WHERE %s (end_snapshot IS NOT NULL AND NOT EXISTS(
 		tables_to_delete_from = {"ducklake_data_file", "ducklake_file_column_stats", "ducklake_file_variant_stats",
 		                         "ducklake_file_partition_value"};
 		for (auto &delete_tbl : tables_to_delete_from) {
-			result = transaction.Execute(StringUtil::Format(R"(
-DELETE FROM {METADATA_CATALOG}.%s
-WHERE data_file_id IN (%s);
-)",
-			                                              delete_tbl, deleted_file_ids));
+			auto query = StringUtil::Format(R"(
+	DELETE FROM {METADATA_CATALOG}.%s
+	WHERE data_file_id IN (%s);
+	)",
+			                                delete_tbl, deleted_file_ids);
+			result = Execute(query);
 			if (result->HasError()) {
 				result->GetErrorObject().Throw("Failed to delete old data file information in DuckLake: ");
 			}
 		}
 		// insert the to-be-cleaned-up files
-		result = transaction.Execute(StringUtil::Format(R"(
-INSERT INTO {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion
-VALUES %s;
-)",
-		                                              files_scheduled_for_cleanup));
+		auto query = StringUtil::Format(R"(
+	INSERT INTO {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion
+	VALUES %s;
+	)",
+		                                files_scheduled_for_cleanup);
+		result = Execute(query);
 		if (result->HasError()) {
 			result->GetErrorObject().Throw("Failed to schedule files for clean-up in DuckLake: ");
 		}
@@ -4656,7 +4660,7 @@ VALUES %s;
 		file_id_filter = StringUtil::Format("data_file_id IN (%s) OR", deleted_file_ids);
 	}
 
-	result = transaction.CurrentQuery(StringUtil::Format(R"(
+	result = CurrentCatalogQuery(StringUtil::Format(R"(
 SELECT delete_file_id, table_id, path, path_is_relative
 FROM {METADATA_CATALOG}.ducklake_delete_file
 WHERE %s %s (end_snapshot IS NOT NULL AND NOT EXISTS(
@@ -4695,20 +4699,22 @@ WHERE %s %s (end_snapshot IS NOT NULL AND NOT EXISTS(
 			    "(%d, %s, %s, NOW())", file.id.index, SQLString(path.path), path.path_is_relative ? "true" : "false");
 		}
 		// delete the delete files
-		result = transaction.Execute(StringUtil::Format(R"(
-DELETE FROM {METADATA_CATALOG}.ducklake_delete_file
-WHERE delete_file_id IN (%s);
-)",
-		                                              deleted_delete_ids));
+		auto query = StringUtil::Format(R"(
+	DELETE FROM {METADATA_CATALOG}.ducklake_delete_file
+	WHERE delete_file_id IN (%s);
+	)",
+		                                deleted_delete_ids);
+		result = Execute(query);
 		if (result->HasError()) {
 			result->GetErrorObject().Throw("Failed to delete old delete file information in DuckLake: ");
 		}
 		// insert the to-be-cleaned-up files
-		result = transaction.Execute(StringUtil::Format(R"(
-INSERT INTO {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion
-VALUES %s;
-)",
-		                                              files_scheduled_for_cleanup));
+		query = StringUtil::Format(R"(
+	INSERT INTO {METADATA_CATALOG}.ducklake_files_scheduled_for_deletion
+	VALUES %s;
+	)",
+		                          files_scheduled_for_cleanup);
+		result = Execute(query);
 		if (result->HasError()) {
 			result->GetErrorObject().Throw("Failed to schedule files for clean-up in DuckLake: ");
 		}
@@ -4719,11 +4725,11 @@ VALUES %s;
 		// Collect orphaned_inlined tables
 		vector<string> inlined_tables_to_drop;
 		{
-			auto result = transaction.CurrentQuery(StringUtil::Format(R"(
-SELECT table_name
-FROM {METADATA_CATALOG}.ducklake_inlined_data_tables
-WHERE table_id IN (%s);)",
-			                                                   deleted_table_ids));
+			auto result = CurrentCatalogQuery(StringUtil::Format(R"(
+	SELECT table_name
+	FROM {METADATA_CATALOG}.ducklake_inlined_data_tables
+	WHERE table_id IN (%s);)",
+			                                               deleted_table_ids));
 			if (result->HasError()) {
 				result->GetErrorObject().Throw("Failed to read ducklake_inlined_data_tables for cleanup in DuckLake: ");
 			}
@@ -4738,10 +4744,11 @@ WHERE table_id IN (%s);)",
 		    "ducklake_column_tag",      "ducklake_sort_info",           "ducklake_sort_expression",
 		    "ducklake_schema_versions", "ducklake_inlined_data_tables", "ducklake_column_mapping"};
 		for (auto &delete_tbl : tables_to_delete_from) {
-			auto result = transaction.Execute(StringUtil::Format(R"(
-DELETE FROM {METADATA_CATALOG}.%s
-WHERE table_id IN (%s);)",
-			                                                   delete_tbl, deleted_table_ids));
+			auto query = StringUtil::Format(R"(
+	DELETE FROM {METADATA_CATALOG}.%s
+	WHERE table_id IN (%s);)",
+			                                delete_tbl, deleted_table_ids);
+			auto result = Execute(query);
 			if (result->HasError()) {
 				result->GetErrorObject().Throw("Failed to delete from " + delete_tbl + " in DuckLake: ");
 			}
@@ -4749,8 +4756,9 @@ WHERE table_id IN (%s);)",
 
 		// Drop orphaned inlined tables
 		for (auto &inlined_table_name : inlined_tables_to_drop) {
-			auto result = transaction.Execute(
-			    StringUtil::Format("DROP TABLE IF EXISTS {METADATA_CATALOG}.%s;", SQLIdentifier(inlined_table_name)));
+			auto query =
+			    StringUtil::Format("DROP TABLE IF EXISTS {METADATA_CATALOG}.%s;", SQLIdentifier(inlined_table_name));
+			auto result = Execute(query);
 			if (result->HasError()) {
 				result->GetErrorObject().Throw("Failed to drop inlined-data table in DuckLake: ");
 			}
@@ -4760,14 +4768,15 @@ WHERE table_id IN (%s);)",
 	// delete any views, schemas, macros, etc that are no longer referenced
 	tables_to_delete_from = {"ducklake_schema", "ducklake_view", "ducklake_tag", "ducklake_macro"};
 	for (auto &delete_tbl : tables_to_delete_from) {
-		auto result = transaction.Execute(StringUtil::Format(R"(
-DELETE FROM {METADATA_CATALOG}.%s
-WHERE end_snapshot IS NOT NULL AND NOT EXISTS(
-    SELECT snapshot_id
-    FROM {METADATA_CATALOG}.ducklake_snapshot
-    WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot
-);)",
-		                                                   delete_tbl));
+		auto query = StringUtil::Format(R"(
+	DELETE FROM {METADATA_CATALOG}.%s
+	WHERE end_snapshot IS NOT NULL AND NOT EXISTS(
+	    SELECT snapshot_id
+	    FROM {METADATA_CATALOG}.ducklake_snapshot
+	    WHERE snapshot_id >= begin_snapshot AND snapshot_id < end_snapshot
+	);)",
+		                                delete_tbl);
+		auto result = Execute(query);
 		if (result->HasError()) {
 			result->GetErrorObject().Throw("Failed to delete from " + delete_tbl + " in DuckLake: ");
 		}
@@ -4776,13 +4785,14 @@ WHERE end_snapshot IS NOT NULL AND NOT EXISTS(
 	// clean up macro implementation and parameters for deleted macros
 	tables_to_delete_from = {"ducklake_macro_impl", "ducklake_macro_parameters"};
 	for (auto &delete_tbl : tables_to_delete_from) {
-		auto result = transaction.Execute(StringUtil::Format(R"(
-DELETE FROM {METADATA_CATALOG}.%s tbl
-WHERE NOT EXISTS (
-    SELECT 1 FROM {METADATA_CATALOG}.ducklake_macro m
-    WHERE m.macro_id = tbl.macro_id
-);)",
-		                                                   delete_tbl));
+		auto query = StringUtil::Format(R"(
+	DELETE FROM {METADATA_CATALOG}.%s tbl
+	WHERE NOT EXISTS (
+	    SELECT 1 FROM {METADATA_CATALOG}.ducklake_macro m
+	    WHERE m.macro_id = tbl.macro_id
+	);)",
+		                                delete_tbl);
+		auto result = Execute(query);
 		if (result->HasError()) {
 			result->GetErrorObject().Throw("Failed to delete from " + delete_tbl + " in DuckLake: ");
 		}
@@ -4790,12 +4800,13 @@ WHERE NOT EXISTS (
 
 	// clean up name mappings for deleted column mappings
 	{
-		auto result = transaction.Execute(R"(
-DELETE FROM {METADATA_CATALOG}.ducklake_name_mapping tbl
-WHERE NOT EXISTS (
-    SELECT 1 FROM {METADATA_CATALOG}.ducklake_column_mapping m
-    WHERE m.mapping_id = tbl.mapping_id
-);)");
+		string query = R"(
+	DELETE FROM {METADATA_CATALOG}.ducklake_name_mapping tbl
+	WHERE NOT EXISTS (
+	    SELECT 1 FROM {METADATA_CATALOG}.ducklake_column_mapping m
+	    WHERE m.mapping_id = tbl.mapping_id
+	);)";
+		auto result = Execute(query);
 		if (result->HasError()) {
 			result->GetErrorObject().Throw("Failed to delete from ducklake_name_mapping in DuckLake: ");
 		}
@@ -4804,7 +4815,7 @@ WHERE NOT EXISTS (
 
 void DuckLakeMetadataManager::DropEmptySupersededInlinedTables() {
 	// Find inlined tables that have been superseded by a newer schema version.
-	auto targets = transaction.CurrentQuery(R"(
+	auto targets = CurrentCatalogQuery(R"(
 SELECT idt.table_id, idt.schema_version, idt.table_name
 FROM {METADATA_CATALOG}.ducklake_inlined_data_tables idt
 WHERE idt.schema_version < (
@@ -4821,8 +4832,8 @@ WHERE idt.schema_version < (
 		auto table_id = row.GetValue<idx_t>(0);
 		auto schema_version = row.GetValue<idx_t>(1);
 		auto table_name = row.GetValue<string>(2);
-		auto count_result = transaction.CurrentQuery(
-		    StringUtil::Format("SELECT COUNT(*) FROM {METADATA_CATALOG}.%s", SQLIdentifier(table_name)));
+		auto count_result =
+		    CurrentCatalogQuery(StringUtil::Format("SELECT COUNT(*) FROM {METADATA_CATALOG}.%s", SQLIdentifier(table_name)));
 		if (count_result->HasError()) {
 			count_result->GetErrorObject().Throw(
 			    "Failed to check emptiness of superseded inlined-data table in DuckLake: ");
@@ -4838,14 +4849,13 @@ WHERE idt.schema_version < (
 	if (drops.empty()) {
 		return;
 	}
-	auto res = transaction.Execute(drops);
+	auto res = Execute(drops);
 	if (res->HasError()) {
 		res->GetErrorObject().Throw("Failed to drop superseded inlined-data tables in DuckLake: ");
 	}
 	// We also need to invalidate the existing schema versions in our catalog
 	auto &catalog = transaction.GetCatalog();
-	auto snapshot_versions =
-	    transaction.CurrentQuery("SELECT DISTINCT schema_version FROM {METADATA_CATALOG}.ducklake_snapshot;");
+	auto snapshot_versions = CurrentCatalogQuery("SELECT DISTINCT schema_version FROM {METADATA_CATALOG}.ducklake_snapshot;");
 	if (snapshot_versions->HasError()) {
 		snapshot_versions->GetErrorObject().Throw("Failed to list schema versions for cache invalidation: ");
 	}
@@ -4855,10 +4865,11 @@ WHERE idt.schema_version < (
 }
 
 void DuckLakeMetadataManager::DeleteInlinedData(const DuckLakeInlinedTableInfo &inlined_table) {
-	auto result = transaction.Execute(StringUtil::Format(R"(
-		DELETE FROM {METADATA_CATALOG}.%s
+	auto query = StringUtil::Format(R"(
+			DELETE FROM {METADATA_CATALOG}.%s
 )",
-	                                                   SQLIdentifier(inlined_table.table_name)));
+	                                SQLIdentifier(inlined_table.table_name));
+	auto result = Execute(query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to delete inlined data in DuckLake from table " +
 		                               inlined_table.table_name + ": ");
@@ -4867,10 +4878,11 @@ void DuckLakeMetadataManager::DeleteInlinedData(const DuckLakeInlinedTableInfo &
 
 void DuckLakeMetadataManager::DeleteFlushedInlinedData(const DuckLakeInlinedTableInfo &inlined_table,
                                                        idx_t flush_snapshot_id) {
-	auto result = transaction.Execute(StringUtil::Format(R"(
-		DELETE FROM {METADATA_CATALOG}.%s WHERE begin_snapshot <= %d
+	auto query = StringUtil::Format(R"(
+			DELETE FROM {METADATA_CATALOG}.%s WHERE begin_snapshot <= %d
 )",
-	                                                   SQLIdentifier(inlined_table.table_name), flush_snapshot_id));
+	                                SQLIdentifier(inlined_table.table_name), flush_snapshot_id);
+	auto result = Execute(query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to delete flushed inlined data in DuckLake from table " +
 		                               inlined_table.table_name + ": ");
@@ -4962,7 +4974,7 @@ void DuckLakeMetadataManager::SetConfigOption(const DuckLakeConfigOption &option
 		scope_id = "NULL";
 		scope_filter = "scope IS NULL";
 	}
-	auto result = transaction.CurrentQuery(StringUtil::Format(R"(
+	auto result = CurrentCatalogQuery(StringUtil::Format(R"(
 SELECT COUNT(*)
 FROM {METADATA_CATALOG}.ducklake_metadata
 WHERE key = %s AND %s
@@ -4972,16 +4984,18 @@ WHERE key = %s AND %s
 	auto count = result->Fetch()->GetValue(0, 0).GetValue<idx_t>();
 	if (count == 0) {
 		// option does not yet exist - insert the value
-		result = transaction.Execute(StringUtil::Format(R"(
-INSERT INTO {METADATA_CATALOG}.ducklake_metadata VALUES (%s, %s, %s, %s)
-)",
-		                                              SQLString(option_key), SQLString(option_value), scope, scope_id));
+		auto query = StringUtil::Format(R"(
+	INSERT INTO {METADATA_CATALOG}.ducklake_metadata VALUES (%s, %s, %s, %s)
+	)",
+		                                SQLString(option_key), SQLString(option_value), scope, scope_id);
+		result = Execute(query);
 	} else {
 		// option already exists - update it
-		result = transaction.Execute(StringUtil::Format(R"(
-UPDATE {METADATA_CATALOG}.ducklake_metadata SET value=%s WHERE key=%s AND %s
-)",
-		                                              SQLString(option_value), SQLString(option_key), scope_filter));
+		auto query = StringUtil::Format(R"(
+	UPDATE {METADATA_CATALOG}.ducklake_metadata SET value=%s WHERE key=%s AND %s
+	)",
+		                                SQLString(option_value), SQLString(option_key), scope_filter);
+		result = Execute(query);
 	}
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to insert config option in DuckLake: ");
