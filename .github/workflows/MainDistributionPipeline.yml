@@ -78,16 +78,31 @@ jobs:
           sha256sum ducklake-linux-amd64.duckdb_extension ducklake-linux-arm64.duckdb_extension > SHA256SUMS
 
       - name: Create or update GitHub Release
+        # The PostHog org's "immutable releases" ruleset rejects asset uploads
+        # to a published release with HTTP 422. Once that happens, the tag
+        # name is permanently bound to the failed release in the immutability
+        # registry — even after deletion, re-publishing under the same tag
+        # fails with "tag_name was used by an immutable release", and the
+        # only recovery is to mint a new tag (see v1.0-posthog.3 -> .4).
+        # Pattern that survives the rule: create as draft with assets attached
+        # at creation time, then flip draft=false in a single edit. Drafts are
+        # mutable, and the publish step is just a metadata flip — no asset
+        # change on a published release.
         run: |
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              release-assets/staged/ducklake-linux-amd64.duckdb_extension \
+              release-assets/staged/ducklake-linux-arm64.duckdb_extension \
+              release-assets/staged/SHA256SUMS \
+              --clobber
+          else
             gh release create "$RELEASE_TAG" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TAG" \
-              --notes "PostHog DuckLake extension binaries for DuckDB ${DUCKDB_VERSION}."
+              --notes "PostHog DuckLake extension binaries for DuckDB ${DUCKDB_VERSION}." \
+              --draft \
+              release-assets/staged/ducklake-linux-amd64.duckdb_extension \
+              release-assets/staged/ducklake-linux-arm64.duckdb_extension \
+              release-assets/staged/SHA256SUMS
+            gh release edit "$RELEASE_TAG" --draft=false
           fi
-
-          gh release upload "$RELEASE_TAG" \
-            release-assets/staged/ducklake-linux-amd64.duckdb_extension \
-            release-assets/staged/ducklake-linux-arm64.duckdb_extension \
-            release-assets/staged/SHA256SUMS \
-            --clobber
