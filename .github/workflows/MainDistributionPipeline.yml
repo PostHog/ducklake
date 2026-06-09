@@ -29,10 +29,11 @@ jobs:
     needs: get-duckdb-version
     # Vendored copy of duckdb/extension-ci-tools _extension_distribution.yml (v1.5.2);
     # see .github/workflows/_extension_distribution.yml for source SHA and rationale.
+    # (Upstream now references @v1.5-variegata; we still vendor for SHA-pin compliance.)
     uses: ./.github/workflows/_extension_distribution.yml
     with:
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: main
+      ci_tools_version: v1.5-variegata
       extension_name: ducklake
 
   duckdb-next-deploy:
