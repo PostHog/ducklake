@@ -18,7 +18,7 @@ jobs:
     outputs:
       duckdb_version: ${{ steps.version.outputs.duckdb_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           sparse-checkout: .github
       - id: version
@@ -61,13 +61,13 @@ jobs:
       DUCKDB_VERSION: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
     steps:
       - name: Download linux amd64 extension
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ducklake-${{ env.DUCKDB_VERSION }}-extension-linux_amd64
           path: release-assets/linux_amd64
 
       - name: Download linux arm64 extension
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ducklake-${{ env.DUCKDB_VERSION }}-extension-linux_arm64
           path: release-assets/linux_arm64
