@@ -191,6 +191,8 @@ jobs:
   generate_matrix:
     name: Generate matrix
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       linux_matrix: ${{ steps.set-matrix-linux.outputs.linux_matrix }}
       windows_matrix: ${{ steps.set-matrix-windows.outputs.windows_matrix }}
@@ -239,6 +241,8 @@ jobs:
   linux:
     name: Linux
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     needs: generate_matrix
     if: ${{ needs.generate_matrix.outputs.linux_matrix != '{}' && needs.generate_matrix.outputs.linux_matrix != '' }}
     strategy:
@@ -508,6 +512,8 @@ jobs:
   macos:
     name: MacOS
     runs-on: macos-latest
+    permissions:
+      contents: read
     needs:
       - generate_matrix
       - linux
@@ -756,6 +762,8 @@ jobs:
   windows:
     name: Windows
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     needs:
       - generate_matrix
       - linux
@@ -1036,6 +1044,8 @@ jobs:
   wasm:
     name: DuckDB-Wasm
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs:
       - generate_matrix
       - linux

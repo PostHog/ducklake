@@ -80,6 +80,8 @@ jobs:
   generate_matrix:
     name: Generate matrix
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       deploy_matrix: ${{ steps.parse-matrices.outputs.deploy_matrix }}
     steps:
@@ -100,6 +102,8 @@ jobs:
   deploy:
     name: Deploy to nightly
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs: generate_matrix
     if: ${{ needs.generate_matrix.outputs.deploy_matrix != '{}' && needs.generate_matrix.outputs.deploy_matrix != '' }}
     strategy:
