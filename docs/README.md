@@ -140,3 +140,14 @@ We are happy to have outside contributions to our DuckLake extension. We current
 # run tests with deletion vectors enabled
 ./build/release/test/unittest --test-config test/configs/deletion_vectors.json
 ```
+
+## PostHog changes
+
+Commits carried in this fork that have not been sent upstream, most recent first:
+
+| Commit | PR | Summary |
+| --- | --- | --- |
+| `d0d22ea9` | _no PR — direct commit_ | Add a `nosemgrep` annotation to suppress the `pull_request_target` Semgrep rule in the CI workflow. |
+| `42ea11be` | [#17](https://github.com/PostHog/ducklake/pull/17) | Pin GitHub Actions to commit hashes instead of mutable tags. |
+| `311534f5` | [#10](https://github.com/PostHog/ducklake/pull/10) | Add `.claude` and `.cache` to `.gitignore` so local tool state isn't accidentally committed. |
+| `4c38a855` (merge) / `bb16ebd0` | [#4](https://github.com/PostHog/ducklake/pull/4) | Publish DuckLake extension release binaries (`linux_amd64`, `linux_arm64`, plus `SHA256SUMS`) to the GitHub Release on tag push, giving Duckgres stable URLs for PostHog-built artifacts. |
