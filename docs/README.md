@@ -143,6 +143,8 @@ We are happy to have outside contributions to our DuckLake extension. We current
 
 ## PostHog changes
 
+**Fork status (2026-06-09):** 5 commits ahead, 242 commits behind `ducklabs/main` (`duckdb/ducklake`). The bulk of the delta arrived in [upstream PR #1216](https://github.com/duckdb/ducklake/pull/1216) ("Merge V1.5 -> Main") on 2026-06-09, which folded ~6 weeks of `v1.5-variegata` work into `main` in a single merge commit. Pulling upstream is tracked as a separate effort.
+
 Commits carried in this fork that have not been sent upstream, most recent first:
 
 | Commit | PR | Summary |
