@@ -93,8 +93,13 @@ jobs:
           repository: ${{ inputs.override_ci_tools_repository }}
 
       - id: parse-matrices
+        env:
+          MATRIX_PARSE_SCRIPT: ${{ inputs.matrix_parse_script }}
+          EXCLUDE_ARCHS: ${{ inputs.exclude_archs }}
+          OPT_IN_ARCHS: ${{ inputs.opt_in_archs }}
+          REDUCED_CI_MODE: ${{ inputs.reduced_ci_mode }}
         run: |
-          python3 ${{ inputs.matrix_parse_script }} --input extension-ci-tools/config/distribution_matrix.json --deploy_matrix --output deploy_matrix.json --exclude "${{ inputs.exclude_archs }}" --opt_in "${{ inputs.opt_in_archs }}" --pretty --reduced_ci_mode ${{ inputs.reduced_ci_mode }}
+          python3 "$MATRIX_PARSE_SCRIPT" --input extension-ci-tools/config/distribution_matrix.json --deploy_matrix --output deploy_matrix.json --exclude "$EXCLUDE_ARCHS" --opt_in "$OPT_IN_ARCHS" --pretty --reduced_ci_mode "$REDUCED_CI_MODE"
           deploy_matrix="`cat deploy_matrix.json`"
           echo deploy_matrix=$deploy_matrix >> $GITHUB_OUTPUT
           echo `cat $GITHUB_OUTPUT`
@@ -116,12 +121,14 @@ jobs:
           submodules: 'recursive'
 
       - name: Checkout DuckDB to version
+        env:
+          DUCKDB_VERSION_INPUT: ${{ inputs.duckdb_version }}
         run: |
           if [ ! -d duckdb ]; then
             git clone https://github.com/duckdb/duckdb.git
           fi
           cd duckdb
-          git checkout ${{ inputs.duckdb_version }}
+          git checkout "$DUCKDB_VERSION_INPUT"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -139,6 +146,11 @@ jobs:
           DUCKDB_EXTENSION_SIGNING_PK: ${{ secrets.S3_DUCKDB_ORG_EXTENSION_SIGNING_PK }}
           DUCKDB_DEPLOY_SCRIPT_MODE: for_real
           PIP_BREAK_SYSTEM_PACKAGES: 1
+          DEPLOY_SCRIPT: ${{ inputs.deploy_script }}
+          EXTENSION_NAME: ${{ inputs.extension_name }}
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+          DEPLOY_LATEST: ${{ inputs.deploy_latest || 'true' && 'false' }}
+          DEPLOY_VERSIONED: ${{ inputs.deploy_versioned || 'true' && 'false' }}
         run: |
           pwd
           python3 -m pip install awscli
@@ -151,4 +163,4 @@ jobs:
           git fetch --tags
           export EXT_VERSION=`git tag --points-at HEAD`
           export EXT_VERSION=${EXT_VERSION:=`git log -1 --format=%h`}
-          ${{ inputs.deploy_script }} ${{ inputs.extension_name }} $EXT_VERSION $DUCKDB_VERSION ${{ matrix.duckdb_arch }} $BUCKET_NAME ${{inputs.deploy_latest || 'true' && 'false'}} ${{inputs.deploy_versioned || 'true' && 'false'}}
+          "$DEPLOY_SCRIPT" "$EXTENSION_NAME" "$EXT_VERSION" "$DUCKDB_VERSION" "$DUCKDB_ARCH" "$BUCKET_NAME" "$DEPLOY_LATEST" "$DEPLOY_VERSIONED"
