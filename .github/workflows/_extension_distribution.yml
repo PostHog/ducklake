@@ -1,0 +1,1330 @@
+# VENDORED COPY of duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml
+# Source SHA: 344397bb848aac786d260daf396ad09fc6a1d21f (v1.5.2)
+# Reason: PostHog org policy requires all action uses to be pinned to full
+# commit SHAs, which the upstream copy of this reusable workflow violates.
+# To update: re-run scripts/vendor-extension-ci-tools.sh (or equivalent) to
+# pull a newer upstream SHA and re-apply the SHA pins for actions referenced
+# below.
+# Reusable workflow for building DuckDB extensions using a standardized environment
+#
+# The workflow:
+#   - builds the extension using the CI workflow from the corresponding DuckDB version
+#   - uploads the extensions as gh actions artifacts in the following format:
+#         <ext_name>-<duckdb_version>-extension-<arch><optional_postfix>
+#
+# note: extensions are simply uploaded to GitHub actions, deploying the extensions is done a separate step. More info on
+#       this can be found in https://github.com/duckdb/extension-template
+
+name: Extension distribution
+on:
+  workflow_call:
+    secrets:
+      VCPKG_CACHING_AWS_ACCESS_KEY_ID:
+        required: false
+      VCPKG_CACHING_AWS_SECRET_ACCESS_KEY:
+        required: false
+      VCPKG_CACHING_AWS_ENDPOINT_URL:
+        required: false
+      VCPKG_CACHING_AWS_DEFAULT_REGION:
+        required: false
+    inputs:
+      # The name with which the extension will be built
+      extension_name:
+        required: true
+        type: string
+      # If our extension is an alias extension, the name of the canonical extension
+      extension_canonical:
+        required: false
+        type: string
+      # DuckDB version to build against, should in most cases be identical to
+      duckdb_version:
+        required: true
+        type: string
+      # The version of the https://github.com/duckdb/extension-ci-tools submodule of the extension. In most cases will be identical to `duckdb_version`.
+      # Passing this explicitly is required because of https://github.com/actions/toolkit/issues/1264
+      ci_tools_version:
+        required: true
+        type: string
+      # ';' separated list of architectures to exclude, for example: 'linux_amd64;osx_arm64'
+      exclude_archs:
+        required: false
+        type: string
+        default: ""
+      # ';' separated list of architectures to opt into, for example: 'windows_arm64;linux_arm64_musl'
+      opt_in_archs:
+        required: false
+        type: string
+        default: ""
+      # Postfix added to artifact names. Can be used to guarantee unique names when this workflow is called multiple times
+      artifact_postfix:
+        required: false
+        type: string
+        default: ""
+      # Override the default vcpkg repository
+      vcpkg_url:
+        required: false
+        type: string
+        default: "https://github.com/microsoft/vcpkg.git"
+      # Override the default vcpkg commit used by this version of DuckDB
+      vcpkg_commit:
+        required: false
+        type: string
+        default: "84bab45d415d22042bd0b9081aea57f362da3f35"
+      # Override the vcpkg binary sources config. By default, we use the public (read-only) cache from duckdb.
+      vcpkg_binary_sources:
+        required: false
+        type: string
+        default: ''
+      vcpkg_extra_dependencies:
+        required: false
+        type: string
+        default: ''
+      # Override the default script producing the matrices. Allows specifying custom matrices.
+      matrix_parse_script:
+        required: false
+        type: string
+        default: "./extension-ci-tools/scripts/modify_distribution_matrix.py"
+      # Enable building the DuckDB Shell
+      build_duckdb_shell:
+        required: false
+        type: boolean
+        default: true
+      # Supply an override repository to build, instead of using the current one
+      override_repository:
+        required: false
+        type: string
+        default: ""
+      # The git ref used for the override_repository
+      override_ref:
+        required: false
+        type: string
+        default: ""
+      # Override the repo for the CI tools (for testing CI tools itself)
+      override_ci_tools_repository:
+        required: false
+        type: string
+        default: "duckdb/extension-ci-tools"
+      # Override the duckdb repository (for using this workflow from a DuckDB fork)
+      override_duckdb_repository:
+        required: false
+        type: string
+        default: ""
+      # Internal tooling option: allows automatically fetching the duckdb repo and ref from the calling repository.
+      set_caller_as_duckdb:
+        required: false
+        type: boolean
+        default: false
+      # Pass extra toolchains
+      #   available: (parser_tools, rust, fortran, omp, python3)
+      extra_toolchains:
+        required: false
+        type: string
+        default: ""
+      # Experimental option to allow automatically building the vcpkg dependencies of duckdb extensions that are used for testing
+      use_merged_vcpkg_manifest:
+        required: false
+        type: string
+        default: ""
+      rust_logs:
+        required: false
+        type: boolean
+        default: false
+      # Optional tag the build extension should have -- this is easy to misuse, and subject to change, for internal use only
+      extension_tag:
+        required: false
+        type: string
+        default: ""
+      # Optional tag the referenced duckdb should have -- this is a easy to misuse, and subject to change, for internal use only
+      duckdb_tag:
+        required: false
+        type: string
+        default: ""
+      # If set tot true, skip tests
+      skip_tests:
+        required: false
+        type: boolean
+        default: false
+      save_cache:
+        required: false
+        type: boolean
+        default: true
+      # DEPRECATED: use extra_toolchains instead
+      enable_rust:
+        required: false
+        type: boolean
+        default: false
+      test_config:
+        required: false
+        type: string
+        default: "{}"
+      build_type:
+        required: false
+        type: string
+        default: "release"
+      upload_all_extensions:
+        required: false
+        type: boolean
+        default: false
+      extra_extension_config:
+        required: false
+        type: string
+        default: ""
+      # auto/enabled/disabled: when enabled (or enabled through auto) will skip redundant architectures to reduce CI load
+      reduced_ci_mode:
+        required: false
+        type: string
+        default: 'auto'
+      # disabling this can result in faster builds, but may run out of space on some runners
+      run_disk_clean_step:
+        required: false
+        type: boolean
+        default: true
+      extensions_test_selection:
+        required: false
+        type: string
+        default: 'regular'
+
+env:
+  VCPKG_BINARY_SOURCES: ${{inputs.vcpkg_binary_sources == '' && 'clear;http,https://vcpkg-cache.duckdb.org,read' || inputs.vcpkg_binary_sources }}
+
+jobs:
+  generate_matrix:
+    name: Generate matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      linux_matrix: ${{ steps.set-matrix-linux.outputs.linux_matrix }}
+      windows_matrix: ${{ steps.set-matrix-windows.outputs.windows_matrix }}
+      osx_matrix: ${{ steps.set-matrix-osx.outputs.osx_matrix }}
+      wasm_matrix: ${{ steps.set-matrix-wasm.outputs.wasm_matrix }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout Extension CI tools
+        with:
+          path: 'extension-ci-tools'
+          ref: ${{ inputs.ci_tools_version }}
+          repository: ${{ inputs.override_ci_tools_repository }}
+
+      - id: parse-matrices
+        env:
+          MATRIX_PARSE_SCRIPT: ${{ inputs.matrix_parse_script }}
+          EXCLUDE_ARCHS: ${{ inputs.exclude_archs }}
+          OPT_IN_ARCHS: ${{ inputs.opt_in_archs }}
+          REDUCED_CI_MODE: ${{ inputs.reduced_ci_mode }}
+        run: |
+          mkdir build
+          python3 "$MATRIX_PARSE_SCRIPT" --input extension-ci-tools/config/distribution_matrix.json --select_os linux   --output build/linux_matrix.json   --exclude "$EXCLUDE_ARCHS" --opt_in "$OPT_IN_ARCHS" --pretty --reduced_ci_mode "$REDUCED_CI_MODE"
+          python3 "$MATRIX_PARSE_SCRIPT" --input extension-ci-tools/config/distribution_matrix.json --select_os osx     --output build/osx_matrix.json     --exclude "$EXCLUDE_ARCHS" --opt_in "$OPT_IN_ARCHS" --pretty --reduced_ci_mode "$REDUCED_CI_MODE"
+          python3 "$MATRIX_PARSE_SCRIPT" --input extension-ci-tools/config/distribution_matrix.json --select_os windows --output build/windows_matrix.json --exclude "$EXCLUDE_ARCHS" --opt_in "$OPT_IN_ARCHS" --pretty --reduced_ci_mode "$REDUCED_CI_MODE"
+          python3 "$MATRIX_PARSE_SCRIPT" --input extension-ci-tools/config/distribution_matrix.json --select_os wasm    --output build/wasm_matrix.json    --exclude "$EXCLUDE_ARCHS" --opt_in "$OPT_IN_ARCHS" --pretty --reduced_ci_mode "$REDUCED_CI_MODE"
+
+      - id: set-matrix-linux
+        run: |
+          linux_matrix="`cat build/linux_matrix.json`"
+          echo linux_matrix=$linux_matrix >> $GITHUB_OUTPUT
+          echo `cat $GITHUB_OUTPUT`
+
+      - id: set-matrix-osx
+        run: |
+          osx_matrix="`cat build/osx_matrix.json`"
+          echo osx_matrix=$osx_matrix >> $GITHUB_OUTPUT
+          echo `cat $GITHUB_OUTPUT`
+
+      - id: set-matrix-windows
+        run: |
+          windows_matrix="`cat build/windows_matrix.json`"
+          echo windows_matrix=$windows_matrix >> $GITHUB_OUTPUT
+          echo `cat $GITHUB_OUTPUT`
+
+      - id: set-matrix-wasm
+        run: |
+          wasm_matrix="`cat build/wasm_matrix.json`"
+          echo wasm_matrix=$wasm_matrix >> $GITHUB_OUTPUT
+          echo `cat $GITHUB_OUTPUT`
+
+  linux:
+    name: Linux
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    needs: generate_matrix
+    if: ${{ needs.generate_matrix.outputs.linux_matrix != '{}' && needs.generate_matrix.outputs.linux_matrix != '' }}
+    strategy:
+      matrix: ${{fromJson(needs.generate_matrix.outputs.linux_matrix)}}
+    env:
+      # VCPKG config
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: ${{ matrix.vcpkg_target_triplet }}
+      VCPKG_HOST_TRIPLET: ${{ matrix.vcpkg_host_triplet }}
+      # VCPKG caching
+      AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+      AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      # Misc
+      GEN: ninja
+      BUILD_SHELL: ${{ inputs.build_duckdb_shell && '1' || '0' }}
+      DUCKDB_PLATFORM: ${{ matrix.duckdb_arch }}
+
+    steps:
+      - name: Free disk space 1
+        uses: endersonmenezes/free-disk-space@713d134e243b926eba4a5cce0cf608bfd1efb89a # v2.1.1
+        continue-on-error: true
+        if: inputs.run_disk_clean_step
+        with:
+#          remove_android: true # ~9.5GB in #52s
+#          remove_dotnet: true
+          remove_haskell: true # ~6.5GB in ~3s
+          remove_tool_cache: true # ~4.8GB in ~17s
+#          remove_swap: true
+#          remove_packages_one_command: true # ~7.5 GB in ~94s
+          remove_folders: "/usr/local/share/powershell /usr/share/swift" # ~ 4GB in ?s
+          testing: false
+
+      - name: Free disk space 2
+        continue-on-error: true
+        if: inputs.run_disk_clean_step
+        run: |
+          docker images -a -q > package.list
+          if [ -s package.list ]; then
+              echo "To be deleted"
+              cat package.list
+              echo "---"
+              docker rmi $(cat package.list)
+          fi
+          rm package.list
+
+      - name: Restart docker to run on /mnt
+        run: |
+          sudo systemctl stop docker
+
+      - name: Configure Docker with custom data directory
+        run: |
+          sudo mkdir -p /mnt/docker-data
+          echo '{ "data-root": "/mnt/docker-data" }' | sudo tee /etc/docker/daemon.json
+
+      - name: Start Docker with updated storage path
+        run: sudo systemctl start docker
+
+      - name: Verify Docker storage path
+        run: docker info | grep "Docker Root Dir"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout override repository
+        if: ${{inputs.override_repository != ''}}
+        with:
+          repository: ${{ inputs.override_repository }}
+          ref: ${{ inputs.override_ref }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout current repository
+        if: ${{inputs.override_repository == ''}}
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout Extension CI tools
+        with:
+          path: 'extension-ci-tools'
+          ref: ${{ inputs.ci_tools_version }}
+          repository: ${{ inputs.override_ci_tools_repository }}
+
+      - name: Fetch override repository
+        if: ${{inputs.override_duckdb_repository != ''}}
+        env:
+          OVERRIDE_DUCKDB_REPOSITORY: ${{ inputs.override_duckdb_repository }}
+        run: |
+          DUCKDB_GIT_REPOSITORY="$OVERRIDE_DUCKDB_REPOSITORY" make set_duckdb_repository
+
+      - name: Set DuckDB to ref of calling workflow
+        if: ${{inputs.set_caller_as_duckdb}}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: 'duckdb'
+          fetch-tags: true
+          fetch-depth: 0
+
+      - name: Checkout DuckDB to version
+        if: ${{ inputs.duckdb_version != '' }}
+        env:
+          DUCKDB_VERSION_INPUT: ${{ inputs.duckdb_version }}
+        run: |
+          DUCKDB_GIT_VERSION="$DUCKDB_VERSION_INPUT" make set_duckdb_version
+
+      - name: Tag extension
+        if: ${{inputs.extension_tag != ''}}
+        env:
+          EXTENSION_TAG: ${{ inputs.extension_tag }}
+        run: |
+          git tag "$EXTENSION_TAG"
+
+      - name: Tag DuckDB extension
+        if: ${{inputs.duckdb_tag != ''}}
+        env:
+          DUCKDB_TAG_INPUT: ${{ inputs.duckdb_tag }}
+        run: |
+          DUCKDB_TAG="$DUCKDB_TAG_INPUT" make set_duckdb_tag
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout Extension CI tools
+        with:
+          path: 'extension-ci-tools'
+          ref: ${{ inputs.ci_tools_version }}
+          repository: ${{ inputs.override_ci_tools_repository }}
+          fetch-depth: 0
+
+      - name: Build Docker image
+        shell: bash
+        env:
+          VCPKG_URL: ${{ inputs.vcpkg_url }}
+          VCPKG_COMMIT: ${{ inputs.vcpkg_commit }}
+          EXTRA_TOOLCHAINS_ARG: ${{ inputs.enable_rust  && format(';{0};rust;', inputs.extra_toolchains) || format(';{0};', inputs.extra_toolchains) }}
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+        run: |
+          docker build \
+            --build-arg "vcpkg_url=$VCPKG_URL" \
+            --build-arg "vcpkg_commit=$VCPKG_COMMIT" \
+            --build-arg "extra_toolchains=$EXTRA_TOOLCHAINS_ARG" \
+            -t "duckdb/$DUCKDB_ARCH" \
+            "./extension-ci-tools/docker/$DUCKDB_ARCH"
+
+      - name: Create env file for docker
+        env:
+          USE_MERGED_VCPKG_MANIFEST_INPUT: ${{ inputs.use_merged_vcpkg_manifest }}
+          VCPKG_AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+          VCPKG_AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+          VCPKG_AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+          VCPKG_AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+          VCPKG_TARGET_TRIPLET_INPUT: ${{ matrix.vcpkg_target_triplet }}
+          BUILD_SHELL_FLAG: ${{ inputs.build_duckdb_shell && '1' || '0' }}
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+          DUCKDB_VERSION_INPUT: ${{ inputs.duckdb_version }}
+          EXTENSION_NAME_INPUT: ${{ inputs.extension_name }}
+          EXTENSION_CANONICAL_INPUT: ${{ inputs.extension_canonical }}
+          EXTENSIONS_TEST_SELECTION_INPUT: ${{ inputs.extensions_test_selection }}
+          TEST_CONFIG_INPUT: ${{ inputs.test_config }}
+        run: |
+          cat <<-EOF > docker_env.txt
+          VCPKG_BINARY_SOURCES=$VCPKG_BINARY_SOURCES
+          USE_MERGED_VCPKG_MANIFEST=$USE_MERGED_VCPKG_MANIFEST_INPUT
+          AWS_ACCESS_KEY_ID=$VCPKG_AWS_ACCESS_KEY_ID
+          AWS_SECRET_ACCESS_KEY=$VCPKG_AWS_SECRET_ACCESS_KEY
+          AWS_ENDPOINT_URL=$VCPKG_AWS_ENDPOINT_URL
+          AWS_DEFAULT_REGION=$VCPKG_AWS_DEFAULT_REGION
+          AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+          VCPKG_TARGET_TRIPLET=$VCPKG_TARGET_TRIPLET_INPUT
+          VCPKG_OVERLAY_TRIPLETS=/duckdb_build_dir/extensions-ci-tools/toolchains
+          VCPKG_OVERLAY_PORTS=/duckdb_build_dir/extension-ci-tools/vcpkg_ports
+          BUILD_SHELL=$BUILD_SHELL_FLAG
+          OPENSSL_ROOT_DIR=/duckdb_build_dir/build/$BUILD_TYPE_INPUT/vcpkg_installed/$VCPKG_TARGET_TRIPLET_INPUT
+          OPENSSL_DIR=/duckdb_build_dir/build/$BUILD_TYPE_INPUT/vcpkg_installed/$VCPKG_TARGET_TRIPLET_INPUT
+          OPENSSL_USE_STATIC_LIBS=true
+          DUCKDB_PLATFORM=$DUCKDB_ARCH
+          DUCKDB_GIT_VERSION=$DUCKDB_VERSION_INPUT
+          ENABLE_EXTENSION_AUTOINSTALL=1
+          ENABLE_EXTENSION_AUTOLOADING=1
+          EXTENSION_NAME=$EXTENSION_NAME_INPUT
+          EXTENSION_CANONICAL=$EXTENSION_CANONICAL_INPUT
+          LINUX_CI_IN_DOCKER=1
+          CCACHE_MAXSIZE=1G
+          CCACHE_NOCOMPRESS=1
+          SUBSET_EXTENSIONS_TESTS=$EXTENSIONS_TEST_SELECTION_INPUT
+          EOF
+          echo "$TEST_CONFIG_INPUT" | jq -r '.test_env_variables // {} | to_entries | map("\(.key)=\(.value)")|.[]' >> docker_env.txt
+
+      - name: Generate timestamp for Ccache entry
+        shell: cmake -P {0}
+        id: ccache_timestamp
+        run: |
+          string(TIMESTAMP current_date "%Y-%m-%d-%H;%M;%S" UTC)
+          message("::set-output name=timestamp::${current_date}")
+
+      - name: Create Ccache directory
+        run: |
+          mkdir ccache_dir
+
+      - name: Load Ccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ./ccache_dir
+          key: ccache-extension-distribution-${{ matrix.duckdb_arch }}-${{ inputs.duckdb_version }}-${{ steps.ccache_timestamp.outputs.timestamp }}
+          restore-keys: |
+            ccache-extension-distribution-${{ matrix.duckdb_arch }}-${{ inputs.duckdb_version }}
+            ccache-extension-distribution-${{ matrix.duckdb_arch }}-
+
+      - name: Run configure (outside Docker)
+        shell: bash
+        env:
+          DUCKDB_GIT_VERSION: ${{ inputs.duckdb_version }}
+          LINUX_CI_IN_DOCKER: 0
+        run: |
+          make configure_ci
+
+      - name: Install extra vcpkg dependencies
+        if: ${{ inputs.vcpkg_extra_dependencies != '' }}
+        env:
+          VCPKG_EXTRA_DEPENDENCIES_JSON: ${{ inputs.vcpkg_extra_dependencies }}
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+        run: |
+          DEPS=$(python3 -c "import os, json; data = json.loads(os.environ['VCPKG_EXTRA_DEPENDENCIES_JSON']); arch = os.environ['DUCKDB_ARCH']; print(' '.join(data.get(arch, [])) if arch in data else '')" | tr -d '\n')
+          if [ ! -z "$DEPS" ]; then
+            for dep in $DEPS; do
+              docker run --env-file=docker_env.txt -v `pwd`:/duckdb_build_dir "duckdb/$DUCKDB_ARCH" vcpkg install "$dep" --recurse
+            done
+          fi
+
+      - name: Inject extra extension config
+        if: ${{ inputs.extra_extension_config }}
+        shell: bash
+        env:
+          EXTENSION_CONFIG: ${{ inputs.extra_extension_config }}
+        run: |
+          echo -e "\n# Injected Extension Config\n$EXTENSION_CONFIG" >> ./extension_config.cmake
+          cat ./extension_config.cmake
+
+      - name: Run configure (inside Docker)
+        shell: bash
+        env:
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+        run: |
+          docker run --env-file=docker_env.txt -v `pwd`:/duckdb_build_dir -v `pwd`/ccache_dir:/ccache_dir "duckdb/$DUCKDB_ARCH" make configure_ci
+
+      - name: Build extension (inside Docker)
+        env:
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        run: |
+          docker run --env-file=docker_env.txt -v `pwd`:/duckdb_build_dir -v `pwd`/ccache_dir:/ccache_dir "duckdb/$DUCKDB_ARCH" make "$BUILD_TYPE_INPUT"
+
+      - name: Save Ccache
+        if: ${{ inputs.save_cache }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ./ccache_dir
+          key: ccache-extension-distribution-${{ matrix.duckdb_arch }}-${{ inputs.duckdb_version }}-${{ steps.ccache_timestamp.outputs.timestamp }}
+
+      - name: Test extension (inside docker)
+        if: ${{ matrix.duckdb_arch != 'linux_arm64' && inputs.skip_tests == false }}
+        env:
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        run: |
+          docker run --env-file=docker_env.txt -v `pwd`:/duckdb_build_dir -v `pwd`/ccache_dir:/ccache_dir "duckdb/$DUCKDB_ARCH" make "test_$BUILD_TYPE_INPUT"
+
+      - name: Test extension (outside docker)
+        if: ${{ matrix.duckdb_arch != 'linux_arm64' && inputs.skip_tests == false }}
+        env:
+          DUCKDB_GIT_VERSION: ${{ inputs.duckdb_version }}
+          LINUX_CI_IN_DOCKER: 0
+          SUBSET_EXTENSIONS_TESTS: ${{ inputs.extensions_test_selection }}
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+          TEST_CONFIG_INPUT: ${{ inputs.test_config }}
+        run: |
+          eval "$(jq -r '.test_env_variables // {} | to_entries[] | "export \(.key)=\(.value | @sh)"' <<< "$TEST_CONFIG_INPUT")"
+          make "test_$BUILD_TYPE_INPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !inputs.upload_all_extensions }}
+        with:
+          if-no-files-found: error
+          name: ${{ inputs.extension_name }}-${{ inputs.duckdb_version }}-extension-${{matrix.duckdb_arch}}${{inputs.artifact_postfix}}
+          path: |
+            build/${{ inputs.build_type }}/extension/${{ inputs.extension_name }}/${{ inputs.extension_name }}.duckdb_extension
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ inputs.upload_all_extensions }}
+        with:
+          if-no-files-found: error
+          name: ${{ inputs.extension_name }}-${{ inputs.duckdb_version }}-extension-${{matrix.duckdb_arch}}${{inputs.artifact_postfix}}
+          path: |
+            build/${{ inputs.build_type }}/repository/**/*.duckdb_extension
+
+      - name: Print Rust logs
+        if: ${{ inputs.rust_logs && (inputs.enable_rust || contains(format(';{0};', inputs.extra_toolchains), ';rust;')) }}
+        env:
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        run: |
+          for filename in build/"$BUILD_TYPE_INPUT"/rust/src/*/*build-*.log; do
+            echo Printing logs for file $filename
+            cat $filename;
+            echo Done printing logs for $filename
+          done
+
+  macos:
+    name: MacOS
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    needs:
+      - generate_matrix
+      - linux
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.generate_matrix.outputs.osx_matrix != '{}' &&
+      needs.generate_matrix.outputs.osx_matrix != '' &&
+      needs.generate_matrix.result == 'success' &&
+      (needs.linux.result == 'success' || needs.linux.result == 'skipped')
+    strategy:
+      matrix: ${{fromJson(needs.generate_matrix.outputs.osx_matrix)}}
+    env:
+      # VCPKG config
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: ${{ matrix.vcpkg_target_triplet }}
+      VCPKG_HOST_TRIPLET: ${{ matrix.vcpkg_host_triplet }}
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/extension-ci-tools/vcpkg_ports
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/extension-ci-tools/toolchains
+      USE_MERGED_VCPKG_MANIFEST: ${{ inputs.use_merged_vcpkg_manifest }}
+      # VCPKG caching
+      AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+      AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      # Misc
+      OSX_BUILD_ARCH: ${{ matrix.osx_build_arch }}
+      GEN: ninja
+      BUILD_SHELL: ${{ inputs.build_duckdb_shell && '1' || '0' }}
+      DUCKDB_PLATFORM: ${{ matrix.duckdb_arch }}
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout override repository
+        if: ${{inputs.override_repository != ''}}
+        with:
+          repository: ${{ inputs.override_repository }}
+          ref: ${{ inputs.override_ref }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout current repository
+        if: ${{inputs.override_repository == ''}}
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: Install Ninja
+        run: |
+          brew install ninja autoconf make libtool automake autoconf-archive
+
+      - name: Setup Ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+        continue-on-error: true
+        with:
+          key: ccache-extension-distribution-${{ matrix.duckdb_arch }}-${{ inputs.duckdb_version }}
+          restore-keys: ccache-extension-distribution-${{ matrix.duckdb_arch }}-
+          save: ${{ inputs.save_cache }}
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout Extension CI tools
+        with:
+          path: 'extension-ci-tools'
+          ref: ${{ inputs.ci_tools_version }}
+          repository: ${{ inputs.override_ci_tools_repository }}
+
+      - name: Fetch override repository
+        if: ${{inputs.override_duckdb_repository != ''}}
+        env:
+          OVERRIDE_DUCKDB_REPOSITORY: ${{ inputs.override_duckdb_repository }}
+        run: |
+          DUCKDB_GIT_REPOSITORY="$OVERRIDE_DUCKDB_REPOSITORY" make set_duckdb_repository
+
+      - name: Set DuckDB to ref of calling workflow
+        if: ${{inputs.set_caller_as_duckdb}}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: 'duckdb'
+          fetch-tags: true
+          fetch-depth: 0
+
+      - name: Checkout DuckDB to version
+        if: ${{ inputs.duckdb_version != '' }}
+        env:
+          DUCKDB_VERSION_INPUT: ${{ inputs.duckdb_version }}
+        run: |
+          DUCKDB_GIT_VERSION="$DUCKDB_VERSION_INPUT" make set_duckdb_version
+
+      - name: Tag extension
+        if: ${{inputs.extension_tag != ''}}
+        env:
+          EXTENSION_TAG: ${{ inputs.extension_tag }}
+        run: |
+          git tag "$EXTENSION_TAG"
+
+      - name: Tag DuckDB extension
+        if: ${{inputs.duckdb_tag != ''}}
+        env:
+          DUCKDB_TAG_INPUT: ${{ inputs.duckdb_tag }}
+        run: |
+          DUCKDB_TAG="$DUCKDB_TAG_INPUT" make set_duckdb_tag
+
+      - name: Setup vcpkg
+        env:
+          VCPKG_URL: ${{ inputs.vcpkg_url }}
+          VCPKG_COMMIT: ${{ inputs.vcpkg_commit }}
+          GH_WORKSPACE: ${{ github.workspace }}
+        run: |
+          mkdir local_vcpkg_installation
+          cmake --version
+          cd local_vcpkg_installation
+          git init
+          git remote add origin "$VCPKG_URL"
+          git fetch origin "$VCPKG_COMMIT"
+          git checkout "$VCPKG_COMMIT"
+          ./bootstrap-vcpkg.sh
+          echo "VCPKG_ROOT=$GH_WORKSPACE/local_vcpkg_installation" >> $GITHUB_ENV
+          echo "VCPKG_TOOLCHAIN_PATH=$GH_WORKSPACE/local_vcpkg_installation/scripts/buildsystems/vcpkg.cmake" >> $GITHUB_ENV
+          echo "$GH_WORKSPACE/local_vcpkg_installation" >> $GITHUB_PATH
+
+      - name: Install Rust cross compile dependency
+        if: ${{ (inputs.enable_rust || contains(format(';{0};', inputs.extra_toolchains), ';rust;')) && matrix.osx_build_arch == 'x86_64'}}
+        run: |
+          rustup target add x86_64-apple-darwin
+
+      - name: Install Fortran
+        if: ${{ (contains(format(';{0};', inputs.extra_toolchains), ';fortran;')) }}
+        run: |
+          brew install gcc
+
+      - name: 'Setup go'
+        if: ${{ (inputs.enable_go || contains(format(';{0};', inputs.extra_toolchains), ';go;'))}}
+        uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4 # v4.3.0
+        with:
+          go-version: '1.23'
+
+      - name: Install parser tools
+        if: ${{ contains(format(';{0};', inputs.extra_toolchains), ';parser_tools;')}}
+        run: |
+          brew install bison flex
+
+      - name: Inject extra extension config
+        if: ${{ inputs.extra_extension_config }}
+        shell: bash
+        env:
+          EXTENSION_CONFIG: ${{ inputs.extra_extension_config }}
+        run: |
+          echo -e "\n# Injected Extension Config\n$EXTENSION_CONFIG" >> ./extension_config.cmake
+          cat ./extension_config.cmake
+
+      - name: install omp (x86)
+        if: ${{ contains(format(';{0};', inputs.extra_toolchains), ';omp;') && matrix.duckdb_arch == 'osx_amd64' }}
+        run: |
+          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"
+          (echo; echo 'eval "$(/usr/local/bin/brew shellenv)"') >> /Users/runner/.bash_profile
+          eval "$(/usr/local/bin/brew shellenv)"
+          arch -x86_64 brew install libomp
+          echo "LDFLAGS=-L/usr/local/opt/libomp/lib" >> $GITHUB_ENV
+          echo "CFLAGS=-I/usr/local/opt/libomp/include" >> $GITHUB_ENV
+          echo "CPPFLAGS=-I/usr/local/opt/libomp/include" >> $GITHUB_ENV
+          echo "CXXFLAGS=-I/usr/local/opt/libomp/include" >> $GITHUB_ENV
+
+      - name: install omp (arm)
+        if: ${{ contains(format(';{0};', inputs.extra_toolchains), ';omp;') && matrix.duckdb_arch == 'osx_arm64' }}
+        run: |
+          brew install libomp
+          echo "LDFLAGS=-L/opt/homebrew/opt/libomp/lib" >> $GITHUB_ENV
+          echo "CFLAGS=-I/opt/homebrew/opt/libomp/include" >> $GITHUB_ENV
+          echo "CPPFLAGS=-I/opt/homebrew/opt/libomp/include" >> $GITHUB_ENV
+          echo "CXXFLAGS=-I/opt/homebrew/opt/libomp/include" >> $GITHUB_ENV
+
+      - name: Install unixODBC (arm64)
+        if: ${{ contains(format(';{0};', inputs.extra_toolchains), ';unixodbc;') && matrix.duckdb_arch == 'osx_arm64' }}
+        run: |
+          brew config
+          brew install unixodbc
+          brew ls -v unixodbc
+
+      - name: Install unixODBC (amd64)
+        if: ${{ contains(format(';{0};', inputs.extra_toolchains), ';unixodbc;') && matrix.duckdb_arch == 'osx_amd64' }}
+        run: |
+          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          /usr/local/bin/brew config
+          /usr/local/bin/brew install unixodbc
+          /usr/local/bin/brew ls -v unixodbc
+
+      - name: Override AWS CLI
+        if: ${{ (contains(format(';{0};', inputs.extra_toolchains), ';downgraded_aws_cli;')) }}
+        shell: bash
+        run: |
+          curl https://awscli.amazonaws.com/AWSCLIV2-2.22.35.pkg -o ./AWSCLIV2.pkg
+          sudo installer -pkg ./AWSCLIV2.pkg -target /
+          aws --version
+
+      - name: Run configure
+        shell: bash
+        env:
+          DUCKDB_GIT_VERSION: ${{ inputs.duckdb_version }}
+        run: |
+          make configure_ci
+
+      - name: Install extra vcpkg dependencies
+        if: ${{ inputs.vcpkg_extra_dependencies != '' }}
+        env:
+          VCPKG_EXTRA_DEPENDENCIES_JSON: ${{ inputs.vcpkg_extra_dependencies }}
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+        run: |
+          DEPS=$(python3 -c "import os, json; data = json.loads(os.environ['VCPKG_EXTRA_DEPENDENCIES_JSON']); arch = os.environ['DUCKDB_ARCH']; print(' '.join(data.get(arch, [])) if arch in data else '')" | tr -d '\n')
+          if [ ! -z "$DEPS" ]; then
+            for dep in $DEPS; do
+              vcpkg install "$dep" --recurse
+            done
+          fi
+
+      - name: Build extension
+        shell: bash
+        env:
+          EXTENSION_NAME_INPUT: ${{ inputs.extension_name }}
+          EXTENSION_CANONICAL_INPUT: ${{ inputs.extension_canonical }}
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        run: |
+          EXTENSION_NAME="$EXTENSION_NAME_INPUT" EXTENSION_CANONICAL="$EXTENSION_CANONICAL_INPUT" ENABLE_EXTENSION_AUTOINSTALL=1 ENABLE_EXTENSION_AUTOLOADING=1 make "$BUILD_TYPE_INPUT"
+
+      - name: Test Extension
+        if: ${{ matrix.osx_build_arch == 'arm64' && inputs.skip_tests == false }}
+        env:
+          SUBSET_EXTENSIONS_TESTS: ${{ inputs.extensions_test_selection }}
+          TEST_CONFIG_INPUT: ${{ inputs.test_config }}
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        shell: bash
+        run: |
+          eval "$(jq -r '.test_env_variables // {} | to_entries[] | "export \(.key)=\(.value | @sh)"' <<< "$TEST_CONFIG_INPUT")"
+          make "test_$BUILD_TYPE_INPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !inputs.upload_all_extensions }}
+        with:
+          if-no-files-found: error
+          name: ${{ inputs.extension_name }}-${{ inputs.duckdb_version }}-extension-${{matrix.duckdb_arch}}${{inputs.artifact_postfix}}
+          path: |
+            build/${{ inputs.build_type }}/extension/${{ inputs.extension_name }}/${{ inputs.extension_name }}.duckdb_extension
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ inputs.upload_all_extensions }}
+        with:
+          if-no-files-found: error
+          name: ${{ inputs.extension_name }}-${{ inputs.duckdb_version }}-extension-${{matrix.duckdb_arch}}${{inputs.artifact_postfix}}
+          path: |
+            build/${{ inputs.build_type }}/repository/**/*.duckdb_extension
+
+      - name: Print Rust logs
+        if: ${{ inputs.rust_logs && (inputs.enable_rust || contains(format(';{0};', inputs.extra_toolchains), ';rust;')) }}
+        env:
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        run: |
+          for filename in build/"$BUILD_TYPE_INPUT"/rust/src/*/*build-*.log; do
+            echo Printing logs for file $filename
+            cat $filename;
+            echo Done printing logs for $filename
+          done
+
+  windows:
+    name: Windows
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    needs:
+      - generate_matrix
+      - linux
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.generate_matrix.outputs.windows_matrix != '{}' &&
+      needs.generate_matrix.outputs.windows_matrix != '' &&
+      needs.generate_matrix.result == 'success' &&
+      (needs.linux.result == 'success' || needs.linux.result == 'skipped')
+    strategy:
+      matrix: ${{fromJson(needs.generate_matrix.outputs.windows_matrix)}}
+    env:
+      # VCPKG config
+      VCPKG_TARGET_TRIPLET: ${{ matrix.vcpkg_target_triplet }}
+      VCPKG_HOST_TRIPLET: ${{ matrix.vcpkg_host_triplet }}
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/extension-ci-tools/vcpkg_ports
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/extension-ci-tools/toolchains
+      USE_MERGED_VCPKG_MANIFEST: ${{ inputs.use_merged_vcpkg_manifest }}
+      # VCPKG caching
+      AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+      AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      # Misc
+      BUILD_SHELL: ${{ inputs.build_duckdb_shell && '1' || '0' }}
+      DUCKDB_PLATFORM: ${{ matrix.duckdb_arch }}
+      CC: ${{ (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw') && 'gcc' || '' }}
+      CXX: ${{ (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw') && 'g++' || '' }}
+      GEN: ninja
+
+    steps:
+      - name: Downgrade AWS cli
+        shell: powershell
+        if: ${{ (contains(format(';{0};', inputs.extra_toolchains), ';downgraded_aws_cli;')) }}
+        run: |
+          $app = Get-WmiObject -Class Win32_Product -Filter "Name LIKE 'AWS Command Line Interface%'"
+          if ($app) { $app.Uninstall() }
+          msiexec.exe /i https://awscli.amazonaws.com/AWSCLIV2-2.22.35.msi  /qn
+          sleep 60
+
+      - name: Test AWS cli version
+        shell: powershell
+        run: |
+          aws --version
+
+      - name: Keep \n line endings
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout override repository
+        if: ${{inputs.override_repository != ''}}
+        with:
+          repository: ${{ inputs.override_repository }}
+          ref: ${{ inputs.override_ref }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout current repository
+        if: ${{inputs.override_repository == ''}}
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Setup Rust
+        if: (inputs.enable_rust || contains(format(';{0};', inputs.extra_toolchains), ';rust;'))
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-06-09
+
+      - name: Setup Rust for Mingw
+        if: (inputs.enable_rust || contains(format(';{0};', inputs.extra_toolchains), ';rust;')) && matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-06-09
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: 'Setup go'
+        if: ${{ (inputs.enable_go || contains(format(';{0};', inputs.extra_toolchains), ';go;'))}}
+        uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4 # v4.3.0
+        with:
+          go-version: '1.23'
+
+      - name: Install parser tools
+        if: ${{ contains(format(';{0};', inputs.extra_toolchains), ';parser_tools;')}}
+        run: |
+          choco install winflexbison3
+
+      - name: Install Ninja build tool
+        run: |
+          choco install ninja -y
+
+      - name: Install jq
+        run: |
+          choco install jq -y
+
+      - name: Setup Ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+        continue-on-error: true
+        with:
+          key: ccache-extension-distribution-${{ matrix.duckdb_arch }}-${{ inputs.duckdb_version }}
+          restore-keys: ccache-extension-distribution-${{ matrix.duckdb_arch }}-
+          save: ${{ inputs.save_cache }}
+
+      - uses: r-lib/actions/setup-r@a51a8012b0aab7c32ef9d19bf54da93f3254335e # v2.12.0
+        if:  matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw'
+        with:
+          r-version: 'devel'
+          update-rtools: true
+          rtools-version: '42' # linker bug in 43
+
+      - name: setup rtools gcc for vcpkg
+        if:  matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw'
+        run: |
+          cp C:/rtools42/x86_64-w64-mingw32.static.posix/bin/gcc.exe C:/rtools42/x86_64-w64-mingw32.static.posix/bin/x86_64-w64-mingw32-gcc.exe
+          cp C:/rtools42/x86_64-w64-mingw32.static.posix/bin/g++.exe C:/rtools42/x86_64-w64-mingw32.static.posix/bin/x86_64-w64-mingw32-g++.exe
+          cp C:/rtools42/x86_64-w64-mingw32.static.posix/bin/gfortran.exe C:/rtools42/x86_64-w64-mingw32.static.posix/bin/x86_64-w64-mingw32-gfortran.exe
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout Extension CI tools
+        with:
+          path: 'extension-ci-tools'
+          ref: ${{ inputs.ci_tools_version }}
+          repository: ${{ inputs.override_ci_tools_repository }}
+
+      - name: Fetch override repository
+        if: ${{inputs.override_duckdb_repository != ''}}
+        env:
+          DUCKDB_GIT_REPOSITORY: ${{ inputs.override_duckdb_repository }}
+        run: |
+          make set_duckdb_repository
+
+      - name: Set DuckDB to ref of calling workflow
+        if: ${{inputs.set_caller_as_duckdb}}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: 'duckdb'
+          fetch-tags: true
+          fetch-depth: 0
+
+      - name: Checkout DuckDB to version
+        if: ${{ inputs.duckdb_version != '' }}
+        env:
+          DUCKDB_GIT_VERSION: ${{ inputs.duckdb_version }}
+        run: |
+          make set_duckdb_version
+
+      - name: Tag extension
+        if: ${{inputs.extension_tag != ''}}
+        env:
+          EXTENSION_TAG: ${{ inputs.extension_tag }}
+        run: |
+          git tag "$EXTENSION_TAG"
+
+      - name: Tag DuckDB extension
+        if: ${{inputs.duckdb_tag != ''}}
+        env:
+          DUCKDB_TAG: ${{ inputs.duckdb_tag }}
+        run: |
+          make set_duckdb_tag
+
+      - name: Setup shorter path for vcpkg
+        run: |
+          $basePath = Split-Path -Path (Split-path -Path $env:GITHUB_WORKSPACE -Parent) -Parent
+          $vcpkgRoot = "$basePath/vcpkg"
+          echo "VCPKG_WINDOWS_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+          echo "VCPKG_TOOLCHAIN_PATH=$vcpkgRoot/scripts/buildsystems/vcpkg.cmake" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@abed23940f9d7bc267b0e1a21ee7b699a3794baa # v11.1
+        with:
+          vcpkgGitCommitId: ${{ inputs.vcpkg_commit }}
+          vcpkgGitURL: ${{ inputs.vcpkg_url }}
+          vcpkgDirectory: ${{ env.VCPKG_WINDOWS_ROOT }}
+
+      - name: Inject extra extension config
+        if: ${{ inputs.extra_extension_config }}
+        shell: bash
+        env:
+          EXTENSION_CONFIG: ${{ inputs.extra_extension_config }}
+        run: |
+          echo -e "\n# Injected Extension Config\n$EXTENSION_CONFIG" >> ./extension_config.cmake
+          cat ./extension_config.cmake
+
+      - name: Run configure
+        shell: bash
+        env:
+          DUCKDB_PLATFORM: ${{ matrix.duckdb_arch }}
+          DUCKDB_PLATFORM_RTOOLS: ${{ (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw') && 1 || 0 }}
+          DUCKDB_GIT_VERSION: ${{ inputs.duckdb_version }}
+        run: |
+          make configure_ci
+
+      - name: Install extra vcpkg dependencies
+        shell: bash
+        if: ${{ inputs.vcpkg_extra_dependencies != '' }}
+        env:
+          VCPKG_EXTRA_DEPENDENCIES_JSON: ${{ inputs.vcpkg_extra_dependencies }}
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+        run: |
+          DEPS=$(python3 -c "import os, json; data = json.loads(os.environ['VCPKG_EXTRA_DEPENDENCIES_JSON']); arch = os.environ['DUCKDB_ARCH']; print(' '.join(data.get(arch, [])) if arch in data else '')" | tr -d '\n')
+          echo $DEPS
+          if [ ! -z "$DEPS" ]; then
+            for dep in $DEPS; do
+              vcpkg install "$dep" --recurse
+            done
+          fi
+
+      - name: Build extension
+        env:
+          DUCKDB_PLATFORM: ${{ matrix.duckdb_arch }}
+          EXTENSION_NAME: ${{ inputs.extension_name }}
+          EXTENSION_CANONICAL: ${{ inputs.extension_canonical }}
+          ENABLE_EXTENSION_AUTOINSTALL: 1
+          ENABLE_EXTENSION_AUTOLOADING: 1
+          DUCKDB_PLATFORM_RTOOLS: ${{ (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw') && 1 || 0 }}
+          EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        shell: cmd
+        run: |
+          if "%DUCKDB_PLATFORM_RTOOLS%" == "0" (
+            if "%DUCKDB_PLATFORM%" == "windows_amd64" (
+              call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+            )
+            if "%DUCKDB_PLATFORM%" == "windows_arm64" (
+              call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsarm64.bat"
+            )
+            REM Rename link.exe to link-git.exe to avoid conflicts with git supplied linker.
+            mv "C:\Program Files\Git\usr\bin\link.exe" "C:\Program Files\Git\usr\bin\link-git.exe"
+          )
+          make %BUILD_TYPE_INPUT%
+
+      - name: Test extension
+        if: ${{ inputs.skip_tests == false }}
+        shell: bash
+        env:
+          DUCKDB_PLATFORM: ${{ matrix.duckdb_arch }}
+          DUCKDB_PLATFORM_RTOOLS: ${{ (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw') && 1 || 0 }}
+          SUBSET_EXTENSIONS_TESTS: ${{ inputs.extensions_test_selection }}
+          TEST_CONFIG_INPUT: ${{ inputs.test_config }}
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        run: |
+          eval "$(jq -r '.test_env_variables // {} | to_entries[] | "export \(.key)=\(.value | @sh)"' <<< "$TEST_CONFIG_INPUT")"
+          make "test_$BUILD_TYPE_INPUT"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !inputs.upload_all_extensions }}
+        with:
+          if-no-files-found: error
+          name: ${{ inputs.extension_name }}-${{ inputs.duckdb_version }}-extension-${{matrix.duckdb_arch}}${{inputs.artifact_postfix}}
+          path: |
+            build/${{ inputs.build_type }}/extension/${{ inputs.extension_name }}/${{ inputs.extension_name }}.duckdb_extension
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ inputs.upload_all_extensions }}
+        with:
+          if-no-files-found: error
+          name: ${{ inputs.extension_name }}-${{ inputs.duckdb_version }}-extension-${{matrix.duckdb_arch}}${{inputs.artifact_postfix}}
+          path: |
+            build/${{ inputs.build_type }}/repository/**/*.duckdb_extension
+
+      - name: Print Rust logs
+        if: ${{ inputs.rust_logs && (inputs.enable_rust || contains(format(';{0};', inputs.extra_toolchains), ';rust;')) }}
+        shell: bash
+        env:
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        run: |
+          for filename in build/"$BUILD_TYPE_INPUT"/rust/src/*/*build-*.log; do
+            echo Printing logs for file $filename
+            cat $filename;
+            echo Done printing logs for $filename
+          done
+
+      - name: Move rtools supplied zstd out of the way, so ccache can work
+        if: (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw')
+        shell: cmd
+        run: |
+          mv C:\rtools42\usr\bin\zstd.exe C:\rtools42\usr\bin\zstd-rtools.exe
+
+  wasm:
+    name: DuckDB-Wasm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - generate_matrix
+      - linux
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.generate_matrix.outputs.wasm_matrix != '{}' &&
+      needs.generate_matrix.outputs.wasm_matrix != '' &&
+      needs.generate_matrix.result == 'success' &&
+      (needs.linux.result == 'success' || needs.linux.result == 'skipped')
+    strategy:
+      matrix: ${{fromJson(needs.generate_matrix.outputs.wasm_matrix)}}
+    env:
+      VCPKG_TARGET_TRIPLET: ${{ matrix.vcpkg_target_triplet }}
+      VCPKG_HOST_TRIPLET: ${{ matrix.vcpkg_host_triplet }}
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      USE_MERGED_VCPKG_MANIFEST: ${{ inputs.use_merged_vcpkg_manifest }}
+      VCPKG_OVERLAY_PORTS: ${{ github.workspace }}/extension-ci-tools/vcpkg_ports
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/extension-ci-tools/toolchains
+      # VCPKG caching
+      AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+      AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+
+      DUCKDB_PLATFORM: ${{ matrix.duckdb_arch }}
+      WASM_EXTENSIONS: 1
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout override repository
+        if: ${{inputs.override_repository != ''}}
+        with:
+          repository: ${{ inputs.override_repository }}
+          ref: ${{ inputs.override_ref }}
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout current repository
+        if: ${{inputs.override_repository == ''}}
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        name: Checkout Extension CI tools
+        with:
+          path: 'extension-ci-tools'
+          ref: ${{ inputs.ci_tools_version }}
+          repository: ${{ inputs.override_ci_tools_repository }}
+
+      - name: Fetch override repository
+        if: ${{inputs.override_duckdb_repository != ''}}
+        env:
+          OVERRIDE_DUCKDB_REPOSITORY: ${{ inputs.override_duckdb_repository }}
+        run: |
+          DUCKDB_GIT_REPOSITORY="$OVERRIDE_DUCKDB_REPOSITORY" make set_duckdb_repository
+
+      - name: Set DuckDB to ref of calling workflow
+        if: ${{inputs.set_caller_as_duckdb}}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: 'duckdb'
+          fetch-tags: true
+          fetch-depth: 0
+
+      - name: Checkout DuckDB to version
+        if: ${{ inputs.duckdb_version != '' }}
+        env:
+          DUCKDB_VERSION_INPUT: ${{ inputs.duckdb_version }}
+        run: |
+          DUCKDB_GIT_VERSION="$DUCKDB_VERSION_INPUT" make set_duckdb_version
+
+      - name: Tag extension
+        if: ${{inputs.extension_tag != ''}}
+        env:
+          EXTENSION_TAG: ${{ inputs.extension_tag }}
+        run: |
+          git tag "$EXTENSION_TAG"
+
+      - name: Tag DuckDB extension
+        if: ${{inputs.duckdb_tag != ''}}
+        env:
+          DUCKDB_TAG_INPUT: ${{ inputs.duckdb_tag }}
+        run: |
+          DUCKDB_TAG="$DUCKDB_TAG_INPUT" make set_duckdb_tag
+
+      - uses: mymindstorm/setup-emsdk@d233ac12b0102f74ca199f5dad7a4e2c13a8a745 # v13
+        with:
+          version: 3.1.71
+
+      - name: Setup Rust for cross compilation
+        if: ${{ (inputs.enable_rust || contains(format(';{0};', inputs.extra_toolchains), ';rust;'))}}
+        uses: dtolnay/rust-toolchain@dd44c20b1206a46e25fba8503d5d7c9a33bd355a # 1.86.0
+        with:
+          targets: wasm32-unknown-emscripten
+
+      - name: 'Setup go'
+        if: ${{ (inputs.enable_go || contains(format(';{0};', inputs.extra_toolchains), ';go;'))}}
+        uses: actions/setup-go@7b8cf10d4e4a01d4992d18a89f4d7dc5a3e6d6f4 # v4.3.0
+        with:
+          go-version: '1.23'
+
+      - name: Setup vcpkg
+        env:
+          VCPKG_URL: ${{ inputs.vcpkg_url }}
+          VCPKG_COMMIT: ${{ inputs.vcpkg_commit }}
+          GH_WORKSPACE: ${{ github.workspace }}
+        run: |
+          mkdir local_vcpkg_installation
+          cmake --version
+          cd local_vcpkg_installation
+          git init
+          git remote add origin "$VCPKG_URL"
+          git fetch origin "$VCPKG_COMMIT"
+          git checkout "$VCPKG_COMMIT"
+          ./bootstrap-vcpkg.sh
+          echo "VCPKG_ROOT=$GH_WORKSPACE/local_vcpkg_installation" >> $GITHUB_ENV
+          echo "VCPKG_TOOLCHAIN_PATH=$GH_WORKSPACE/local_vcpkg_installation/scripts/buildsystems/vcpkg.cmake" >> $GITHUB_ENV
+          echo "$GH_WORKSPACE/local_vcpkg_installation" >> $GITHUB_PATH
+
+      - name: Setup Ccache
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+        continue-on-error: true
+        with:
+          key: ccache-extension-distribution-${{ matrix.duckdb_arch }}-${{ inputs.duckdb_version }}
+          restore-keys: ccache-extension-distribution-${{ matrix.duckdb_arch }}-
+          save: ${{ inputs.save_cache }}
+
+      - name: Downgrade AWS cli
+        if: ${{ (contains(format(';{0};', inputs.extra_toolchains), ';downgraded_aws_cli;')) }}
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.22.35.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+          aws --version
+
+      - name: Inject extra extension config
+        if: ${{ inputs.extra_extension_config }}
+        shell: bash
+        env:
+          EXTENSION_CONFIG: ${{ inputs.extra_extension_config }}
+        run: |
+          echo -e "\n# Injected Extension Config\n$EXTENSION_CONFIG" >> ./extension_config.cmake
+          cat ./extension_config.cmake
+
+      - name: Run configure
+        shell: bash
+        env:
+          DUCKDB_GIT_VERSION: ${{ inputs.duckdb_version }}
+        run: |
+          make configure_ci
+
+      - name: Install extra vcpkg dependencies
+        if: ${{ inputs.vcpkg_extra_dependencies != '' }}
+        shell: bash
+        env:
+          VCPKG_EXTRA_DEPENDENCIES_JSON: ${{ inputs.vcpkg_extra_dependencies }}
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+        run: |
+          DEPS=$(python3 -c "import os, json; data = json.loads(os.environ['VCPKG_EXTRA_DEPENDENCIES_JSON']); arch = os.environ['DUCKDB_ARCH']; print(' '.join(data.get(arch, [])) if arch in data else '')" | tr -d '\n')
+          if [ ! -z "$DEPS" ]; then
+            for dep in $DEPS; do
+              vcpkg install "$dep" --recurse
+            done
+          fi
+
+      - name: Build Wasm module
+        env:
+          EXTENSION_NAME_INPUT: ${{ inputs.extension_name }}
+          EXTENSION_CANONICAL_INPUT: ${{ inputs.extension_canonical }}
+          DUCKDB_ARCH: ${{ matrix.duckdb_arch }}
+        run: |
+          EXTENSION_NAME="$EXTENSION_NAME_INPUT" EXTENSION_CANONICAL="$EXTENSION_CANONICAL_INPUT" ENABLE_EXTENSION_AUTOINSTALL=1 ENABLE_EXTENSION_AUTOLOADING=1 make "$DUCKDB_ARCH"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !inputs.upload_all_extensions }}
+        with:
+          if-no-files-found: error
+          name: ${{ inputs.extension_name }}-${{ inputs.duckdb_version }}-extension-${{matrix.duckdb_arch}}${{inputs.artifact_postfix}}
+          path: |
+            build/${{ matrix.duckdb_arch }}/extension/${{ inputs.extension_name }}/${{ inputs.extension_name }}.duckdb_extension.wasm
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ inputs.upload_all_extensions}}
+        with:
+          if-no-files-found: error
+          name: ${{ inputs.extension_name }}-${{ inputs.duckdb_version }}-extension-${{matrix.duckdb_arch}}${{inputs.artifact_postfix}}
+          path: |
+            build/${{ matrix.duckdb_arch }}/repository/**/*.duckdb_extension.wasm
+
+      - name: Print Rust logs
+        if: ${{ inputs.rust_logs && (inputs.enable_rust || contains(format(';{0};', inputs.extra_toolchains), ';rust;')) }}
+        shell: bash
+        env:
+          BUILD_TYPE_INPUT: ${{ inputs.build_type }}
+        run: |
+          for filename in build/"$BUILD_TYPE_INPUT"/rust/src/*/*build-*.log; do
+            echo Printing logs for file $filename
+            cat $filename;
+            echo Done printing logs for $filename
+          done
