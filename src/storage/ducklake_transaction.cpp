@@ -2729,43 +2729,12 @@ unique_ptr<QueryResult> DuckLakeTransaction::ExecuteRaw(string query) {
 	return result;
 }
 
-// Transaction-level metadata queries run directly on the metadata connection (raw): for a Postgres
-// backend that means DuckDB executes them against the attached Postgres catalog, translating DuckDB
-// syntax (uuid(), LIST/STRUCT, ...) that the server-side postgres_query/postgres_execute passthrough
-// cannot handle. The postgres passthrough is applied only by the metadata manager's own
-// SnapshotQuery/CurrentQuery/Execute methods (called unqualified inside the manager) for the
-// snapshot-pinned file/stats reads that benefit from server-side execution (#5/#11).
-unique_ptr<QueryResult> DuckLakeTransaction::Execute(DuckLakeSnapshot snapshot, string query) {
-	metadata_manager->SubstituteSnapshotPlaceholders(snapshot, query);
-	metadata_manager->SubstituteCatalogPlaceholders(query);
-	return ExecuteRaw(std::move(query));
+unique_ptr<QueryResult> DuckLakeTransaction::Query(string query) {
+	return metadata_manager->Query(query);
 }
 
-unique_ptr<QueryResult> DuckLakeTransaction::Execute(string query) {
-	metadata_manager->SubstituteCatalogPlaceholders(query);
-	return ExecuteRaw(std::move(query));
-}
-
-unique_ptr<QueryResult> DuckLakeTransaction::SnapshotQuery(DuckLakeSnapshot snapshot, string query) {
-	metadata_manager->SubstituteSnapshotPlaceholders(snapshot, query);
-	metadata_manager->SubstituteCatalogPlaceholders(query);
-	return ExecuteRaw(std::move(query));
-}
-
-unique_ptr<QueryResult> DuckLakeTransaction::CurrentQuery(DuckLakeSnapshot snapshot, string query) {
-	metadata_manager->SubstituteSnapshotPlaceholders(snapshot, query);
-	metadata_manager->SubstituteCatalogPlaceholders(query);
-	return ExecuteRaw(std::move(query));
-}
-
-unique_ptr<QueryResult> DuckLakeTransaction::CurrentQuery(string query) {
-	metadata_manager->SubstituteCatalogPlaceholders(query);
-	return ExecuteRaw(std::move(query));
-}
-
-unique_ptr<QueryResult> DuckLakeTransaction::RawQuery(string query) {
-	metadata_manager->SubstituteCatalogPlaceholders(query);
-	return ExecuteRaw(std::move(query));
+unique_ptr<QueryResult> DuckLakeTransaction::Query(DuckLakeSnapshot snapshot, string query) {
+	return metadata_manager->Query(snapshot, query);
 }
 
 string DuckLakeTransaction::GetDefaultSchemaName() {
