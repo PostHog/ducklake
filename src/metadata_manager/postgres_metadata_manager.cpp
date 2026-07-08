@@ -301,15 +301,11 @@ unique_ptr<QueryResult> PostgresMetadataManager::Execute(string &query) {
 	return ExecuteQuery(query, "postgres_execute");
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::SnapshotQuery(DuckLakeSnapshot snapshot, string &query) {
-	return ExecuteQuery(snapshot, query, "postgres_query");
+unique_ptr<QueryResult> PostgresMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
+	return DuckLakeMetadataManager::Query(snapshot, query);
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::CurrentQuery(DuckLakeSnapshot snapshot, string &query) {
-	return ExecuteQuery(snapshot, query, "postgres_query");
-}
-
-unique_ptr<QueryResult> PostgresMetadataManager::CurrentQuery(string &query) {
+unique_ptr<QueryResult> PostgresMetadataManager::Query(string &query) {
 	return ExecuteQuery(query, "postgres_query");
 }
 
@@ -335,7 +331,7 @@ SELECT EXISTS (
 	  AND table_name = %s
 ))",
 	                                DuckLakeUtil::SQLLiteralToString(table_name));
-	auto result = SnapshotQuery(snapshot, query);
+	auto result = Query(snapshot, query);
 	if (result->HasError()) {
 		return false;
 	}

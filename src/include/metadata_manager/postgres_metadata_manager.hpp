@@ -37,9 +37,8 @@ public:
 	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
 	unique_ptr<QueryResult> Execute(string &query) override;
 
-	unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string &query) override;
-	unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string &query) override;
-	unique_ptr<QueryResult> CurrentQuery(string &query) override;
+	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query) override;
+	unique_ptr<QueryResult> Query(string &query) override;
 
 protected:
 	string GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
