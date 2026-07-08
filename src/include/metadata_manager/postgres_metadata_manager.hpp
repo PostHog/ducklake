@@ -42,7 +42,6 @@ public:
 
 protected:
 	string GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
-	bool InlinedDeletionTableExists(TableIndex table_id, DuckLakeSnapshot snapshot, const string &table_name) override;
 	string CastValueToTarget(const Value &val, const LogicalType &type) override;
 	string CastStatsToTarget(const string &stats, const LogicalType &type) override;
 	string GenerateConstantFilter(const ConstantFilter &constant_filter, const LogicalType &type,

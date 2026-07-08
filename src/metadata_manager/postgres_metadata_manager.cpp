@@ -321,24 +321,6 @@ string PostgresMetadataManager::GenerateFileColumnStatsCTEBody(const CTERequirem
 	                          select_list, req.column_field_index, table_id.index);
 }
 
-bool PostgresMetadataManager::InlinedDeletionTableExists(TableIndex, DuckLakeSnapshot snapshot,
-                                                         const string &table_name) {
-	auto query = StringUtil::Format(R"(
-SELECT EXISTS (
-	SELECT 1
-	FROM information_schema.tables
-	WHERE table_schema = {METADATA_SCHEMA_NAME_LITERAL}
-	  AND table_name = %s
-))",
-	                                DuckLakeUtil::SQLLiteralToString(table_name));
-	auto result = Query(snapshot, query);
-	if (result->HasError()) {
-		return false;
-	}
-	auto chunk = result->Fetch();
-	return chunk && chunk->size() > 0 && chunk->GetValue(0, 0).GetValue<bool>();
-}
-
 // We need a specialized function here to do a reinterpret for postgres from BLOB to VARCHAR
 shared_ptr<DuckLakeInlinedData>
 PostgresMetadataManager::TransformInlinedData(QueryResult &result, const vector<LogicalType> &expected_types) {

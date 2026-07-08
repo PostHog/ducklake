@@ -103,6 +103,7 @@ static unique_ptr<Catalog> DuckLakeAttach(optional_ptr<StorageExtensionInfo> sto
 	if (options.access_mode == AccessMode::READ_ONLY && !is_create_if_not_exists_set) {
 		options.create_if_not_exists = false;
 	}
+	options.hide_metadata_catalog = options.metadata_database.empty();
 	if (options.metadata_database.empty()) {
 		options.metadata_database = "__ducklake_metadata_" + name;
 	}
