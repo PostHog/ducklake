@@ -6,11 +6,12 @@ require ducklake
 
 require parquet
 
-require postgres_scanner
-
 require-env DUCKLAKE_CI
 
 test-env DATA_PATH {TEST_DIR}
+
+statement ok
+LOAD postgres_scanner
 
 statement ok
 ATTACH 'ducklake:postgres:dbname=ducklakedb' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_postgres_passthrough', DATA_INLINING_ROW_LIMIT 0)

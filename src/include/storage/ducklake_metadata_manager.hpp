@@ -174,6 +174,14 @@ public:
 	virtual unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query);
 	virtual unique_ptr<QueryResult> Query(string &query);
 
+	//! Opt-in direct backend execution for metadata engines that support it.
+	//! The default implementation preserves the regular DuckDB-routed Query/Execute behavior.
+	virtual unique_ptr<QueryResult> PassthroughExecute(DuckLakeSnapshot snapshot, string &query);
+	virtual unique_ptr<QueryResult> PassthroughExecute(string &query);
+
+	virtual unique_ptr<QueryResult> PassthroughQuery(DuckLakeSnapshot snapshot, string &query);
+	virtual unique_ptr<QueryResult> PassthroughQuery(string &query);
+
 protected:
 	void SubstituteCatalogPlaceholders(string &query) const;
 	void SubstituteSnapshotPlaceholders(DuckLakeSnapshot snapshot, string &query) const;
