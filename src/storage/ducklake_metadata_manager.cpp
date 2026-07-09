@@ -3085,7 +3085,7 @@ FROM {METADATA_CATALOG}.%s inlined_data
 WHERE {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)
 ORDER BY row_id;)",
 	                                projection, inlined_table_name);
-	auto result = transaction.Query(snapshot, query);
+	auto result = PassthroughQuery(snapshot, query);
 	return result;
 }
 
@@ -3099,7 +3099,7 @@ SELECT %s
 FROM {METADATA_CATALOG}.%s inlined_data
 WHERE inlined_data.begin_snapshot >= %d AND inlined_data.begin_snapshot <= {SNAPSHOT_ID};)",
 	                                projection, inlined_table_name, start_snapshot.snapshot_id);
-	auto result = transaction.Query(end_snapshot, query);
+	auto result = PassthroughQuery(end_snapshot, query);
 	return result;
 }
 
@@ -3113,7 +3113,7 @@ SELECT %s
 FROM {METADATA_CATALOG}.%s inlined_data
 WHERE inlined_data.end_snapshot >= %d AND inlined_data.end_snapshot <= {SNAPSHOT_ID};)",
 	                                projection, inlined_table_name, start_snapshot.snapshot_id);
-	auto result = transaction.Query(end_snapshot, query);
+	auto result = PassthroughQuery(end_snapshot, query);
 	return result;
 }
 
@@ -3127,7 +3127,7 @@ FROM {METADATA_CATALOG}.%s inlined_data
 WHERE {SNAPSHOT_ID} >= begin_snapshot
 ORDER BY row_id, begin_snapshot;)",
 	                                projection, inlined_table_name);
-	auto result = transaction.Query(snapshot, query);
+	auto result = PassthroughQuery(snapshot, query);
 	return result;
 }
 

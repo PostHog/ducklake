@@ -71,9 +71,10 @@ bool DuckLakeInlinedDataReader::TryInitializeScan(ClientContext &context, Global
 			string projected_column = KeywordHelper::WriteOptionallyQuoted(columns[index].name);
 			auto &metadata_type = ducklake_catalog.MetadataType();
 			bool needs_cast = !metadata_type.empty() && metadata_type != "duckdb" && metadata_type != "quack" &&
-			                  metadata_type != "quack_scanner";
+			                  metadata_type != "quack_scanner" && metadata_type != "postgres" &&
+			                  metadata_type != "postgres_scanner";
 			if (needs_cast) {
-				// If it's not a duckdb catalog, we add a cast.
+				// Some metadata backends need projection casts in the metadata query.
 				if (columns[index].type.id() != LogicalTypeId::VARCHAR) {
 					projected_column = metadata_manager.CastColumnToTarget(projected_column, columns[index].type);
 				}

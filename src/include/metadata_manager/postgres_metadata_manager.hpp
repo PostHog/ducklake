@@ -34,6 +34,9 @@ public:
 	                                                     const vector<LogicalType> &expected_types) override;
 	void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) override;
 
+	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
+	unique_ptr<QueryResult> Execute(string &query) override;
+
 	unique_ptr<QueryResult> PassthroughExecute(DuckLakeSnapshot snapshot, string &query) override;
 	unique_ptr<QueryResult> PassthroughExecute(string &query) override;
 
