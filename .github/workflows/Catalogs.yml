@@ -90,6 +90,7 @@ jobs:
 
     - name: Test Postgres
       env:
+        DUCKLAKE_CI: "1"
         PGSERVICE: postgres
       run: |
         # Install the official prebuilt postgres_scanner for this DuckDB version (autoloading is
