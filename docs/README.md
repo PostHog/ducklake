@@ -153,3 +153,9 @@ Commits carried in this fork that have not been sent upstream, most recent first
 | `42ea11be` | [#17](https://github.com/PostHog/ducklake/pull/17) | Pin GitHub Actions to commit hashes instead of mutable tags. |
 | `311534f5` | [#10](https://github.com/PostHog/ducklake/pull/10) | Add `.claude` and `.cache` to `.gitignore` so local tool state isn't accidentally committed. |
 | `4c38a855` (merge) / `bb16ebd0` | [#4](https://github.com/PostHog/ducklake/pull/4) | Publish DuckLake extension release binaries (`linux_amd64`, `linux_arm64`, plus `SHA256SUMS`) to the GitHub Release on tag push, giving Duckgres stable URLs for PostHog-built artifacts. |
+
+Upstream commits cherry-picked onto this fork ahead of a full upstream pull, most recent first:
+
+| Upstream PR | Commits | Summary |
+| --- | --- | --- |
+| [duckdb/ducklake#1234](https://github.com/duckdb/ducklake/pull/1234) | `a5a6be4d`, `fda045ba` | Fix `ducklake_add_data_files()` writing every `ducklake_file_partition_value` row at the last transform's `partition_key_index` when a partition spec applies multiple transforms to one source column (e.g. `year`/`month`/`day` on a single timestamp). Broke tier-3 compaction ("Files have different hive partition path") and partition pruning for files registered by the PostHog duckling backfill; worked around downstream in posthog#67168 until this fix. |
