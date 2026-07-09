@@ -37,6 +37,9 @@ jobs:
       ci_tools_version: d3e0ee09e2e392941f2e390e6cbab108a095daa4
       override_ci_tools_repository: PostHog/extension-ci-tools
       extension_name: ducklake
+      # PostHog deploys DuckLake via AWS/Kubernetes Linux containers; do not
+      # build Windows release artifacts in this fork.
+      exclude_archs: windows_amd64;windows_amd64_mingw;windows_arm64
       # arm64 on GitHub-hosted (public repo, free); the depot arm64 runner
       # was unresponsive (job lost at the 10-min runner timeout). amd64 stays
       # on the working depot runner.
