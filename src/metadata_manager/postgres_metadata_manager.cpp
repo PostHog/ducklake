@@ -19,6 +19,11 @@ static bool HasFourDigitDatePrefix(const string &value) {
 	       IsDigit(value[9]);
 }
 
+static string WithPostgresBinaryCollation(const string &expression) {
+	// DuckLake VARCHAR stats use DuckDB's bytewise ordering, independent of the metadata database locale.
+	return "(" + expression + " COLLATE \"C\")";
+}
+
 PostgresMetadataManager::PostgresMetadataManager(DuckLakeTransaction &transaction)
     : DuckLakeMetadataManager(transaction) {
 }
@@ -179,6 +184,9 @@ string PostgresMetadataManager::CastValueToTarget(const Value &val, const Logica
 		return val.ToString();
 	}
 	auto literal = DuckLakeUtil::SQLLiteralToString(val.ToString());
+	if (type.id() == LogicalTypeId::VARCHAR) {
+		return WithPostgresBinaryCollation(literal);
+	}
 	if (IsPostgresTemporalStatsType(type) && CanCastTemporalValueForValueComparison(val, type)) {
 		return literal + "::" + GetPostgresStatsType(type);
 	}
@@ -202,6 +210,9 @@ string PostgresMetadataManager::CastStatsToTarget(const string &stats, const Log
 	}
 	if (RequiresValueComparison(type) && CanCastStatsForValueComparison(type)) {
 		return stats + "::" + GetPostgresStatsType(type);
+	}
+	if (type.id() == LogicalTypeId::VARCHAR) {
+		return WithPostgresBinaryCollation(stats);
 	}
 	return stats;
 }
