@@ -321,6 +321,11 @@ string PostgresMetadataManager::GenerateFileColumnStatsCTEBody(const CTERequirem
 	                          select_list, req.column_field_index, table_id.index);
 }
 
+string PostgresMetadataManager::GeneratePassthroughFileColumnStatsCTEBody(const CTERequirement &req,
+                                                                          TableIndex table_id) {
+	return DuckLakeMetadataManager::GenerateFileColumnStatsCTEBody(req, table_id);
+}
+
 // We need a specialized function here to do a reinterpret for postgres from BLOB to VARCHAR
 shared_ptr<DuckLakeInlinedData>
 PostgresMetadataManager::TransformInlinedData(QueryResult &result, const vector<LogicalType> &expected_types) {

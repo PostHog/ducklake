@@ -42,6 +42,7 @@ public:
 
 protected:
 	string GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
+	string GeneratePassthroughFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
 	string CastValueToTarget(const Value &val, const LogicalType &type) override;
 	string CastStatsToTarget(const string &stats, const LogicalType &type) override;
 	string GenerateConstantFilter(const ConstantFilter &constant_filter, const LogicalType &type,
