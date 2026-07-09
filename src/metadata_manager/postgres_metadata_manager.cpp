@@ -103,7 +103,7 @@ CREATE INDEX IF NOT EXISTS ducklake_table_column_stats_table_column_idx ON {META
 void PostgresMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) {
 	DuckLakeMetadataManager::InitializeDuckLake(has_explicit_schema, encryption);
 	auto index_query = GetPostgresIndexStatements();
-	auto result = Execute(index_query);
+	auto result = PassthroughExecute(index_query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to initialize DuckLake Postgres metadata indexes: ");
 	}
@@ -293,19 +293,19 @@ unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(string &query, str
 	DuckLakeSnapshot snapshot;
 	return ExecuteQuery(snapshot, query, std::move(command));
 }
-unique_ptr<QueryResult> PostgresMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
+unique_ptr<QueryResult> PostgresMetadataManager::PassthroughExecute(DuckLakeSnapshot snapshot, string &query) {
 	return ExecuteQuery(snapshot, query, "postgres_execute");
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::Execute(string &query) {
+unique_ptr<QueryResult> PostgresMetadataManager::PassthroughExecute(string &query) {
 	return ExecuteQuery(query, "postgres_execute");
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
-	return DuckLakeMetadataManager::Query(snapshot, query);
+unique_ptr<QueryResult> PostgresMetadataManager::PassthroughQuery(DuckLakeSnapshot snapshot, string &query) {
+	return ExecuteQuery(snapshot, query, "postgres_query");
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::Query(string &query) {
+unique_ptr<QueryResult> PostgresMetadataManager::PassthroughQuery(string &query) {
 	return ExecuteQuery(query, "postgres_query");
 }
 

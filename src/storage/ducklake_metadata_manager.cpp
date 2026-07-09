@@ -997,7 +997,7 @@ ORDER BY table_id;
 )",
 	                                  table_id.index);
 
-	auto result = Query(snapshot, query);
+	auto result = PassthroughQuery(snapshot, query);
 	return TransformGlobalStats(*result);
 }
 
@@ -2356,6 +2356,22 @@ unique_ptr<QueryResult> DuckLakeMetadataManager::Query(DuckLakeSnapshot snapshot
 unique_ptr<QueryResult> DuckLakeMetadataManager::Query(string &query) {
 	SubstituteCatalogPlaceholders(query);
 	return transaction.ExecuteRaw(query);
+}
+
+unique_ptr<QueryResult> DuckLakeMetadataManager::PassthroughExecute(DuckLakeSnapshot snapshot, string &query) {
+	return Execute(snapshot, query);
+}
+
+unique_ptr<QueryResult> DuckLakeMetadataManager::PassthroughExecute(string &query) {
+	return Execute(query);
+}
+
+unique_ptr<QueryResult> DuckLakeMetadataManager::PassthroughQuery(DuckLakeSnapshot snapshot, string &query) {
+	return Query(snapshot, query);
+}
+
+unique_ptr<QueryResult> DuckLakeMetadataManager::PassthroughQuery(string &query) {
+	return Query(query);
 }
 
 string DuckLakeMetadataManager::DropMacros(const set<MacroIndex> &ids) {

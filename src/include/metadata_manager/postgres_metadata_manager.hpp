@@ -34,11 +34,11 @@ public:
 	                                                     const vector<LogicalType> &expected_types) override;
 	void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) override;
 
-	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
-	unique_ptr<QueryResult> Execute(string &query) override;
+	unique_ptr<QueryResult> PassthroughExecute(DuckLakeSnapshot snapshot, string &query) override;
+	unique_ptr<QueryResult> PassthroughExecute(string &query) override;
 
-	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query) override;
-	unique_ptr<QueryResult> Query(string &query) override;
+	unique_ptr<QueryResult> PassthroughQuery(DuckLakeSnapshot snapshot, string &query) override;
+	unique_ptr<QueryResult> PassthroughQuery(string &query) override;
 
 protected:
 	string GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
