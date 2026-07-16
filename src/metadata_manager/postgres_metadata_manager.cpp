@@ -143,6 +143,8 @@ string PostgresMetadataManager::GetPostgresStatsType(const LogicalType &type) {
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
 		return "TIMESTAMP";
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return "TIMESTAMPTZ";
 	default:
 		return type.ToString();
 	}
@@ -152,6 +154,7 @@ bool PostgresMetadataManager::IsPostgresTemporalStatsType(const LogicalType &typ
 	switch (type.id()) {
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_TZ:
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
 		return true;
@@ -201,6 +204,20 @@ string PostgresMetadataManager::CastStatsToTarget(const string &stats, const Log
 		string regex;
 		if (type.id() == LogicalTypeId::DATE) {
 			regex = "'^[0-9]{4}-(0[1-9]|1[0-2])-([0][1-9]|[12][0-9]|3[01])$'";
+		} else if (type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+			regex = "'^[0-9]{4}-(0[1-9]|1[0-2])-([0][1-9]|[12][0-9]|3[01]) "
+			        "([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,6})?"
+			        "(Z|[+-](0[0-9]|1[0-5])(:[0-5][0-9])?)$'";
+			auto year = StringUtil::Format("substring(%s FROM 1 FOR 4)::INTEGER", stats);
+			auto month = StringUtil::Format("substring(%s FROM 6 FOR 2)::INTEGER", stats);
+			auto day = StringUtil::Format("substring(%s FROM 9 FOR 2)::INTEGER", stats);
+			auto max_day = StringUtil::Format(
+			    "(CASE WHEN %s = 2 THEN CASE WHEN mod(%s, 4) = 0 AND (mod(%s, 100) <> 0 OR mod(%s, 400) = 0) "
+			    "THEN 29 ELSE 28 END WHEN %s IN (4, 6, 9, 11) THEN 30 ELSE 31 END)",
+			    month, year, year, year, month);
+			auto valid_date = StringUtil::Format("%s > 0 AND %s <= %s", year, day, max_day);
+			return StringUtil::Format("(CASE WHEN %s ~ %s THEN CASE WHEN %s THEN %s::%s END END)", stats, regex,
+			                          valid_date, stats, GetPostgresStatsType(type));
 		} else {
 			regex =
 			    "'^[0-9]{4}-(0[1-9]|1[0-2])-([0][1-9]|[12][0-9]|3[01])( [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?)?$'";

@@ -1,0 +1,227 @@
+# name: test/sql/metadata/postgres_timestamptz_pruning.test
+# description: PostgreSQL metadata must safely prune files using TIMESTAMPTZ stats
+# group: [metadata]
+
+require ducklake
+
+require parquet
+
+require-env DUCKLAKE_CI
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+LOAD postgres_scanner
+
+statement ok
+ATTACH 'ducklake:postgres:dbname=ducklakedb' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_postgres_timestamptz_pruning', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE ducklake.timestamptz_pruning(id INTEGER, payload VARCHAR, "timestamp" TIMESTAMPTZ)
+
+# Each insert creates a separate file.
+statement ok
+INSERT INTO ducklake.timestamptz_pruning VALUES (1, 'before', TIMESTAMPTZ '2026-07-03 23:59:59.9+00')
+
+statement ok
+INSERT INTO ducklake.timestamptz_pruning VALUES (2, 'inside', TIMESTAMPTZ '2026-07-04 12:00:00.123456+00')
+
+statement ok
+INSERT INTO ducklake.timestamptz_pruning VALUES (3, 'after', TIMESTAMPTZ '2026-07-05 00:00:00+00')
+
+# UTC day range.
+query I
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-04 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-05 00:00:00+00'
+----
+1
+
+query II
+EXPLAIN ANALYZE
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-04 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-05 00:00:00+00'
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+# The equivalent absolute range expressed with a non-UTC offset.
+query II
+EXPLAIN ANALYZE
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-03 20:00:00-04'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-04 20:00:00-04'
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+query I
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-03 20:00:00-04'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-04 20:00:00-04'
+----
+1
+
+# Fractional-second bounds retain the matching file.
+query II
+EXPLAIN ANALYZE
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-04 12:00:00.123455+00'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-04 12:00:00.123457+00'
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+query I
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-04 12:00:00.123455+00'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-04 12:00:00.123457+00'
+----
+1
+
+# PostgreSQL metadata can contain equivalent offset-bearing representations.
+statement ok
+CALL postgres_execute('__ducklake_metadata_ducklake', '
+UPDATE public.ducklake_file_column_stats stats
+SET min_value = CASE
+        WHEN min_value::timestamptz < TIMESTAMPTZ ''2026-07-04 00:00:00+00''
+          THEN ''2026-07-03 19:59:59.9-04''
+        WHEN min_value::timestamptz < TIMESTAMPTZ ''2026-07-05 00:00:00+00''
+          THEN ''2026-07-04 17:45:00.123456+05:45''
+        ELSE ''2026-07-05 00:00:00Z''
+    END,
+    max_value = CASE
+        WHEN max_value::timestamptz < TIMESTAMPTZ ''2026-07-04 00:00:00+00''
+          THEN ''2026-07-03 19:59:59.9-04''
+        WHEN max_value::timestamptz < TIMESTAMPTZ ''2026-07-05 00:00:00+00''
+          THEN ''2026-07-04 17:45:00.123456+05:45''
+        ELSE ''2026-07-05 00:00:00Z''
+    END
+FROM public.ducklake_column col
+JOIN public.ducklake_table tbl USING (table_id)
+WHERE stats.table_id = col.table_id
+  AND stats.column_id = col.column_id
+  AND tbl.table_name = ''timestamptz_pruning''
+  AND col.column_name = ''timestamp''
+')
+
+query II
+EXPLAIN ANALYZE
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-04 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-05 00:00:00+00'
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+query I
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-04 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-05 00:00:00+00'
+----
+1
+
+# Gregorian leap-day validation accepts both ordinary and 400-year leap years.
+statement ok
+CREATE TABLE ducklake.timestamptz_leap_years("timestamp" TIMESTAMPTZ)
+
+statement ok
+INSERT INTO ducklake.timestamptz_leap_years VALUES (TIMESTAMPTZ '2000-02-29 12:00:00+00')
+
+statement ok
+INSERT INTO ducklake.timestamptz_leap_years VALUES (TIMESTAMPTZ '2024-02-29 12:00:00+00')
+
+query II
+EXPLAIN ANALYZE
+SELECT count()
+FROM ducklake.timestamptz_leap_years
+WHERE "timestamp" >= TIMESTAMPTZ '2000-02-29 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2000-03-01 00:00:00+00'
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+query I
+SELECT count()
+FROM ducklake.timestamptz_leap_years
+WHERE "timestamp" >= TIMESTAMPTZ '2000-02-29 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2000-03-01 00:00:00+00'
+----
+1
+
+query II
+EXPLAIN ANALYZE
+SELECT count()
+FROM ducklake.timestamptz_leap_years
+WHERE "timestamp" >= TIMESTAMPTZ '2024-02-29 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2024-03-01 00:00:00+00'
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+query I
+SELECT count()
+FROM ducklake.timestamptz_leap_years
+WHERE "timestamp" >= TIMESTAMPTZ '2024-02-29 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2024-03-01 00:00:00+00'
+----
+1
+
+# Unsupported constants disable metadata pruning instead of failing the query.
+query I
+SELECT count() FROM ducklake.timestamptz_pruning WHERE "timestamp" < TIMESTAMPTZ 'infinity'
+----
+3
+
+# Invalid stats must disable pruning instead of reaching a PostgreSQL cast.
+foreach invalid_stat 2026-02-31_00:00:00+00 1900-02-29_00:00:00+00 2026-07-04_25:00:00+00 2026-07-04_00:00:00+16:00 0000-07-04_00:00:00+00 2026-07-04 not-a-timestamp 300000-01-01_00:00:00+00
+
+statement ok
+CALL postgres_execute('__ducklake_metadata_ducklake', '
+UPDATE public.ducklake_file_column_stats stats
+SET min_value = replace(''${invalid_stat}'', ''_'', '' ''),
+    max_value = replace(''${invalid_stat}'', ''_'', '' '')
+FROM public.ducklake_column col
+JOIN public.ducklake_table tbl USING (table_id)
+WHERE stats.table_id = col.table_id
+  AND stats.column_id = col.column_id
+  AND tbl.table_name = ''timestamptz_pruning''
+  AND col.column_name = ''timestamp''
+')
+
+query II
+EXPLAIN ANALYZE
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-04 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-05 00:00:00+00'
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 3.*
+
+endloop
+
+# NULL stats are also retained conservatively.
+statement ok
+CALL postgres_execute('__ducklake_metadata_ducklake', '
+UPDATE public.ducklake_file_column_stats stats
+SET min_value = NULL,
+    max_value = NULL
+FROM public.ducklake_column col
+JOIN public.ducklake_table tbl USING (table_id)
+WHERE stats.table_id = col.table_id
+  AND stats.column_id = col.column_id
+  AND tbl.table_name = ''timestamptz_pruning''
+  AND col.column_name = ''timestamp''
+')
+
+query II
+EXPLAIN ANALYZE
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" >= TIMESTAMPTZ '2026-07-04 00:00:00+00'
+  AND "timestamp" <  TIMESTAMPTZ '2026-07-05 00:00:00+00'
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 3.*
