@@ -128,6 +128,31 @@ vector<column_t> DuckLakeGetRowIdColumn(ClientContext &context, optional_ptr<Fun
 	return result;
 }
 
+// Exposes DuckLake catalog column statistics to the optimizer's MIN/MAX aggregate pushdown.
+// DuckDB's StatisticsPropagator::TryExecuteAggregates folds MIN(col)/MAX(col) over a single scan into a
+// constant when the partition exposes (exact) column statistics through this interface.
+struct DuckLakePartitionRowGroup : public PartitionRowGroup {
+	DuckLakePartitionRowGroup(ClientContext &context, DuckLakeTableEntry &table, bool min_max_exact)
+	    : context(context), table(table), min_max_exact(min_max_exact) {
+	}
+
+	ClientContext &context;
+	DuckLakeTableEntry &table;
+	bool min_max_exact;
+
+	unique_ptr<BaseStatistics> GetColumnStatistics(const StorageIndex &storage_index) override {
+		if (storage_index.HasChildren()) {
+			// MIN/MAX over a nested sub-field - we only track stats for top-level columns, fall back to a scan
+			return nullptr;
+		}
+		return table.GetStatistics(context, storage_index.GetPrimaryIndex());
+	}
+
+	bool MinMaxIsExact(const BaseStatistics &stats, const StorageIndex &storage_index) override {
+		return min_max_exact;
+	}
+};
+
 vector<PartitionStatistics> DuckLakeGetPartitionStats(ClientContext &context, GetPartitionStatsInput &input) {
 	vector<PartitionStatistics> result;
 
@@ -171,12 +196,21 @@ vector<PartitionStatistics> DuckLakeGetPartitionStats(ClientContext &context, Ge
 		return result;
 	}
 
-	idx_t count = table.GetNetDataFileRowCount(*transaction) + table.GetNetInlinedRowCount(*transaction);
+	idx_t net_count = table.GetNetDataFileRowCount(*transaction) + table.GetNetInlinedRowCount(*transaction);
+
+	// MIN/MAX can be answered from the catalog column stats, but only when those stats are exact.
+	// Global column stats only ever widen on insert (via MergeStats) and are never tightened by deletes
+	// or compaction - so they are exact for the live data iff no row has ever been deleted, i.e. the gross
+	// record_count (total ever inserted) equals the net (delete-adjusted) row count. count(*) is unaffected
+	// either way: it does not consult MinMaxIsExact and subtracts delete counts independently.
+	auto table_stats = table.GetTableStats(*transaction);
+	bool min_max_exact = table_stats && table_stats->record_count == net_count;
 
 	// Return single partition with total count
 	PartitionStatistics stats;
-	stats.count = count;
+	stats.count = net_count;
 	stats.count_type = CountType::COUNT_EXACT;
+	stats.partition_row_group = make_shared_ptr<DuckLakePartitionRowGroup>(context, table, min_max_exact);
 	result.push_back(std::move(stats));
 	return result;
 }
@@ -240,12 +274,18 @@ shared_ptr<DuckLakeTransaction> DuckLakeFunctionInfo::GetTransaction() {
 void DuckLakeScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
                            const TableFunction &function) {
 	auto &func_info = function.function_info->Cast<DuckLakeFunctionInfo>();
-	D_ASSERT(func_info.scan_type == DuckLakeScanType::SCAN_TABLE);
 	auto &catalog = func_info.table.ParentCatalog();
 	serializer.WriteProperty(100, "catalog_name", catalog.GetName());
 	serializer.WriteProperty(101, "schema_name", func_info.table.ParentSchema().name);
 	serializer.WriteProperty(102, "table_name", func_info.table_name);
 	serializer.WriteObject(103, "snapshot", [&](Serializer &obj) { func_info.snapshot.Serialize(obj); });
+	serializer.WriteProperty(104, "scan_type", static_cast<uint8_t>(func_info.scan_type));
+	bool has_start_snapshot = func_info.start_snapshot != nullptr;
+	serializer.WriteProperty(105, "has_start_snapshot", has_start_snapshot);
+	if (has_start_snapshot) {
+		serializer.WriteObject(106, "start_snapshot",
+		                       [&](Serializer &obj) { func_info.start_snapshot->Serialize(obj); });
+	}
 }
 
 unique_ptr<FunctionData> DuckLakeScanDeserialize(Deserializer &deserializer, TableFunction &function) {
@@ -255,6 +295,15 @@ unique_ptr<FunctionData> DuckLakeScanDeserialize(Deserializer &deserializer, Tab
 	auto table_name = deserializer.ReadProperty<string>(102, "table_name");
 	DuckLakeSnapshot snapshot;
 	deserializer.ReadObject(103, "snapshot", [&](Deserializer &obj) { snapshot = DuckLakeSnapshot::Deserialize(obj); });
+	auto scan_type = static_cast<DuckLakeScanType>(deserializer.ReadPropertyWithExplicitDefault<uint8_t>(
+	    104, "scan_type", static_cast<uint8_t>(DuckLakeScanType::SCAN_TABLE)));
+	auto has_start_snapshot = deserializer.ReadPropertyWithExplicitDefault<bool>(105, "has_start_snapshot", false);
+	unique_ptr<DuckLakeSnapshot> start_snapshot;
+	if (has_start_snapshot) {
+		deserializer.ReadObject(106, "start_snapshot", [&](Deserializer &obj) {
+			start_snapshot = make_uniq<DuckLakeSnapshot>(DuckLakeSnapshot::Deserialize(obj));
+		});
+	}
 
 	// If ducklake_scan was registered before parquet was loaded, we set it now
 	if (!function.bind) {
@@ -271,7 +320,10 @@ unique_ptr<FunctionData> DuckLakeScanDeserialize(Deserializer &deserializer, Tab
 	auto &table_entry =
 	    Catalog::GetEntry<TableCatalogEntry>(context, catalog_name, schema_name, table_name).Cast<DuckLakeTableEntry>();
 
-	function.function_info = DuckLakeFunctionInfo::Create(table_entry, transaction, snapshot);
+	auto function_info = DuckLakeFunctionInfo::Create(table_entry, transaction, snapshot);
+	function_info->scan_type = scan_type;
+	function_info->start_snapshot = std::move(start_snapshot);
+	function.function_info = std::move(function_info);
 
 	return DuckLakeFunctions::BindDuckLakeScan(context, function);
 }

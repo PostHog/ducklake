@@ -40,6 +40,9 @@ string DuckLakeInitializer::GetAttachOptions() {
 		// this is duckdb, we always do latest storage
 		attach_options.push_back(StringUtil::Format("STORAGE_VERSION '%s'", "latest"));
 	}
+	if (options.hide_metadata_catalog) {
+		attach_options.push_back("HIDDEN true");
+	}
 
 	if (attach_options.empty()) {
 		return string();
@@ -67,9 +70,7 @@ void DuckLakeInitializer::Initialize() {
 		                catalog.MetadataPath() + "\"");
 	}
 	// explicitly load all secrets - work-around to secret initialization bug
-	// Run as a local DuckDB utility query (duckdb_secrets() is not valid metadata-backend SQL,
-	// so it must not be routed through the Postgres metadata passthrough).
-	transaction.ExecuteRaw("FROM duckdb_secrets()");
+	transaction.Query("FROM duckdb_secrets()");
 
 	bool has_explicit_schema = !options.metadata_schema.empty();
 	if (options.metadata_schema.empty()) {
@@ -91,6 +92,8 @@ void DuckLakeInitializer::Initialize() {
 		}
 		InitializeNewDuckLake(transaction, has_explicit_schema);
 	}
+	// probe the metadata server for optional capabilities (e.g. server-side commit retries) once per attach
+	metadata_manager.ProbeServerCapabilities();
 	metadata_manager.ClearCache();
 	if (options.at_clause) {
 		// if the user specified a snapshot try to load it to trigger an error if it does not exist

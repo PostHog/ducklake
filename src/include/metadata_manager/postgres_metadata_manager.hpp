@@ -37,13 +37,15 @@ public:
 	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
 	unique_ptr<QueryResult> Execute(string &query) override;
 
-	unique_ptr<QueryResult> SnapshotQuery(DuckLakeSnapshot snapshot, string &query) override;
-	unique_ptr<QueryResult> CurrentQuery(DuckLakeSnapshot snapshot, string &query) override;
-	unique_ptr<QueryResult> CurrentQuery(string &query) override;
+	unique_ptr<QueryResult> PassthroughExecute(DuckLakeSnapshot snapshot, string &query) override;
+	unique_ptr<QueryResult> PassthroughExecute(string &query) override;
+
+	unique_ptr<QueryResult> PassthroughQuery(DuckLakeSnapshot snapshot, string &query) override;
+	unique_ptr<QueryResult> PassthroughQuery(string &query) override;
 
 protected:
 	string GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
-	bool InlinedDeletionTableExists(TableIndex table_id, DuckLakeSnapshot snapshot, const string &table_name) override;
+	string GeneratePassthroughFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
 	string CastValueToTarget(const Value &val, const LogicalType &type) override;
 	string CastStatsToTarget(const string &stats, const LogicalType &type) override;
 	string GenerateConstantFilter(const ConstantFilter &constant_filter, const LogicalType &type,

@@ -1,0 +1,60 @@
+# name: test/sql/metadata/postgres_metadata_collation.test
+# description: PostgreSQL metadata pruning must use DuckDB-compatible string ordering
+# group: [metadata]
+
+require ducklake
+
+require parquet
+
+require-env DUCKLAKE_CI
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+LOAD postgres_scanner
+
+statement ok
+ATTACH 'ducklake:postgres:dbname=ducklakedb' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_postgres_collation', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE ducklake.collation_test(payload VARCHAR)
+
+statement ok
+INSERT INTO ducklake.collation_test VALUES ('Z'), ('a')
+
+# Verify DuckDB produced bytewise file bounds [Z, a].
+query TT
+SELECT min_value, max_value
+FROM postgres_query('__ducklake_metadata_ducklake', '
+SELECT min_value, max_value
+FROM public.ducklake_file_column_stats
+')
+----
+Z	a
+
+# Force the file-stat bounds to use an ordering that differs from DuckDB's bytewise ordering.
+statement ok
+CALL postgres_execute('__ducklake_metadata_ducklake', '
+ALTER TABLE public.ducklake_file_column_stats
+    ALTER COLUMN min_value TYPE VARCHAR COLLATE "en-x-icu";
+ALTER TABLE public.ducklake_file_column_stats
+    ALTER COLUMN max_value TYPE VARCHAR COLLATE "en-x-icu";
+')
+
+# Confirm this PostgreSQL collation considers DuckDB's [Z, a] bounds inverted.
+query I
+SELECT value_in_bounds
+FROM postgres_query('__ducklake_metadata_ducklake', '
+SELECT (''a'' COLLATE "en-x-icu")
+       BETWEEN (''Z'' COLLATE "en-x-icu") AND (''a'' COLLATE "en-x-icu") AS value_in_bounds
+')
+----
+false
+
+# Pruning must not discard a file that actually contains the requested value.
+query I
+SELECT count(*)
+FROM ducklake.collation_test
+WHERE payload = 'a'
+----
+1

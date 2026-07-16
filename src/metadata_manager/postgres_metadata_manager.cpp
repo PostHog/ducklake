@@ -1,6 +1,7 @@
 #include "metadata_manager/postgres_metadata_manager.hpp"
 #include "common/ducklake_util.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -16,6 +17,11 @@ static bool HasFourDigitDatePrefix(const string &value) {
 	return value.size() >= 10 && IsDigit(value[0]) && IsDigit(value[1]) && IsDigit(value[2]) && IsDigit(value[3]) &&
 	       value[4] == '-' && IsDigit(value[5]) && IsDigit(value[6]) && value[7] == '-' && IsDigit(value[8]) &&
 	       IsDigit(value[9]);
+}
+
+static string WithPostgresBinaryCollation(const string &expression) {
+	// DuckLake VARCHAR stats use DuckDB's bytewise ordering, independent of the metadata database locale.
+	return "(" + expression + " COLLATE \"C\")";
 }
 
 PostgresMetadataManager::PostgresMetadataManager(DuckLakeTransaction &transaction)
@@ -103,7 +109,7 @@ CREATE INDEX IF NOT EXISTS ducklake_table_column_stats_table_column_idx ON {META
 void PostgresMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) {
 	DuckLakeMetadataManager::InitializeDuckLake(has_explicit_schema, encryption);
 	auto index_query = GetPostgresIndexStatements();
-	auto result = Execute(index_query);
+	auto result = PassthroughExecute(index_query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to initialize DuckLake Postgres metadata indexes: ");
 	}
@@ -178,6 +184,9 @@ string PostgresMetadataManager::CastValueToTarget(const Value &val, const Logica
 		return val.ToString();
 	}
 	auto literal = DuckLakeUtil::SQLLiteralToString(val.ToString());
+	if (type.id() == LogicalTypeId::VARCHAR) {
+		return WithPostgresBinaryCollation(literal);
+	}
 	if (IsPostgresTemporalStatsType(type) && CanCastTemporalValueForValueComparison(val, type)) {
 		return literal + "::" + GetPostgresStatsType(type);
 	}
@@ -201,6 +210,9 @@ string PostgresMetadataManager::CastStatsToTarget(const string &stats, const Log
 	}
 	if (RequiresValueComparison(type) && CanCastStatsForValueComparison(type)) {
 		return stats + "::" + GetPostgresStatsType(type);
+	}
+	if (type.id() == LogicalTypeId::VARCHAR) {
+		return WithPostgresBinaryCollation(stats);
 	}
 	return stats;
 }
@@ -276,10 +288,13 @@ unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(DuckLakeSnapshot s
 	query = StringUtil::Replace(query, "{METADATA_PATH}", metadata_path);
 	query = StringUtil::Replace(query, "{DATA_PATH}", data_path);
 
-	auto passthrough_query = StringUtil::Format("CALL %s(%s, %s)", command, catalog_literal, SQLString(query));
-	// Run the fully-formed passthrough call directly on the metadata connection. Routing it back
+	auto passthrough_query =
+	    command == "postgres_query" ? StringUtil::Format("SELECT * FROM postgres_query(%s, %s)", catalog_literal,
+	                                                     SQLString(query))
+	                                : StringUtil::Format("CALL %s(%s, %s)", command, catalog_literal, SQLString(query));
+	// Run the fully-formed passthrough query directly on the metadata connection. Routing it back
 	// through transaction.Query() would re-enter PostgresMetadataManager::Query and wrap the query
-	// in another CALL postgres_query(...) indefinitely (v1.5.3 delegates transaction.Query -> manager).
+	// in another postgres_query(...) call indefinitely (v1.5.3 delegates transaction.Query -> manager).
 	auto result = transaction.ExecuteRaw(passthrough_query);
 	if (command == "postgres_execute" && !result->HasError()) {
 		while (result->Fetch()) {
@@ -293,23 +308,28 @@ unique_ptr<QueryResult> PostgresMetadataManager::ExecuteQuery(string &query, str
 	DuckLakeSnapshot snapshot;
 	return ExecuteQuery(snapshot, query, std::move(command));
 }
+
 unique_ptr<QueryResult> PostgresMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
-	return ExecuteQuery(snapshot, query, "postgres_execute");
+	return PassthroughExecute(snapshot, query);
 }
 
 unique_ptr<QueryResult> PostgresMetadataManager::Execute(string &query) {
+	return PassthroughExecute(query);
+}
+
+unique_ptr<QueryResult> PostgresMetadataManager::PassthroughExecute(DuckLakeSnapshot snapshot, string &query) {
+	return ExecuteQuery(snapshot, query, "postgres_execute");
+}
+
+unique_ptr<QueryResult> PostgresMetadataManager::PassthroughExecute(string &query) {
 	return ExecuteQuery(query, "postgres_execute");
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::SnapshotQuery(DuckLakeSnapshot snapshot, string &query) {
+unique_ptr<QueryResult> PostgresMetadataManager::PassthroughQuery(DuckLakeSnapshot snapshot, string &query) {
 	return ExecuteQuery(snapshot, query, "postgres_query");
 }
 
-unique_ptr<QueryResult> PostgresMetadataManager::CurrentQuery(DuckLakeSnapshot snapshot, string &query) {
-	return ExecuteQuery(snapshot, query, "postgres_query");
-}
-
-unique_ptr<QueryResult> PostgresMetadataManager::CurrentQuery(string &query) {
+unique_ptr<QueryResult> PostgresMetadataManager::PassthroughQuery(string &query) {
 	return ExecuteQuery(query, "postgres_query");
 }
 
@@ -325,59 +345,49 @@ string PostgresMetadataManager::GenerateFileColumnStatsCTEBody(const CTERequirem
 	                          select_list, req.column_field_index, table_id.index);
 }
 
-bool PostgresMetadataManager::InlinedDeletionTableExists(TableIndex, DuckLakeSnapshot snapshot,
-                                                         const string &table_name) {
-	auto query = StringUtil::Format(R"(
-SELECT EXISTS (
-	SELECT 1
-	FROM information_schema.tables
-	WHERE table_schema = {METADATA_SCHEMA_NAME_LITERAL}
-	  AND table_name = %s
-))",
-	                                DuckLakeUtil::SQLLiteralToString(table_name));
-	auto result = SnapshotQuery(snapshot, query);
-	if (result->HasError()) {
-		return false;
-	}
-	auto chunk = result->Fetch();
-	return chunk && chunk->size() > 0 && chunk->GetValue(0, 0).GetValue<bool>();
+string PostgresMetadataManager::GeneratePassthroughFileColumnStatsCTEBody(const CTERequirement &req,
+                                                                          TableIndex table_id) {
+	return DuckLakeMetadataManager::GenerateFileColumnStatsCTEBody(req, table_id);
 }
 
-// We need a specialized function here to do a reinterpret for postgres from BLOB to VARCHAR
+// Postgres inlined data is fetched in its storage types; convert it to the expected DuckDB scan types.
 shared_ptr<DuckLakeInlinedData>
 PostgresMetadataManager::TransformInlinedData(QueryResult &result, const vector<LogicalType> &expected_types) {
-	bool needs_reinterpret = false;
-	if (!expected_types.empty()) {
-		D_ASSERT(expected_types.size() == result.types.size());
-		for (idx_t i = 0; i < expected_types.size(); i++) {
-			if (result.types[i] != expected_types[i]) {
-				D_ASSERT(result.types[i].id() == LogicalTypeId::BLOB &&
-				         expected_types[i].id() == LogicalTypeId::VARCHAR);
-				needs_reinterpret = true;
-			}
-		}
-	}
-	if (!needs_reinterpret) {
-		return DuckLakeMetadataManager::TransformInlinedData(result, expected_types);
-	}
-
 	if (result.HasError()) {
 		result.GetErrorObject().Throw("Failed to read inlined data from DuckLake: ");
 	}
+
+	if (expected_types.empty() || result.types == expected_types) {
+		return DuckLakeMetadataManager::TransformInlinedData(result, expected_types);
+	}
+	if (expected_types.size() != result.types.size()) {
+		throw InternalException("Expected %d inlined data columns from Postgres, but received %d", expected_types.size(),
+		                        result.types.size());
+	}
+
 	auto context = transaction.context.lock();
 	auto data = make_uniq<ColumnDataCollection>(*context, expected_types);
-	DataChunk reinterpret_chunk;
-	reinterpret_chunk.Initialize(*context, expected_types);
+	ColumnDataAppendState append_state;
+	data->InitializeAppend(append_state);
+	DataChunk transform_chunk;
+	transform_chunk.Initialize(*context, expected_types);
 	while (true) {
 		auto chunk = result.Fetch();
 		if (!chunk) {
 			break;
 		}
+		transform_chunk.Reset();
 		for (idx_t i = 0; i < expected_types.size(); i++) {
-			reinterpret_chunk.data[i].Reinterpret(chunk->data[i]);
+			if (result.types[i] == expected_types[i]) {
+				transform_chunk.data[i].Reference(chunk->data[i]);
+			} else if (result.types[i].id() == LogicalTypeId::BLOB && expected_types[i].id() == LogicalTypeId::VARCHAR) {
+				transform_chunk.data[i].Reinterpret(chunk->data[i]);
+			} else {
+				VectorOperations::Cast(*context, chunk->data[i], transform_chunk.data[i], chunk->size());
+			}
 		}
-		reinterpret_chunk.SetCardinality(chunk->size());
-		data->Append(reinterpret_chunk);
+		transform_chunk.SetCardinality(chunk->size());
+		data->Append(append_state, transform_chunk);
 	}
 	auto inlined_data = make_shared_ptr<DuckLakeInlinedData>();
 	inlined_data->data = std::move(data);
