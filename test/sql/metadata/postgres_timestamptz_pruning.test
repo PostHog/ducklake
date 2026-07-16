@@ -83,6 +83,43 @@ WHERE "timestamp" >= TIMESTAMPTZ '2026-07-04 12:00:00.123455+00'
 ----
 1
 
+# Validate each metadata bound once even when an IN filter has multiple values.
+statement ok
+CALL enable_logging('DuckLakeMetadata')
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query I
+SELECT count()
+FROM ducklake.timestamptz_pruning
+WHERE "timestamp" IN (
+    TIMESTAMPTZ '2026-07-03 23:59:59.9+00',
+    TIMESTAMPTZ '2026-07-04 12:00:00.123456+00',
+    TIMESTAMPTZ '2026-07-06 00:00:00+00'
+)
+----
+2
+
+query III
+SELECT
+    CAST(max((length(query) - length(replace(query, 'min_value ~', ''))) / length('min_value ~')) AS BIGINT),
+    CAST(max((length(query) - length(replace(query, 'max_value ~', ''))) / length('max_value ~')) AS BIGINT),
+    CAST(max(
+        strpos(query, ' AS __ducklake_typed_min_value') < strpos(query, 'ducklake_file_column_stats')
+        AND strpos(query, ' AS __ducklake_typed_max_value') < strpos(query, 'ducklake_file_column_stats')
+        AND strpos(substr(query, strpos(query, 'ducklake_file_column_stats')), '__ducklake_typed_min_value') > 0
+        AND strpos(substr(query, strpos(query, 'ducklake_file_column_stats')), '__ducklake_typed_max_value') > 0
+    ) AS BIGINT)
+FROM duckdb_logs_parsed('DuckLakeMetadata')
+WHERE query LIKE '%ducklake_file_column_stats%'
+  AND query LIKE '%AS MATERIALIZED%'
+  AND query LIKE '%2026-07-03 23:59:59.9+00%'
+  AND query LIKE '%2026-07-04 12:00:00.123456+00%'
+  AND query LIKE '%2026-07-06 00:00:00+00%'
+----
+1	1	1
+
 # PostgreSQL metadata can contain equivalent offset-bearing representations.
 statement ok
 CALL postgres_execute('__ducklake_metadata_ducklake', '

@@ -9,6 +9,9 @@
 
 namespace duckdb {
 
+static constexpr const char *POSTGRES_TYPED_MIN_VALUE = "__ducklake_typed_min_value";
+static constexpr const char *POSTGRES_TYPED_MAX_VALUE = "__ducklake_typed_max_value";
+
 static bool IsDigit(char c) {
 	return c >= '0' && c <= '9';
 }
@@ -243,8 +246,10 @@ string PostgresMetadataManager::GenerateConstantFilter(const ConstantFilter &con
 		return string();
 	}
 	auto constant_str = CastValueToTarget(constant_filter.constant, type);
-	auto min_value = CastStatsToTarget("min_value", type);
-	auto max_value = CastStatsToTarget("max_value", type);
+	auto min_value =
+	    IsPostgresTemporalStatsType(type) ? POSTGRES_TYPED_MIN_VALUE : CastStatsToTarget("min_value", type);
+	auto max_value =
+	    IsPostgresTemporalStatsType(type) ? POSTGRES_TYPED_MAX_VALUE : CastStatsToTarget("max_value", type);
 	if (IsPostgresTemporalStatsType(type)) {
 		auto postgres_type = GetPostgresStatsType(type);
 		min_value = StringUtil::Format("COALESCE(%s, '-infinity'::%s)", min_value, postgres_type);
@@ -351,20 +356,41 @@ unique_ptr<QueryResult> PostgresMetadataManager::PassthroughQuery(string &query)
 }
 
 string PostgresMetadataManager::GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) {
+	auto select_list = GenerateFileColumnStatsSelectList(req);
+	auto query = StringUtil::Format("SELECT %s\n"
+	                                "FROM {METADATA_SCHEMA_ESCAPED}.ducklake_file_column_stats\n"
+	                                "WHERE column_id = %d AND table_id = %d",
+	                                select_list, req.column_field_index, table_id.index);
+	return StringUtil::Format("  SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL},\n"
+	                          "    %s)\n",
+	                          DuckLakeUtil::SQLLiteralToString(query));
+}
+
+string PostgresMetadataManager::GenerateFileColumnStatsSelectList(const CTERequirement &req) {
 	string select_list = "data_file_id";
 	for (const auto &stat : req.referenced_stats) {
 		select_list += ", " + stat;
 	}
-	return StringUtil::Format("  SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL},\n"
-	                          "    'SELECT %s\n"
-	                          "     FROM {METADATA_SCHEMA_ESCAPED}.ducklake_file_column_stats\n"
-	                          "     WHERE column_id = %d AND table_id = %d')\n",
-	                          select_list, req.column_field_index, table_id.index);
+	if (!IsPostgresTemporalStatsType(req.column_type)) {
+		return select_list;
+	}
+	if (req.referenced_stats.count("min_value")) {
+		select_list +=
+		    StringUtil::Format(", %s AS %s", CastStatsToTarget("min_value", req.column_type), POSTGRES_TYPED_MIN_VALUE);
+	}
+	if (req.referenced_stats.count("max_value")) {
+		select_list +=
+		    StringUtil::Format(", %s AS %s", CastStatsToTarget("max_value", req.column_type), POSTGRES_TYPED_MAX_VALUE);
+	}
+	return select_list;
 }
 
 string PostgresMetadataManager::GeneratePassthroughFileColumnStatsCTEBody(const CTERequirement &req,
                                                                           TableIndex table_id) {
-	return DuckLakeMetadataManager::GenerateFileColumnStatsCTEBody(req, table_id);
+	return StringUtil::Format("  SELECT %s\n"
+	                          "  FROM {METADATA_CATALOG}.ducklake_file_column_stats\n"
+	                          "  WHERE column_id = %d AND table_id = %d\n",
+	                          GenerateFileColumnStatsSelectList(req), req.column_field_index, table_id.index);
 }
 
 // Postgres inlined data is fetched in its storage types; convert it to the expected DuckDB scan types.

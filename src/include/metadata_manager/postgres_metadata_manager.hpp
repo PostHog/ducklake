@@ -52,6 +52,7 @@ protected:
 	                              unordered_set<string> &referenced_stats) override;
 
 private:
+	string GenerateFileColumnStatsSelectList(const CTERequirement &req);
 	unique_ptr<QueryResult> ExecuteQuery(DuckLakeSnapshot snapshot, string &query, string command);
 	unique_ptr<QueryResult> ExecuteQuery(string &query, string command);
 	string GetPostgresIndexStatements();

@@ -1395,7 +1395,7 @@ FilterSQLResult DuckLakeMetadataManager::ConvertFilterPushdownToSQL(const Filter
 			                                 cte_name, cte_name, null_checks.c_str(), filter_condition.c_str());
 		}
 
-		CTERequirement req(column_filter.column_field_index, referenced_stats);
+		CTERequirement req(column_filter.column_field_index, column_filter.column_type, referenced_stats);
 		req.reference_count = 2;
 		result.required_ctes.emplace(column_filter.column_field_index, std::move(req));
 	}
