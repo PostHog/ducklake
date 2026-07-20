@@ -33,6 +33,8 @@ public:
 	shared_ptr<DuckLakeInlinedData> TransformInlinedData(QueryResult &result,
 	                                                     const vector<LogicalType> &expected_types) override;
 	void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) override;
+	void DeleteSnapshots(const vector<DuckLakeSnapshotInfo> &snapshots) override;
+	vector<DuckLakeTableSizeInfo> GetTableSizes(DuckLakeSnapshot snapshot) override;
 
 	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
 	unique_ptr<QueryResult> Execute(string &query) override;

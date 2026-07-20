@@ -329,6 +329,11 @@ public:
 	GetSnapshotAndStatsAndChanges(SnapshotAndStats &current_snapshot,
 	                              const std::function<unique_ptr<QueryResult>(string)> &executor);
 	static string GetSnapshotAndStatsAndChangesQuery();
+	static SnapshotChangeInfo
+	GetSnapshotAndStatsAndChanges(SnapshotAndStats &current_snapshot,
+	                              const std::function<unique_ptr<QueryResult>(string)> &executor,
+	                              const set<TableIndex> &table_ids);
+	static string GetSnapshotAndStatsAndChangesQuery(const set<TableIndex> &table_ids);
 	static SnapshotChangeInfo ParseSnapshotAndStatsAndChanges(QueryResult &result, SnapshotAndStats &current_snapshot);
 	virtual unique_ptr<DuckLakeSnapshot> GetSnapshot();
 	virtual unique_ptr<DuckLakeSnapshot> GetSnapshot(BoundAtClause &at_clause, SnapshotBound bound);

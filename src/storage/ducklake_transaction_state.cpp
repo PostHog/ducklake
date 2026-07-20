@@ -787,10 +787,10 @@ bool DuckLakeTransactionState::TryMergeInlinedStats(const vector<DuckLakeColumnS
 }
 
 void DuckLakeTransactionState::RecomputeGlobalStatsAfterRewrite(string &batch_query, TableIndex table_id,
-                                                                 DuckLakeSnapshot snapshot,
-                                                                 const CompactionInformation &rewrite_changes,
-                                                                 const set<DataFileIndex> &removed_source_ids,
-                                                                 const DuckLakeCommitContext &context) {
+                                                                DuckLakeSnapshot snapshot,
+                                                                const CompactionInformation &rewrite_changes,
+                                                                const set<DataFileIndex> &removed_source_ids,
+                                                                const DuckLakeCommitContext &context) {
 	auto columns = context.get_table_column_schema(table_id);
 	if (columns.empty()) {
 		return; // no schema visible at the commit snapshot
@@ -910,7 +910,8 @@ void DuckLakeTransactionState::RecomputeGlobalStatsAfterRewrite(string &batch_qu
 	//    no live data becomes "unknown" -> it is scanned at query time, which is correct). UpdateGlobalTableStatsSql
 	//    only UPDATEs existing rows, so entries with no committed stats row (e.g. struct containers) are harmless
 	//    no-ops. Use the snapshot schema instead of current_stats->column_stats: the server-side stats cache is only
-	//    populated for tables with staged inserts, so a pure-rewrite commit can see an empty current_stats.column_stats.
+	//    populated for tables with staged inserts, so a pure-rewrite commit can see an empty
+	//    current_stats.column_stats.
 	for (auto &col : columns) {
 		if (new_stats.column_stats.find(col.field_index) == new_stats.column_stats.end()) {
 			new_stats.column_stats.insert(make_pair(col.field_index, DuckLakeColumnStats(col.column_type)));
@@ -1677,7 +1678,8 @@ DuckLakeTransactionState::CheckForConflicts(DuckLakeSnapshot transaction_snapsho
                                             const std::function<unique_ptr<QueryResult>(string)> &executor) {
 	SnapshotAndStats snapshot_and_stats;
 	// get all changes made to the system after the current snapshot was started
-	auto changes_made = DuckLakeMetadataManager::GetSnapshotAndStatsAndChanges(snapshot_and_stats, executor);
+	auto changes_made = DuckLakeMetadataManager::GetSnapshotAndStatsAndChanges(snapshot_and_stats, executor,
+	                                                                           changes.GetStatsTableIds());
 	// parse changes made by other transactions
 	auto other_changes = SnapshotChangeInformation::ParseChangesMade(changes_made.changes_made);
 
