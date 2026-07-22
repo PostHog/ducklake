@@ -103,7 +103,7 @@ SELECT count(*)
 FROM __ducklake_metadata_lake.postgres_passthrough_metadata.ducklake_files_scheduled_for_deletion
 WHERE path IS NULL OR path_is_relative
 ----
-0
+2
 
 foreach tbl ducklake_table ducklake_column ducklake_table_stats ducklake_table_column_stats ducklake_data_file ducklake_delete_file
 
@@ -116,3 +116,72 @@ endloop
 
 statement ok
 DETACH lake
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS relocated (DATA_PATH '{DATA_PATH}/postgres_passthrough_relocated', OVERRIDE_DATA_PATH TRUE, METADATA_SCHEMA 'postgres_passthrough_metadata', DATA_INLINING_ROW_LIMIT 0)
+
+query III
+SELECT count(*),
+       count(*) FILTER (WHERE starts_with(path, '{DATA_PATH}/postgres_passthrough_relocated')),
+       count(*) FILTER (WHERE NOT starts_with(path, '{DATA_PATH}/postgres_passthrough/'))
+FROM ducklake_cleanup_old_files('relocated', cleanup_all => true, dry_run => true)
+----
+2	2	2
+
+statement ok
+DETACH relocated
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS inline_lake (DATA_PATH '{DATA_PATH}/postgres_inline_cleanup', METADATA_SCHEMA 'postgres_inline_cleanup_metadata', DATA_INLINING_ROW_LIMIT 10)
+
+statement ok
+CREATE TABLE inline_lake.main.inline_events AS SELECT range AS i FROM range(100)
+
+statement ok
+DELETE FROM inline_lake.main.inline_events WHERE i IN (3, 5, 7)
+
+statement ok
+INSERT INTO inline_lake.main.inline_events VALUES (200), (201)
+
+query I
+SELECT count(*) FROM postgres_query('__ducklake_metadata_inline_lake', $$
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'postgres_inline_cleanup_metadata'
+      AND table_name LIKE 'ducklake_inlined_delete_%'
+$$)
+----
+1
+
+query I
+SELECT count(*) FROM postgres_query('__ducklake_metadata_inline_lake', $$
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'postgres_inline_cleanup_metadata'
+      AND table_name LIKE 'ducklake_inlined_data_%'
+      AND table_name <> 'ducklake_inlined_data_tables'
+$$)
+----
+1
+
+statement ok
+DROP TABLE inline_lake.main.inline_events
+
+statement ok
+CALL ducklake_expire_snapshots('inline_lake', older_than => NOW())
+
+query I
+SELECT count(*) FROM __ducklake_metadata_inline_lake.postgres_inline_cleanup_metadata.ducklake_inlined_data_tables
+----
+0
+
+query I
+SELECT count(*) FROM postgres_query('__ducklake_metadata_inline_lake', $$
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'postgres_inline_cleanup_metadata'
+      AND (table_name LIKE 'ducklake_inlined_delete_%'
+           OR (table_name LIKE 'ducklake_inlined_data_%' AND table_name <> 'ducklake_inlined_data_tables'))
+$$)
+----
+0
+
+statement ok
+DETACH inline_lake

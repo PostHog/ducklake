@@ -327,10 +327,6 @@ public:
 	static string UpdateGlobalTableStatsSql(const DuckLakeGlobalStatsInfo &stats);
 	static SnapshotChangeInfo
 	GetSnapshotAndStatsAndChanges(SnapshotAndStats &current_snapshot,
-	                              const std::function<unique_ptr<QueryResult>(string)> &executor);
-	static string GetSnapshotAndStatsAndChangesQuery();
-	static SnapshotChangeInfo
-	GetSnapshotAndStatsAndChanges(SnapshotAndStats &current_snapshot,
 	                              const std::function<unique_ptr<QueryResult>(string)> &executor,
 	                              const set<TableIndex> &table_ids);
 	static string GetSnapshotAndStatsAndChangesQuery(const set<TableIndex> &table_ids);
@@ -378,6 +374,11 @@ public:
 	virtual void MigrateV02(bool allow_failures = false);
 	virtual void MigrateV03(bool allow_failures = false);
 	virtual void MigrateV04();
+
+protected:
+	virtual void DeleteSnapshotRows(const vector<DuckLakeSnapshotInfo> &snapshots);
+
+public:
 	virtual void ExecuteMigration(string migrate_query, bool allow_failures, const string &from_version,
 	                              const string &to_version);
 

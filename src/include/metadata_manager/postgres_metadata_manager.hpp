@@ -33,7 +33,6 @@ public:
 	shared_ptr<DuckLakeInlinedData> TransformInlinedData(QueryResult &result,
 	                                                     const vector<LogicalType> &expected_types) override;
 	void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) override;
-	void DeleteSnapshots(const vector<DuckLakeSnapshotInfo> &snapshots) override;
 	vector<DuckLakeTableSizeInfo> GetTableSizes(DuckLakeSnapshot snapshot) override;
 
 	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
@@ -46,6 +45,7 @@ public:
 	unique_ptr<QueryResult> PassthroughQuery(string &query) override;
 
 protected:
+	void DeleteSnapshotRows(const vector<DuckLakeSnapshotInfo> &snapshots) override;
 	string GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
 	string GeneratePassthroughFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) override;
 	string CastValueToTarget(const Value &val, const LogicalType &type) override;
