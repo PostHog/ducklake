@@ -6,7 +6,7 @@ require ducklake
 
 require parquet
 
-require-env DUCKLAKE_POSTGRES 1
+require-env DUCKLAKE_POSTGRES
 
 test-env DUCKLAKE_CONNECTION ignored
 
