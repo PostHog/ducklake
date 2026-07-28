@@ -1,0 +1,185 @@
+# name: test/sql/stats/variant_path_file_pruning.test
+# group: [stats]
+
+# File-level pruning driven by ducklake_file_variant_stats. Filters on a field inside a VARIANT are matched against
+# the per-path min/max recorded for each data file, so files that cannot contain a match are never opened.
+#
+# The bounds in that table are written using the ordering of whatever type the path was *shredded* as, and that type
+# can differ between files. Pruning is therefore only allowed against shredded types that share an ordering domain
+# with the filter constant - the tests below pin that down, because getting it wrong silently drops rows.
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_vprune', METADATA_CATALOG 'md', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+USE ducklake
+
+statement ok
+CREATE TABLE ev(id BIGINT, props VARIANT)
+
+# two files with disjoint ranges for props.a
+statement ok
+INSERT INTO ev SELECT i, {'a': i, 'b': 'x'||i}::VARIANT FROM range(10000) i(i)
+
+statement ok
+INSERT INTO ev SELECT i, {'a': i, 'b': 'x'||i}::VARIANT FROM range(10000, 20000) i(i)
+
+query IIII
+SELECT variant_path, shredded_type, min_value, max_value FROM md.ducklake_file_variant_stats WHERE data_file_id = 0 AND variant_path = '"a"'
+----
+"a"	int64	0	9999
+
+# results must be correct regardless of pruning
+query I
+SELECT count(*) FROM ev WHERE props.a::BIGINT = 15000
+----
+1
+
+query I
+SELECT count(*) FROM ev WHERE props.a::BIGINT = 5000
+----
+1
+
+query I
+SELECT count(*) FROM ev WHERE props.a::BIGINT BETWEEN 9990 AND 10010
+----
+21
+
+query I
+SELECT count(*) FROM ev WHERE props.a::BIGINT > 100000
+----
+0
+
+query I
+SELECT count(*) FROM ev WHERE props.a::BIGINT >= 0
+----
+20000
+
+query I
+SELECT props.b FROM ev WHERE props.a::BIGINT = 15000
+----
+x15000
+
+# ----------------------------------------------------------------------------
+# the same path shredded as different types across files
+# ----------------------------------------------------------------------------
+statement ok
+CREATE TABLE mixed(v VARIANT)
+
+statement ok
+INSERT INTO mixed SELECT {'a': 1000+i}::VARIANT FROM range(100) i(i)
+
+# varchar-shredded numeric strings: string ordering makes min='10' and max='9', which is numerically misleading.
+# Pruning this file with a numeric comparison would drop the row holding '5'.
+statement ok
+INSERT INTO mixed VALUES ({'a': '10'}::VARIANT), ({'a': '5'}::VARIANT), ({'a': '9'}::VARIANT)
+
+# data_file_id is global across tables, so identify the row by its (unique) shredded type instead
+query II
+SELECT shredded_type, min_value FROM md.ducklake_file_variant_stats WHERE variant_path = '"a"' AND shredded_type = 'varchar'
+----
+varchar	10
+
+query I
+SELECT count(*) FROM mixed WHERE v.a::BIGINT = 5
+----
+1
+
+query I
+SELECT count(*) FROM mixed WHERE v.a::BIGINT = 1050
+----
+1
+
+query I
+SELECT count(*) FROM mixed WHERE v.a::BIGINT = 7
+----
+0
+
+# filtering the varchar file on its own domain still works
+query I
+SELECT count(*) FROM mixed WHERE v.a::VARCHAR = '5'
+----
+1
+
+query I
+SELECT count(*) FROM mixed
+----
+103
+
+# ----------------------------------------------------------------------------
+# paths that are absent, and files with no stats for the path
+# ----------------------------------------------------------------------------
+statement ok
+CREATE TABLE sparse(v VARIANT)
+
+statement ok
+INSERT INTO sparse SELECT {'a': i}::VARIANT FROM range(50) i(i)
+
+statement ok
+INSERT INTO sparse SELECT {'b': i}::VARIANT FROM range(50) i(i)
+
+query I
+SELECT count(*) FROM sparse WHERE v.a::BIGINT = 10
+----
+1
+
+query I
+SELECT count(*) FROM sparse WHERE v.b::BIGINT = 10
+----
+1
+
+query I
+SELECT count(*) FROM sparse
+----
+100
+
+# ----------------------------------------------------------------------------
+# nested paths
+# ----------------------------------------------------------------------------
+statement ok
+CREATE TABLE nested(v VARIANT)
+
+statement ok
+INSERT INTO nested SELECT {'outer': {'inner': i}}::VARIANT FROM range(500) i(i)
+
+statement ok
+INSERT INTO nested SELECT {'outer': {'inner': i}}::VARIANT FROM range(500, 1000) i(i)
+
+query I
+SELECT count(*) FROM nested WHERE v.outer.inner::BIGINT = 750
+----
+1
+
+query I
+SELECT count(*) FROM nested WHERE v.outer.inner::BIGINT = 5000
+----
+0
+
+query I
+SELECT count(*) FROM nested
+----
+1000
+
+# ----------------------------------------------------------------------------
+# deletes and updates must invalidate nothing incorrectly
+# ----------------------------------------------------------------------------
+statement ok
+DELETE FROM ev WHERE props.a::BIGINT = 15000
+
+query I
+SELECT count(*) FROM ev WHERE props.a::BIGINT = 15000
+----
+0
+
+query I
+SELECT count(*) FROM ev
+----
+19999

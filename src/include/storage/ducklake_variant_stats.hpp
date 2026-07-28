@@ -56,4 +56,8 @@ private:
 	set<vector<string>> fully_shredded_fields;
 };
 
+//! Encodes a single VARIANT field name the way it is stored in ducklake_file_variant_stats.variant_path.
+//! Filter pushdown must use this so that the path it looks up matches the path the stats writer emitted.
+string QuoteVariantFieldName(const string &field_name);
+
 } // namespace duckdb

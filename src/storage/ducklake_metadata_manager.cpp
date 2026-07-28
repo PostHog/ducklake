@@ -1489,12 +1489,99 @@ string DuckLakeMetadataManager::GenerateFilterPushdown(const ExpressionFilter &f
 	return GenerateFilterFromExpression(*filter.expr, nullptr, referenced_stats);
 }
 
+//! For a VARIANT sub-path we must know exactly which type the generated comparison casts min_value/max_value to, so
+//! that the "bounds are unusable" guard can be written against the same cast. Only a single comparison against a
+//! constant is recognised; for anything else (conjunctions, IS NULL, ...) we cannot pin down one type, and pruning a
+//! VARIANT path on a mismatched cast silently drops rows. Returning false means "do not prune on this filter".
+static bool TryGetVariantFilterTargetType(const Expression &expr, LogicalType &result) {
+	if (!BoundComparisonExpression::IsComparison(expr)) {
+		return false;
+	}
+	auto &comparison = expr.Cast<BoundFunctionExpression>();
+	auto &left = BoundComparisonExpression::Left(comparison);
+	auto &right = BoundComparisonExpression::Right(comparison);
+	if (IsSimpleFilterSubject(left) && right.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		result = right.Cast<BoundConstantExpression>().GetValue().type();
+		return true;
+	}
+	if (IsSimpleFilterSubject(right) && left.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		result = left.Cast<BoundConstantExpression>().GetValue().type();
+		return true;
+	}
+	return false;
+}
+
+//! min_value/max_value in ducklake_file_variant_stats are written using the ordering of the type the path was
+//! *shredded* as, which can differ per file. A path shredded as varchar has string-ordered bounds ('10' < '9'), so
+//! casting those to a numeric type and comparing numerically would prune files that really do contain matches.
+//! Pruning is therefore only allowed against shredded types that share an ordering domain with the constant.
+//! Returns false when no safe set exists, which disables pruning for that filter.
+static bool TryGetComparableShreddedTypes(const LogicalType &target, vector<string> &result) {
+	switch (target.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT: {
+		// all integer widths order identically as numbers, and TRY_CAST turns any out-of-range bound into NULL,
+		// which the null guard then treats as "unknown"
+		static constexpr LogicalTypeId INTEGRAL_IDS[] = {
+		    LogicalTypeId::TINYINT,  LogicalTypeId::SMALLINT,  LogicalTypeId::INTEGER,  LogicalTypeId::BIGINT,
+		    LogicalTypeId::UTINYINT, LogicalTypeId::USMALLINT, LogicalTypeId::UINTEGER, LogicalTypeId::UBIGINT};
+		for (auto id : INTEGRAL_IDS) {
+			result.push_back(DuckLakeTypes::ToString(LogicalType(id)));
+		}
+		return true;
+	}
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+		result.push_back(DuckLakeTypes::ToString(target));
+		return true;
+	default:
+		// decimals (width/scale sensitive), blobs, nested and anything unknown - not worth the risk
+		return false;
+	}
+}
+
 FilterSQLResult DuckLakeMetadataManager::ConvertFilterPushdownToSQL(const FilterPushdownInfo &filter_info) {
 	FilterSQLResult result;
 	string conditions;
 
 	for (const auto &entry : filter_info.column_filters) {
 		const auto &column_filter = entry.second;
+
+		LogicalType variant_target_type;
+		string variant_type_filter;
+		if (!column_filter.variant_path.empty()) {
+			if (!column_filter.table_filter || !column_filter.table_filter->expr ||
+			    !TryGetVariantFilterTargetType(*column_filter.table_filter->expr, variant_target_type)) {
+				continue;
+			}
+			vector<string> comparable_types;
+			if (!TryGetComparableShreddedTypes(variant_target_type, comparable_types)) {
+				continue;
+			}
+			string in_list;
+			for (auto &type_name : comparable_types) {
+				if (!in_list.empty()) {
+					in_list += ", ";
+				}
+				in_list += SQLString(type_name);
+			}
+			variant_type_filter = StringUtil::Format(" AND shredded_type IN (%s)", in_list);
+		}
 
 		unordered_set<string> referenced_stats;
 		auto filter_condition = GenerateFilterPushdown(*column_filter.table_filter, referenced_stats);
@@ -1507,7 +1594,16 @@ FilterSQLResult DuckLakeMetadataManager::ConvertFilterPushdownToSQL(const Filter
 
 		string null_checks;
 		for (const auto &stat : referenced_stats) {
-			null_checks += stat + " IS NULL OR ";
+			if (!column_filter.variant_path.empty() && (stat == "min_value" || stat == "max_value")) {
+				// A VARIANT sub-path may be shredded as a different type in different files, so min_value/max_value
+				// are not guaranteed to be castable to the type this filter compares against. An uncastable bound
+				// means "unknown", which must keep the file - without this the TRY_CAST below would yield NULL, the
+				// comparison would not be TRUE, and the file would be pruned away incorrectly. Note this must use
+				// the same type the comparison casts to (the constant's type), not the column's declared type.
+				null_checks += CastStatsToTarget(stat, variant_target_type) + " IS NULL OR ";
+			} else {
+				null_checks += stat + " IS NULL OR ";
+			}
 		}
 
 		const bool needs_value_count_guard =
@@ -1534,6 +1630,8 @@ FilterSQLResult DuckLakeMetadataManager::ConvertFilterPushdownToSQL(const Filter
 
 		CTERequirement req(column_filter.column_field_index, referenced_stats);
 		req.reference_count = 2;
+		req.variant_path = column_filter.variant_path;
+		req.variant_type_filter = std::move(variant_type_filter);
 		result.required_ctes.emplace(column_filter.column_field_index, std::move(req));
 	}
 
@@ -1545,6 +1643,16 @@ string DuckLakeMetadataManager::GenerateFileColumnStatsCTEBody(const CTERequirem
 	string select_list = "data_file_id";
 	for (const auto &stat : req.referenced_stats) {
 		select_list += ", " + stat;
+	}
+	if (!req.variant_path.empty()) {
+		// Statistics for a field inside a VARIANT live in a separate table, keyed additionally by the path. Files
+		// that never shredded this path simply have no row here, which leaves them outside the CTE and therefore
+		// unpruned - the same fail-open behaviour as a column with no stats.
+		return StringUtil::Format("  SELECT %s\n"
+		                          "  FROM {METADATA_CATALOG}.ducklake_file_variant_stats\n"
+		                          "  WHERE column_id = %d AND table_id = %d AND variant_path = %s%s\n",
+		                          select_list, req.column_field_index, table_id.index, SQLString(req.variant_path),
+		                          req.variant_type_filter);
 	}
 	return StringUtil::Format("  SELECT %s\n"
 	                          "  FROM {METADATA_CATALOG}.ducklake_file_column_stats\n"
@@ -1739,6 +1847,11 @@ string DuckLakeMetadataManager::BuildBucketPartitionPruningClause(DuckLakeTableE
 		}
 		const auto &col_filter = it->second;
 		if (!col_filter.table_filter || !col_filter.table_filter->expr) {
+			continue;
+		}
+		if (!col_filter.variant_path.empty()) {
+			// this filter constrains a field inside the VARIANT, not the partitioned column itself - bucketing it
+			// would compute hashes over the wrong values
 			continue;
 		}
 
