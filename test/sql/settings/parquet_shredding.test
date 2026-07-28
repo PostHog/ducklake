@@ -1,0 +1,120 @@
+# name: test/sql/settings/parquet_shredding.test
+# group: [settings]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_shredding', METADATA_CATALOG 'md', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+USE ducklake
+
+# a malformed schema is rejected eagerly, at set_option time
+statement error
+CALL ducklake.set_option('parquet_shredding', 'v')
+----
+expected the form
+
+statement error
+CALL ducklake.set_option('parquet_shredding', '')
+----
+empty value
+
+# pin an explicit shredding schema that only covers 'a' - auto-analysis would shred both 'a' and 'b'
+statement ok
+CALL ducklake.set_option('parquet_shredding', 'v: ''STRUCT(a BIGINT)''')
+
+statement ok
+CREATE TABLE t(v VARIANT)
+
+statement ok
+INSERT INTO t SELECT {'a': i, 'b': 'x'||i}::VARIANT FROM range(100) i(i)
+
+# only 'a' is shredded - 'b' stays in the untyped value column and therefore has no stats
+query II
+SELECT variant_path, shredded_type FROM md.ducklake_file_variant_stats ORDER BY variant_path
+----
+"a"	int64
+
+# data is fully readable regardless of what was shredded
+query I
+SELECT count(*) FROM t
+----
+100
+
+query I
+SELECT v.b FROM t WHERE v.a = 42
+----
+x42
+
+query I
+SELECT count(*) FROM t WHERE v.b = 'x7'
+----
+1
+
+# values that do not match the pinned schema still round-trip - they fall back to the untyped encoding
+statement ok
+INSERT INTO t VALUES ({'a': 'not-an-integer', 'b': 'q'}::VARIANT), (42::VARIANT), ([1,2,3]::VARIANT)
+
+query I
+SELECT count(*) FROM t
+----
+103
+
+query I
+SELECT v.b FROM t WHERE v.a = 'not-an-integer'
+----
+q
+
+query I
+SELECT count(*) FROM t WHERE v.a = 42
+----
+1
+
+# the multi-column form parses, including type strings that contain commas
+statement ok
+CREATE TABLE multi(v VARIANT, w VARIANT)
+
+statement ok
+CALL ducklake.set_option('parquet_shredding', 'v: ''STRUCT(a BIGINT, b VARCHAR)'', w: ''INTEGER[]''')
+
+statement ok
+INSERT INTO multi VALUES ({'a': 1, 'b': 'one'}::VARIANT, [1,2,3]::VARIANT)
+
+query II
+SELECT v.a, w[1] FROM multi
+----
+1	1
+
+# braces around the spec are optional and accepted
+statement ok
+CALL ducklake.set_option('parquet_shredding', '{v: ''STRUCT(a BIGINT)''}')
+
+statement ok
+INSERT INTO t VALUES ({'a': 555, 'b': 'five'}::VARIANT)
+
+query I
+SELECT v.b FROM t WHERE v.a = 555
+----
+five
+
+# naming a column that is not a VARIANT in this table degrades to "no explicit shredding" rather than failing
+statement ok
+CREATE TABLE novariant(i INTEGER)
+
+statement ok
+CALL ducklake.set_option('parquet_shredding', 'nosuchcolumn: ''BIGINT''')
+
+statement ok
+INSERT INTO novariant VALUES (1), (2)
+
+query I
+SELECT sum(i) FROM novariant
+----
+3

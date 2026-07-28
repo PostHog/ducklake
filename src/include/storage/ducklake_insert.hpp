@@ -69,6 +69,11 @@ public:
 	string encryption_key;
 
 public:
+	//! Parses a 'parquet_shredding' option value into the STRUCT Value expected by the Parquet SHREDDING option.
+	//! Throws InvalidInputException on malformed input. Exposed so that set_option can validate eagerly.
+	static Value ParseShreddingOption(const string &spec);
+
+public:
 	// // Source interface
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;

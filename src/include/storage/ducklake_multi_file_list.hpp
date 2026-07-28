@@ -48,6 +48,9 @@ public:
 	bool HasTransactionLocalData() const {
 		return !transaction_local_files.empty() || transaction_local_data;
 	}
+	DuckLakeScanType GetScanType() const {
+		return read_info.scan_type;
+	}
 	vector<DuckLakeFileListExtendedEntry> GetFilesExtended() const;
 	const vector<DuckLakeFileListEntry> &GetFiles() const;
 	const DuckLakeFileListEntry &GetFileEntry(idx_t file_idx) const;
