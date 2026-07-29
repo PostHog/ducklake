@@ -18,7 +18,7 @@ jobs:
     outputs:
       duckdb_version: ${{ steps.version.outputs.duckdb_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           sparse-checkout: .github
       - id: version
@@ -27,10 +27,14 @@ jobs:
   duckdb-next-build:
     name: Build extension binaries
     needs: get-duckdb-version
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    # PostHog fork of extension-ci-tools: internal actions are pinned to SHAs. The org ruleset rejects unpinned
+    # action refs transitively - even inside a SHA-referenced reusable workflow - so duckdb/extension-ci-tools
+    # cannot run here. Mirrors what posthog/v1.5.3 already does.
+    uses: PostHog/extension-ci-tools/.github/workflows/_extension_distribution.yml@d3e0ee09e2e392941f2e390e6cbab108a095daa4
     with:
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: d3e0ee09e2e392941f2e390e6cbab108a095daa4
+      override_ci_tools_repository: PostHog/extension-ci-tools
       extension_name: ducklake
 
   # Regression test, see https://github.com/duckdb/ducklake/pull/1256 for more details.
@@ -50,7 +54,7 @@ jobs:
           sudo apt-get update -y -qq
           sudo apt-get install -y -qq build-essential gcc-12 g++-12 cmake ninja-build ccache python3 mold
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           submodules: 'true'
@@ -61,13 +65,13 @@ jobs:
           git checkout $(cat ../.github/duckdb-version)
 
       - name: Setup Ccache
-        uses: hendrikmuhs/ccache-action@main
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # main
         with:
           key: gcc12-compatibility-build
           save: ${{ github.ref == 'refs/heads/main' || github.repository != 'duckdb/ducklake' }}
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11.1
+        uses: lukka/run-vcpkg@abed23940f9d7bc267b0e1a21ee7b699a3794baa # v11.1
         with:
           vcpkgGitCommitId: a42af01b72c28a8e1d7b48107b33e4f286a55ef6
 
@@ -75,18 +79,9 @@ jobs:
         run: |
           make release
 
-  duckdb-next-deploy:
-    name: Deploy extension binaries
-    needs: [get-duckdb-version, duckdb-next-build, gcc12-compatibility-build]
-    if: github.ref != 'refs/heads/main'
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@main
-    secrets: inherit
-    with:
-      extension_name: ducklake
-      duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
-      ci_tools_version: main
-      deploy_latest: ${{ startsWith(github.ref, 'refs/heads/v') }}
-      deploy_versioned: ${{ startsWith(github.ref, 'refs/heads/v') }}
+  # duckdb-next-deploy removed: it published to DuckDB's own extension repository using inherited secrets we do
+  # not have, so it cannot succeed on a fork. posthog/v1.5.3 likewise drops it in favour of publishing GitHub
+  # Release assets. Nothing else in this workflow depends on it.
 
   relassert:
     name: Build relassert
@@ -102,7 +97,7 @@ jobs:
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:abort_on_error=0"
       UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           submodules: 'true'
@@ -119,12 +114,12 @@ jobs:
             sudo ln -sf "${asan_static_target}" "${asan_static_dir}/libclang_rt.asan_static.a"
           fi
       - name: Setup Ccache
-        uses: hendrikmuhs/ccache-action@main
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # main
         with:
           max-size: 5GB
           evict-old-files: job
       - name: Build (relassert → ASan + UBSan + LSan)
-        uses: duckdb/duckdb-ci/build-duckdb@main
+        uses: duckdb/duckdb-ci/build-duckdb@338320f8675596058133849ee5c925a759663075 # main
         with:
           build-type: relassert
           build: python3 duckdb/scripts/ci/retry.py -- make relassert
