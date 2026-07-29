@@ -69,8 +69,7 @@ private:
 	void GetFilesForTable() const;
 	void GetTableInsertions() const;
 	void GetTableDeletions() const;
-	void AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id,
-	                             unique_ptr<TableFilter> filter,
+	void AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id, unique_ptr<TableFilter> filter,
 	                             optional_ptr<const ColumnIndex> column_index = nullptr) const;
 	//! Get the row_id_start for transaction-local inlined data.
 	idx_t GetTransactionLocalRowIdStart(idx_t transaction_row_start) const;
