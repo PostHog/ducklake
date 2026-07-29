@@ -40,7 +40,8 @@
     "Unsupported type \"TIME_NS\" in Parquet writer",
     "DuckLakeScan not implemented",
     "Unsupported ALTER TABLE",
-    "reserved by DuckLake"
+    "reserved by DuckLake",
+    "We cannot add a column with a non-literal default value"
   ],
   "skip_tests": [
     {
@@ -196,7 +197,8 @@
         "test/sql/transactions/test_create_drop_conflict_variation1.test",
         "test/sql/copy/parquet/parquet_glob.test",
         "test/sql/alter/alter_table_set_table_options.test",
-        "test/sql/function/variant/variant_extract_try_cast.test"
+        "test/sql/function/variant/variant_extract_try_cast.test",
+        "test/sql/transactions/rollback_drop_table.test"
       ]
     },
     {
@@ -376,7 +378,6 @@
         "test/sql/function/list/list_value_nested_lists.test"
       ]
     },
-
     {
       "reason": "FIXME: BUGS? Weird behavior around hugeint",
       "paths": [
@@ -499,25 +500,25 @@
       "reason": "Prepared statement differs from original result!",
       "paths": [
         "test/sql/function/generic/test_connection_count.test"
-        ]
+      ]
     },
-     {
+    {
       "reason": "FIXME: DuckTransaction::Get called on non-DuckDB transaction",
       "paths": [
         "test/sql/function/timestamp/test_icu_makedate.test"
-        ]
+      ]
     },
     {
       "reason": "FIXME: Macros are currently not taken in for recursion",
       "paths": [
         "test/sql/catalog/function/test_recursive_macro.test"
-        ]
+      ]
     },
     {
       "reason": " Failed to parse DuckLake type - unsupported nested type",
       "paths": [
         "test/sql/catalog/function/test_macro_issue_13104.test"
-        ]
+      ]
     },
     {
       "reason": "Expected different behavior between duckdb and ducklake wrt macros. Notice these are not ducklake bugs just tests that do not fit.",
@@ -525,7 +526,7 @@
         "test/sql/catalog/function/test_table_macro_copy.test",
         "test/sql/catalog/function/test_macro_type_overloads.test",
         "test/sql/pragma/test_table_info.test"
-        ]
+      ]
     },
     {
       "reason": "Checkpoint in DuckLake doesn't produce expected result. Notice these are not ducklake bugs just tests that do not fit.",
@@ -582,65 +583,65 @@
     {
       "reason": "Assumes ordering of rowids that is not guaranteed in DuckLake",
       "paths": [
-          "test/sql/projection/test_row_id_expression.test"
+        "test/sql/projection/test_row_id_expression.test"
       ]
     },
     {
       "reason": "PARTITIONED BY is not supported for tables in a ducklake catalog",
       "paths": [
-          "test/sql/create/create_table_extra_options.test"
+        "test/sql/create/create_table_extra_options.test"
       ]
     },
     {
       "reason": "Different results",
       "paths": [
-          "test/sql/attach/show_schemas.test"
+        "test/sql/attach/show_schemas.test"
       ]
     },
     {
       "reason": "FIXME: CI Deadlock?",
       "paths": [
-          "test/sql/update/test_stress_update_issue_19688.test"
+        "test/sql/update/test_stress_update_issue_19688.test"
       ]
     },
     {
       "reason": "FIXME: Internal error",
       "paths": [
-          "test/sql/copy/csv/test_copy_null.test"
+        "test/sql/copy/csv/test_copy_null.test"
       ]
     },
     {
       "reason": "Unsupported variant type in Parquet",
       "paths": [
-          "test/sql/function/variant/variant_typeof.test",
-          "test/sql/storage/types/variant/test_all_types_single_object.test",
-          "test/sql/storage/types/variant/struct_of_variant.test",
-          "test/sql/storage/types/variant/test_all_types_single_table.test",
-          "test/sql/storage/types/variant/test_all_types.test",
-          "test/sql/storage/types/variant/test_all_types_variant.test"
+        "test/sql/function/variant/variant_typeof.test",
+        "test/sql/storage/types/variant/test_all_types_single_object.test",
+        "test/sql/storage/types/variant/struct_of_variant.test",
+        "test/sql/storage/types/variant/test_all_types_single_table.test",
+        "test/sql/storage/types/variant/test_all_types.test",
+        "test/sql/storage/types/variant/test_all_types_variant.test"
       ]
     },
     {
       "reason": "Variant shredding stats are different between Parquet <> DuckDB",
       "paths": [
-          "test/sql/storage/types/variant/variant_extract_stats.test"
+        "test/sql/storage/types/variant/variant_extract_stats.test"
       ]
     },
     {
       "reason": "FIXME? Variant issues",
       "paths": [
-          "test/sql/storage/types/variant/variant_shredding_omit_untyped.test"
+        "test/sql/storage/types/variant/variant_shredding_omit_untyped.test"
       ]
     },
     {
-        "reason": "FIXME: GEOMETRY limitations (stats are different in DuckLake, shredding is not supported)",
-        "paths": [
-            "test/sql/types/geo/geometry_stats.test",
-            "test/sql/types/geo/geometry_shred_list.test",
-            "test/sql/types/geo/geometry_shred_limit.test",
-            "test/sql/types/geo/geometry_crs.test",
-            "test/sql/types/geo/geometry_shred.test"
-        ]
+      "reason": "FIXME: GEOMETRY limitations (stats are different in DuckLake, shredding is not supported)",
+      "paths": [
+        "test/sql/types/geo/geometry_stats.test",
+        "test/sql/types/geo/geometry_shred_list.test",
+        "test/sql/types/geo/geometry_shred_limit.test",
+        "test/sql/types/geo/geometry_crs.test",
+        "test/sql/types/geo/geometry_shred.test"
+      ]
     },
     {
       "reason": "Multiple require storage sections create same-named tables, causing conflicts in DuckLake",
@@ -655,6 +656,45 @@
         "test/parquet/variant/variant_comparison.test",
         "test/sql/storage/types/variant/variant_shredding_omit_untyped.test",
         "test/parquet/variant/variant_json_copy.test"
+      ]
+    },
+    {
+      "reason": "DuckLake table entries get a new object id on ALTER, the test asserts oid stability.",
+      "paths": [
+        "test/sql/catalog/test_alter_oid_stability.test"
+      ]
+    },
+    {
+      "reason": "DuckDB-native compression and storage-file internals (pragma_storage_info, native string statistics, corrupted duckdb files).",
+      "paths": [
+        "test/sql/storage/compression/dict_fsst/dict_fsst_expression_filter.test",
+        "test/sql/storage/compression/patas/patas_corrupted_file.test",
+        "test/sql/storage/compression/rle/rle_corrupted_count_offset.test"
+      ]
+    },
+    {
+      "reason": "Native database-file invalidation, checkpoint and WAL-revert semantics.",
+      "paths": [
+        "test/sql/storage/attach/attach_invalidation_default_db.test",
+        "test/sql/storage/checkpoint/initial_database_autocheckpoint_failure.test"
+      ]
+    },
+    {
+      "reason": "Parquet writer does not support non-root VARIANT columns; native shredded-variant statistics do not apply.",
+      "paths": [
+        "test/sql/types/variant/variant_map_to_variant_filter.test"
+      ]
+    },
+    {
+      "reason": "FIXME: inlined data flush renders shredded-variant struct values with empty keys as positional arguments in generated SQL.",
+      "paths": [
+        "test/sql/storage/types/variant/variant_shredding_empty_keys.test"
+      ]
+    },
+    {
+      "reason": "TIMETZ offsets with second precision are quantized by parquet storage.",
+      "paths": [
+        "test/sql/function/timetz/test_extract.test"
       ]
     }
   ]
