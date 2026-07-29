@@ -40,7 +40,7 @@ jobs:
           sudo apt-get remove -y cmake cmake-data
           sudo apt-get install --allow-downgrades -y -qq 'cmake=3.*' 'cmake-data=3.*'
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           submodules: 'true'
@@ -56,12 +56,12 @@ jobs:
           cmake --version
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11.1
+        uses: lukka/run-vcpkg@abed23940f9d7bc267b0e1a21ee7b699a3794baa # v11.1
         with:
           vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
 
       - name: Setup Ccache
-        uses: hendrikmuhs/ccache-action@main
+        uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # main
         continue-on-error: true
 
       - name: Build extension
