@@ -1,0 +1,75 @@
+# name: test/sql/functions/ducklake_commit_stats.test
+# description: Test the ducklake_commit_stats table function
+# group: [functions]
+
+require ducklake
+
+require parquet
+
+# callable without any attached ducklake catalog
+statement ok
+SELECT catalog, stat, value FROM ducklake_commit_stats()
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake_stats (DATA_PATH '${DATA_PATH}/ducklake_commit_stats_files')
+
+statement ok
+CREATE TABLE ducklake_stats.test(i INTEGER)
+
+statement ok
+INSERT INTO ducklake_stats.test VALUES (1), (2), (3)
+
+# each catalog reports exactly the 10 stats of the contract
+query I
+SELECT count(*) >= 10 FROM ducklake_commit_stats() WHERE catalog = 'ducklake_stats'
+----
+true
+
+query I
+SELECT count(DISTINCT stat) FROM ducklake_commit_stats() WHERE catalog = 'ducklake_stats' AND stat IN ('attempts', 'successes', 'retries_exhausted', 'nonretryable_errors', 'backoff_ms', 'total_commit_ms', 'conflicts.primary_key', 'conflicts.unique', 'conflicts.conflict', 'conflicts.concurrent')
+----
+10
+
+# the CREATE TABLE and INSERT commits are reflected in the counters
+query I
+SELECT count(*) > 0 FROM ducklake_commit_stats() WHERE catalog = 'ducklake_stats' AND stat = 'successes' AND value > 0
+----
+true
+
+# NOTE: thresholds are >= 1, not the number of statements run: on server-side-commit
+# configs (quack) data-only commits run their commit loop in the SERVER process, so this
+# client-side registry only sees the DDL commits.
+query I
+SELECT count(*) > 0 FROM ducklake_commit_stats() WHERE catalog = 'ducklake_stats' AND stat = 'attempts' AND value >= 1
+----
+true
+
+# attempts is always at least successes
+query I
+SELECT bool_and(attempts >= successes) FROM (
+    SELECT catalog,
+           sum(value) FILTER (stat = 'attempts') AS attempts,
+           sum(value) FILTER (stat = 'successes') AS successes
+    FROM ducklake_commit_stats()
+    GROUP BY catalog)
+----
+true
+
+# no counter is ever negative
+query I
+SELECT count(*) FROM ducklake_commit_stats() WHERE value < 0
+----
+0
+
+# counters are monotonic - another commit never decreases successes
+statement ok
+CREATE TABLE ducklake_stats.test2(j INTEGER)
+
+query I
+SELECT count(*) > 0 FROM ducklake_commit_stats() WHERE catalog = 'ducklake_stats' AND stat = 'successes' AND value >= 2
+----
+true

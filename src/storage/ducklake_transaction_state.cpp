@@ -1,5 +1,6 @@
 #include "storage/ducklake_transaction_state.hpp"
 
+#include "common/ducklake_commit_stats.hpp"
 #include "common/ducklake_types.hpp"
 #include "duckdb/catalog/catalog_entry/macro_catalog_entry.hpp"
 #include "duckdb/function/scalar_macro_function.hpp"
@@ -1687,13 +1688,36 @@ DuckLakeTransactionState::CheckForConflicts(DuckLakeSnapshot transaction_snapsho
 	return snapshot_and_stats;
 }
 
+namespace {
+
+//! Adds the wall-clock time of the whole commit retry loop to total_commit_ms, on every exit path
+//! (success or throw).
+struct CommitLoopTimer {
+	explicit CommitLoopTimer(DuckLakeCatalogCommitStats &commit_stats)
+	    : commit_stats(commit_stats), start(std::chrono::steady_clock::now()) {
+	}
+	~CommitLoopTimer() {
+		auto elapsed = std::chrono::steady_clock::now() - start;
+		commit_stats.total_commit_ms += std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+	}
+
+	DuckLakeCatalogCommitStats &commit_stats;
+	std::chrono::steady_clock::time_point start;
+};
+
+} // namespace
+
 void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
                                       const TransactionChangeInformation &transaction_changes,
                                       const DuckLakeRetryConfig &retry_config, const DuckLakeCommitContext &context) {
+	auto &commit_stats =
+	    DuckLakeCommitStatsRegistry::Get().GetStats(context.catalog_name.empty() ? "default" : context.catalog_name);
+	CommitLoopTimer commit_timer(commit_stats);
 	SnapshotAndStats commit_stats_snapshot;
 	auto &commit_snapshot = commit_stats_snapshot.snapshot;
 	optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats;
 	for (idx_t i = 0; i < retry_config.max_retry_count + 1; i++) {
+		commit_stats.attempts++;
 		bool can_retry;
 		auto attempt_changes = transaction_changes;
 		try {
@@ -1731,13 +1755,21 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 			context.set_catalog_version(commit_snapshot.schema_version);
 
 			// finished writing
+			commit_stats.successes++;
 			break;
 		} catch (std::exception &ex) {
 			ErrorData error(ex);
 			// rollback if there is an active transaction
 			context.try_rollback();
-			bool retry_on_error = DuckLakeTransaction::RetryOnError(error.Message());
+			auto conflict_cause = DuckLakeCommitStatsRegistry::ClassifyCommitError(error.Message());
+			commit_stats.RecordConflict(conflict_cause);
+			bool retry_on_error = DuckLakeCommitStatsRegistry::IsRetryableCause(conflict_cause);
 			bool finished_retrying = i + 1 >= retry_config.max_retry_count;
+			if (!retry_on_error) {
+				commit_stats.nonretryable_errors++;
+			} else if (finished_retrying) {
+				commit_stats.retries_exhausted++;
+			}
 			if (!can_retry || !retry_on_error || finished_retrying) {
 				// we abort after the max retry count
 				CleanupFiles();
@@ -1759,6 +1791,7 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 			double random_multiplier = (random.NextRandom() + 1.0) / 2.0;
 			uint64_t sleep_amount = (uint64_t)((double)retry_config.retry_wait_ms * random_multiplier *
 			                                   pow(retry_config.retry_backoff, static_cast<double>(i)));
+			commit_stats.backoff_ms += static_cast<int64_t>(sleep_amount);
 			std::this_thread::sleep_for(std::chrono::milliseconds(sleep_amount));
 #endif
 
