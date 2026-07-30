@@ -313,6 +313,7 @@ unique_ptr<LogicalOperator> DuckLakeDataFlusher::GenerateFlushCommand() {
 	copy_input.get_table_index = table_idx;
 	copy_input.virtual_columns = InsertVirtualColumns::WRITE_ROW_ID_AND_SNAPSHOT_ID;
 
+	bool is_encrypted = !copy_input.encryption_key.empty();
 	auto copy_options = DuckLakeInsert::GetCopyOptions(context, copy_input);
 
 	auto virtual_columns = table.GetVirtualColumns();
@@ -383,6 +384,9 @@ unique_ptr<LogicalOperator> DuckLakeDataFlusher::GenerateFlushCommand() {
 	copy->partition_columns = std::move(copy_options.partition_columns);
 	copy->names = std::move(copy_options.names);
 	copy->expected_types = std::move(copy_options.expected_types);
+
+	copy->hive_file_pattern =
+	    copy_input.catalog.UseHiveFilePattern(!is_encrypted, copy_input.schema_id, copy_input.table_id);
 
 	copy->children.push_back(std::move(root));
 
