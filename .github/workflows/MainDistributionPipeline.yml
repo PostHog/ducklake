@@ -35,6 +35,8 @@ jobs:
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
       ci_tools_version: d3e0ee09e2e392941f2e390e6cbab108a095daa4
       override_ci_tools_repository: PostHog/extension-ci-tools
+      # duckdb-version pins a commit that only exists in our fork, so DuckDB has to be cloned from there too.
+      override_duckdb_repository: PostHog/duckdb
       extension_name: ducklake
 
   # Regression test, see https://github.com/duckdb/ducklake/pull/1256 for more details.
