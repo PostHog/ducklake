@@ -1,7 +1,7 @@
 [submodule "duckdb"]
 	path = duckdb
 	url = https://github.com/PostHog/duckdb
-	branch = posthog/main-snapshot-2026-07-22
+	branch = posthog/fix-variant-pushdown-prefetch-accounting
 [submodule "extension-ci-tools"]
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
