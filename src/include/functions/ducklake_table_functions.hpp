@@ -140,4 +140,9 @@ public:
 	DuckLakeCommitFunction();
 };
 
+class DuckLakeCommitStatsFunction : public TableFunction {
+public:
+	DuckLakeCommitStatsFunction();
+};
+
 } // namespace duckdb

@@ -2,6 +2,7 @@
 
 #include "storage/ducklake_commit_state.hpp"
 #include "storage/ducklake_transaction_state.hpp"
+#include "common/ducklake_commit_stats.hpp"
 #include "common/ducklake_types.hpp"
 #include "common/ducklake_util.hpp"
 #include "duckdb/common/thread.hpp"
@@ -1259,20 +1260,10 @@ DuckLakeDeleteFileInfo DuckLakeTransaction::GetNewDeleteFile(TableIndex table_id
 }
 
 bool DuckLakeTransaction::RetryOnError(const string &original_message) {
-	auto message = StringUtil::Lower(original_message);
-	// retry on primary key errors
-	if (StringUtil::Contains(message, "primary key") || StringUtil::Contains(message, "unique")) {
-		return true;
-	}
-	// retry on conflicts
-	if (StringUtil::Contains(message, "conflict")) {
-		return true;
-	}
-	// retry on concurrent access
-	if (StringUtil::Contains(message, "concurrent")) {
-		return true;
-	}
-	return false;
+	// retry on primary key / unique errors, conflicts and concurrent access - the classification helper uses
+	// the exact substring checks that used to live here
+	return DuckLakeCommitStatsRegistry::IsRetryableCause(
+	    DuckLakeCommitStatsRegistry::ClassifyCommitError(original_message));
 }
 
 DuckLakeRetryConfig DuckLakeRetryConfig::FromContext(ClientContext &context) {
@@ -1451,6 +1442,7 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 		ducklake_catalog.SetCommittedSnapshotId(snapshot_id);
 	};
 	context.commit_info = state->commit_info;
+	context.catalog_name = ducklake_catalog.GetName();
 	state->Commit(transaction_snapshot, transaction_changes, retry_config, context);
 }
 

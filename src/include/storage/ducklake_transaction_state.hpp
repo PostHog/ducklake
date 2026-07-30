@@ -95,6 +95,8 @@ struct DuckLakeCommitContext {
 	std::function<void(idx_t)> set_committed_snapshot_id;
 	//! Author / message / extra info for the snapshot row.
 	DuckLakeSnapshotCommit commit_info;
+	//! Catalog label used for commit-loop statistics; falls back to "default" when left empty.
+	string catalog_name;
 	//! When true, Commit() skips the post-commit DropEmptySupersededInlinedTables cleanup.
 	bool skip_drop_empty_inlined = false;
 };
