@@ -1,6 +1,7 @@
 #include "common/ducklake_util.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_multi_file_list.hpp"
+#include "storage/ducklake_variant_stats.hpp"
 #include "storage/ducklake_multi_file_reader.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 
@@ -40,8 +41,36 @@ DuckLakeMultiFileList::DuckLakeMultiFileList(DuckLakeFunctionInfo &read_info,
 	inlined_data_tables.push_back(inlined_table);
 }
 
+//! Builds the ducklake_file_variant_stats.variant_path key for a pushdown-extract ColumnIndex, i.e. the path the
+//! optimizer pushed into the scan for an expression like `v.a.b`. Returns an empty string when the index is not a
+//! pushdown extract or when the path is not a plain chain of field names - anything unexpected must fall back to
+//! "no path", which disables pruning rather than pruning on a path we did not really resolve.
+static string BuildVariantStatsPath(const ColumnIndex &index) {
+	if (!index.IsPushdownExtract() || !index.HasChildren()) {
+		return string();
+	}
+	string path;
+	reference<const ColumnIndex> current(index.GetChildIndex(0));
+	while (true) {
+		// a positional (primary index) component is not something the stats table is keyed by
+		if (current.get().HasPrimaryIndex()) {
+			return string();
+		}
+		if (!path.empty()) {
+			path += ".";
+		}
+		path += QuoteVariantFieldName(current.get().GetFieldName());
+		if (!current.get().HasChildren()) {
+			break;
+		}
+		current = current.get().GetChildIndex(0);
+	}
+	return path;
+}
+
 void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id,
-                                                    unique_ptr<TableFilter> filter) const {
+                                                    unique_ptr<TableFilter> filter,
+                                                    optional_ptr<const ColumnIndex> column_index_p) const {
 	if (IsVirtualColumn(column_id)) {
 		return;
 	}
@@ -50,6 +79,20 @@ void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown
 	auto field_index = root_id.GetFieldIndex().index;
 	// Get the column type from the table schema, not from the scan types array
 	const auto &column_type = read_info.column_types[column_index.index];
+
+	string variant_path;
+	if (column_index_p && column_type.id() == LogicalTypeId::VARIANT) {
+		variant_path = BuildVariantStatsPath(*column_index_p);
+	}
+	if (!variant_path.empty()) {
+		// The filter applies to the extracted field, not to the VARIANT column, so it must be built against the
+		// extracted type - using the VARIANT type here would produce a nonsensical comparison.
+		const auto &extract_type = column_index_p->GetType();
+		auto expr_filter = ExpressionFilter::FromTableFilter(*filter, extract_type);
+		ColumnFilterInfo filter_info_entry(field_index, extract_type, std::move(expr_filter), std::move(variant_path));
+		pushdown_info.column_filters.emplace(field_index, std::move(filter_info_entry));
+		return;
+	}
 	auto expr_filter = ExpressionFilter::FromTableFilter(*filter, column_type);
 	ColumnFilterInfo filter_info_entry(field_index, column_type, std::move(expr_filter));
 	pushdown_info.column_filters.emplace(field_index, std::move(filter_info_entry));
@@ -64,7 +107,10 @@ DuckLakeMultiFileList::DynamicFilterPushdown(ClientContext &context, const Multi
 		return nullptr;
 	}
 
-	auto pushdown_info = make_uniq<FilterPushdownInfo>();
+	// Seed from the filters already pushed down (as ComplexFilterPushdown does). This interface only receives
+	// column_ids, so it cannot reconstruct a VARIANT sub-path; starting from a fresh map would silently drop any
+	// path-qualified filter that static pushdown had already resolved. emplace() keeps the existing entry.
+	auto pushdown_info = filter_info ? filter_info->Copy() : make_uniq<FilterPushdownInfo>();
 
 	for (auto &entry : filters) {
 		auto column_id = column_ids[entry.GetIndex().GetIndex()];
@@ -105,8 +151,15 @@ unique_ptr<MultiFileList> DuckLakeMultiFileList::ComplexFilterPushdown(ClientCon
 	auto pushdown_info = filter_info ? filter_info->Copy() : make_uniq<FilterPushdownInfo>();
 
 	for (auto &entry : table_filter_set) {
-		auto column_id = info.column_ids[entry.GetIndex().GetIndex()];
-		AddFilterToPushdownInfo(*pushdown_info, column_id, entry.TakeFilter());
+		auto scan_index = entry.GetIndex().GetIndex();
+		auto column_id = info.column_ids[scan_index];
+		// the ColumnIndex carries the VARIANT sub-path the optimizer pushed down (if any) - column_ids alone
+		// only identifies the top-level column
+		optional_ptr<const ColumnIndex> column_index;
+		if (scan_index < info.column_indexes.size()) {
+			column_index = info.column_indexes[scan_index];
+		}
+		AddFilterToPushdownInfo(*pushdown_info, column_id, entry.TakeFilter(), column_index);
 	}
 
 	if (pushdown_info->column_filters.empty()) {

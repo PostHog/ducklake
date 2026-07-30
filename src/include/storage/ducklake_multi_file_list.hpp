@@ -48,6 +48,9 @@ public:
 	bool HasTransactionLocalData() const {
 		return !transaction_local_files.empty() || transaction_local_data;
 	}
+	DuckLakeScanType GetScanType() const {
+		return read_info.scan_type;
+	}
 	vector<DuckLakeFileListExtendedEntry> GetFilesExtended() const;
 	const vector<DuckLakeFileListEntry> &GetFiles() const;
 	const DuckLakeFileListEntry &GetFileEntry(idx_t file_idx) const;
@@ -66,8 +69,8 @@ private:
 	void GetFilesForTable() const;
 	void GetTableInsertions() const;
 	void GetTableDeletions() const;
-	void AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id,
-	                             unique_ptr<TableFilter> filter) const;
+	void AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id, unique_ptr<TableFilter> filter,
+	                             optional_ptr<const ColumnIndex> column_index = nullptr) const;
 	//! Get the row_id_start for transaction-local inlined data.
 	idx_t GetTransactionLocalRowIdStart(idx_t transaction_row_start) const;
 

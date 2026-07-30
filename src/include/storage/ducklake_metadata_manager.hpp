@@ -49,6 +49,12 @@ struct CTERequirement {
 	idx_t column_field_index;
 	unordered_set<string> referenced_stats;
 	idx_t reference_count = 1;
+	//! When set, the stats come from ducklake_file_variant_stats for this VARIANT sub-path rather than from
+	//! ducklake_file_column_stats for the column as a whole. Encoded the same way the stats writer encodes it:
+	//! dot-separated, each field name quoted (see QuoteVariantFieldName).
+	string variant_path;
+	//! SQL fragment restricting which shredded_type values may be pruned on (see TryGetComparableShreddedTypes).
+	string variant_type_filter;
 
 	CTERequirement(idx_t col_idx, unordered_set<string> stats)
 	    : column_field_index(col_idx), referenced_stats(std::move(stats)) {
@@ -68,14 +74,18 @@ struct ColumnFilterInfo {
 	idx_t column_field_index;
 	LogicalType column_type;
 	unique_ptr<ExpressionFilter> table_filter;
+	//! Non-empty when this filter targets a field inside a VARIANT column rather than the column itself, in which
+	//! case pruning must consult ducklake_file_variant_stats for this path. Empty for ordinary columns.
+	string variant_path;
 
-	ColumnFilterInfo(idx_t col_idx, LogicalType type, unique_ptr<ExpressionFilter> filter)
-	    : column_field_index(col_idx), column_type(std::move(type)), table_filter(std::move(filter)) {
+	ColumnFilterInfo(idx_t col_idx, LogicalType type, unique_ptr<ExpressionFilter> filter, string variant_path_p = "")
+	    : column_field_index(col_idx), column_type(std::move(type)), table_filter(std::move(filter)),
+	      variant_path(std::move(variant_path_p)) {
 	}
 
 	ColumnFilterInfo(const ColumnFilterInfo &other)
 	    : column_field_index(other.column_field_index), column_type(other.column_type),
-	      table_filter(other.table_filter->Copy()) {
+	      table_filter(other.table_filter->Copy()), variant_path(other.variant_path) {
 	}
 
 	ColumnFilterInfo(ColumnFilterInfo &&other) = default;
@@ -85,6 +95,7 @@ struct ColumnFilterInfo {
 			column_field_index = other.column_field_index;
 			column_type = other.column_type;
 			table_filter = other.table_filter ? other.table_filter->Copy() : nullptr;
+			variant_path = other.variant_path;
 		}
 		return *this;
 	}

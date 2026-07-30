@@ -20,6 +20,8 @@
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/storage/storage_index.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 
 namespace duckdb {
 
@@ -111,7 +113,42 @@ unique_ptr<BaseStatistics> DuckLakeStatisticsExtended(ClientContext &context, Ta
 	if (input.column_index.IsVirtualColumn()) {
 		return nullptr;
 	}
-	return DuckLakeStatistics(context, input.bind_data.get(), input.column_index.GetPrimaryIndex());
+	auto result = DuckLakeStatistics(context, input.bind_data.get(), input.column_index.GetPrimaryIndex());
+	if (!result || !input.column_index.IsPushdownExtract()) {
+		return result;
+	}
+	// the optimizer pushed a VARIANT/STRUCT field extract into the scan - the stats we just looked up describe the
+	// whole column, so they must be narrowed to the extracted field. Returning them as-is would attribute
+	// whole-column min/max to a single field and produce incorrect results, not merely bad estimates.
+	auto storage_index = StorageIndex::FromColumnIndex(input.column_index);
+	auto &child_indexes = storage_index.GetChildIndexes();
+	if (child_indexes.size() != 1) {
+		return nullptr;
+	}
+	return result->PushdownExtract(child_indexes[0]);
+}
+
+// Determines whether the optimizer may push a field extract (e.g. `v.a` on a VARIANT column) down into the scan.
+// This mirrors ParquetScanSupportPushdownExtract, but additionally refuses any scan whose rows may not come from
+// a Parquet data file: the inlined-data reader has no notion of a pushdown-extract ColumnIndex.
+static bool DuckLakeSupportsPushdownExtract(const FunctionData &bind_data_p, const LogicalIndex &col_idx) {
+	auto &multi_file_data = bind_data_p.Cast<MultiFileBindData>();
+	if (!multi_file_data.file_list) {
+		return false;
+	}
+	auto &file_list = multi_file_data.file_list->Cast<DuckLakeMultiFileList>();
+	// only plain table scans - change feed / flush scans have their own column plumbing
+	if (file_list.GetScanType() != DuckLakeScanType::SCAN_TABLE) {
+		return false;
+	}
+	// transaction-local inserts and committed inlined data are not read through the Parquet reader
+	if (file_list.HasTransactionLocalData() || !file_list.GetTable().GetInlinedDataTables().empty()) {
+		return false;
+	}
+	if (col_idx.index >= multi_file_data.columns.size()) {
+		return false;
+	}
+	return multi_file_data.columns[col_idx.index].type.id() == LogicalTypeId::VARIANT;
 }
 
 BindInfo DuckLakeBindInfo(const optional_ptr<FunctionData> bind_data) {
@@ -242,8 +279,13 @@ TableFunction DuckLakeFunctions::GetDuckLakeScanFunction(DatabaseInstance &insta
 		function.get_multi_file_reader = DuckLakeMultiFileReader::CreateInstance;
 	}
 
-	function.statistics = DuckLakeStatistics;
+	// NOTE: deliberately only 'statistics_extended' is set, mirroring the native table_scan function.
+	// RemoveUnusedColumns disables pushdown extract for any scan that sets 'statistics' (see
+	// duckdb/src/optimizer/remove_unused_columns.cpp), which would switch off VARIANT field pushdown for every
+	// DuckLake scan. All optimizer consumers prefer 'statistics_extended' when it is set, and
+	// DuckLakeStatisticsExtended covers everything DuckLakeStatistics did.
 	function.statistics_extended = DuckLakeStatisticsExtended;
+	function.supports_pushdown_extract = DuckLakeSupportsPushdownExtract;
 	function.get_bind_info = DuckLakeBindInfo;
 	function.get_virtual_columns = DuckLakeVirtualColumns;
 	function.get_row_id_columns = DuckLakeGetRowIdColumn;

@@ -483,6 +483,116 @@ static void GeneratePartitionExpressions(ClientContext &context, DuckLakeCopyInp
 	}
 }
 
+static bool IsShreddingSpace(char c) {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static string TrimShreddingToken(const string &input) {
+	idx_t start = 0;
+	while (start < input.size() && IsShreddingSpace(input[start])) {
+		start++;
+	}
+	idx_t end = input.size();
+	while (end > start && IsShreddingSpace(input[end - 1])) {
+		end--;
+	}
+	return input.substr(start, end - start);
+}
+
+static string StripShreddingQuotes(const string &input) {
+	if (input.size() < 2) {
+		return input;
+	}
+	auto first = input.front();
+	auto last = input.back();
+	if ((first == '\'' && last == '\'') || (first == '"' && last == '"')) {
+		return input.substr(1, input.size() - 2);
+	}
+	return input;
+}
+
+//! Split on `separator`, but only at nesting depth 0 and outside quoted sections, so that type strings containing
+//! commas (STRUCT(a BIGINT, b VARCHAR)) or colons survive intact.
+static vector<string> SplitShreddingTopLevel(const string &input, char separator) {
+	vector<string> result;
+	idx_t depth = 0;
+	char quote = '\0';
+	string current;
+	for (idx_t i = 0; i < input.size(); i++) {
+		auto c = input[i];
+		if (quote != '\0') {
+			current += c;
+			if (c == quote) {
+				quote = '\0';
+			}
+			continue;
+		}
+		if (c == '\'' || c == '"') {
+			quote = c;
+			current += c;
+		} else if (c == '(' || c == '[') {
+			depth++;
+			current += c;
+		} else if (c == ')' || c == ']') {
+			if (depth > 0) {
+				depth--;
+			}
+			current += c;
+		} else if (c == separator && depth == 0) {
+			result.push_back(current);
+			current.clear();
+		} else {
+			current += c;
+		}
+	}
+	result.push_back(current);
+	return result;
+}
+
+//! Parses the DuckLake 'parquet_shredding' option into the STRUCT Value that the Parquet writer's SHREDDING option
+//! expects. The outer braces and the quotes around each type are optional, so all of these are accepted:
+//!   v: 'STRUCT(a BIGINT, b VARCHAR)'
+//!   {v: STRUCT(a BIGINT), w: 'INTEGER[]'}
+Value DuckLakeInsert::ParseShreddingOption(const string &spec) {
+	auto trimmed = TrimShreddingToken(spec);
+	if (trimmed.size() >= 2 && trimmed.front() == '{' && trimmed.back() == '}') {
+		trimmed = TrimShreddingToken(trimmed.substr(1, trimmed.size() - 2));
+	}
+	if (trimmed.empty()) {
+		throw InvalidInputException("'parquet_shredding' was set to an empty value - expected entries of the form "
+		                            "<column>: <type>, e.g. v: 'STRUCT(a BIGINT)'");
+	}
+	child_list_t<Value> children;
+	for (auto &entry : SplitShreddingTopLevel(trimmed, ',')) {
+		if (TrimShreddingToken(entry).empty()) {
+			continue;
+		}
+		auto parts = SplitShreddingTopLevel(entry, ':');
+		if (parts.size() < 2) {
+			throw InvalidInputException("Invalid 'parquet_shredding' entry \"%s\" - expected the form <column>: "
+			                            "<type>, e.g. v: 'STRUCT(a BIGINT)'",
+			                            TrimShreddingToken(entry));
+		}
+		auto column_name = StripShreddingQuotes(TrimShreddingToken(parts[0]));
+		// rejoin any remaining fragments so that type strings containing ':' are preserved
+		string type_str = parts[1];
+		for (idx_t i = 2; i < parts.size(); i++) {
+			type_str += ":" + parts[i];
+		}
+		type_str = StripShreddingQuotes(TrimShreddingToken(type_str));
+		if (column_name.empty() || type_str.empty()) {
+			throw InvalidInputException("Invalid 'parquet_shredding' entry \"%s\" - both a column name and a type are "
+			                            "required, e.g. v: 'STRUCT(a BIGINT)'",
+			                            TrimShreddingToken(entry));
+		}
+		children.emplace_back(column_name, Value(type_str));
+	}
+	if (children.empty()) {
+		throw InvalidInputException("'parquet_shredding' did not contain any entries");
+	}
+	return Value::STRUCT(std::move(children));
+}
+
 DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input) {
 	auto info = make_uniq<CopyInfo>();
 	auto &catalog = copy_input.catalog;
@@ -527,6 +637,31 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	string row_group_size_bytes;
 	if (catalog.TryGetConfigOption("parquet_row_group_size_bytes", row_group_size_bytes, schema_id, table_id)) {
 		info->options["row_group_size_bytes"].emplace_back(row_group_size_bytes + " bytes");
+	}
+	string parquet_shredding;
+	if (catalog.TryGetConfigOption("parquet_shredding", parquet_shredding, schema_id, table_id)) {
+		auto shredding_value = ParseShreddingOption(parquet_shredding);
+		// The option can be set at catalog/schema level, so it may name columns that do not exist (as VARIANT) in
+		// this particular write. The Parquet binder hard-errors on such names, so only forward the entries that
+		// actually resolve here - an unusable setting degrades to "no explicit shredding", not a failed INSERT.
+		case_insensitive_set_t variant_columns;
+		for (auto &col : copy_input.columns.Logical()) {
+			if (col.Type().id() == LogicalTypeId::VARIANT) {
+				variant_columns.insert(col.Name().GetIdentifierName());
+			}
+		}
+		child_list_t<Value> applicable;
+		auto &struct_type = shredding_value.type();
+		auto &struct_children = StructValue::GetChildren(shredding_value);
+		for (idx_t i = 0; i < struct_children.size(); i++) {
+			auto child_name = StructType::GetChildName(struct_type, i).GetIdentifierName();
+			if (variant_columns.find(child_name) != variant_columns.end()) {
+				applicable.emplace_back(child_name, struct_children[i]);
+			}
+		}
+		if (!applicable.empty()) {
+			info->options["shredding"].push_back(Value::STRUCT(std::move(applicable)));
+		}
 	}
 	string per_thread_output_str;
 	bool per_thread_output = false;

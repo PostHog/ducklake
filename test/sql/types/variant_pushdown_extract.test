@@ -1,0 +1,185 @@
+# name: test/sql/types/variant_pushdown_extract.test
+# group: [types]
+
+# Covers pushdown extract on VARIANT columns in DuckLake scans. The scan exposes 'statistics_extended' only, which
+# allows the optimizer to push `v.field` into the scan; DuckLakeStatisticsExtended must then narrow the column
+# statistics to the extracted field. If it returned whole-column stats instead, the filters below would prune
+# incorrectly and silently return wrong results.
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/ducklake_pushdown', METADATA_CATALOG 'md', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+USE ducklake
+
+# fields with deliberately divergent ranges: 'a' ascends, 'b' descends, 'c' is constant
+statement ok
+CREATE TABLE t(v VARIANT)
+
+statement ok
+INSERT INTO t SELECT {'a': i, 'b': 100000-i, 'c': 42}::VARIANT FROM range(20000) i(i)
+
+# 'b' must not be pruned using 'a' (or whole-column) statistics
+query I
+SELECT count(*) FROM t WHERE v.b = 99999
+----
+1
+
+query I
+SELECT count(*) FROM t WHERE v.b = 80001
+----
+1
+
+query I
+SELECT count(*) FROM t WHERE v.b BETWEEN 80001 AND 80010
+----
+10
+
+query I
+SELECT count(*) FROM t WHERE v.c = 42
+----
+20000
+
+query I
+SELECT count(*) FROM t WHERE v.a = 5
+----
+1
+
+# values outside a field's own range correctly return nothing
+query I
+SELECT count(*) FROM t WHERE v.b = 5
+----
+0
+
+query I
+SELECT count(*) FROM t WHERE v.a = 99999
+----
+0
+
+# projecting one field while filtering on another
+query I
+SELECT v.b FROM t WHERE v.a = 7
+----
+99993
+
+query I
+SELECT v.a FROM t WHERE v.b = 99993
+----
+7
+
+# aggregates over an extracted field
+query II
+SELECT min(v.a::BIGINT), max(v.a::BIGINT) FROM t
+----
+0	19999
+
+query II
+SELECT min(v.b::BIGINT), max(v.b::BIGINT) FROM t
+----
+80001	100000
+
+# multiple files: per-file statistics must stay associated with the right field
+statement ok
+CREATE TABLE multi(id BIGINT, props VARIANT)
+
+statement ok
+INSERT INTO multi SELECT i, {'a': i, 'b': 'x'||i}::VARIANT FROM range(10000) i(i)
+
+statement ok
+INSERT INTO multi SELECT i, {'a': i, 'b': 'x'||i}::VARIANT FROM range(10000, 20000) i(i)
+
+query I
+SELECT count(*) FROM multi WHERE props.a = 15000
+----
+1
+
+query I
+SELECT props.b FROM multi WHERE props.a = 15000
+----
+x15000
+
+query I
+SELECT count(*) FROM multi WHERE props.a BETWEEN 9990 AND 10010
+----
+21
+
+# a filter spanning both files
+query I
+SELECT count(*) FROM multi WHERE props.a < 20000
+----
+20000
+
+# nested extract
+statement ok
+CREATE TABLE nested(v VARIANT)
+
+statement ok
+INSERT INTO nested SELECT {'outer': {'inner': i}}::VARIANT FROM range(1000) i(i)
+
+query I
+SELECT count(*) FROM nested WHERE v.outer.inner = 500
+----
+1
+
+query I
+SELECT v.outer.inner FROM nested WHERE v.outer.inner = 999
+----
+999
+
+# transaction-local (uncommitted) data must still read correctly - pushdown extract is disabled for those scans
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO multi VALUES (99999, {'a': 99999, 'b': 'local'}::VARIANT)
+
+query I
+SELECT props.b FROM multi WHERE props.a = 99999
+----
+local
+
+query I
+SELECT count(*) FROM multi
+----
+20001
+
+statement ok
+COMMIT
+
+query I
+SELECT props.b FROM multi WHERE props.a = 99999
+----
+local
+
+# inlined data path
+statement ok
+CREATE TABLE inlined(v VARIANT)
+
+statement ok
+CALL ducklake.set_option('data_inlining_row_limit', 100)
+
+statement ok
+INSERT INTO inlined SELECT {'a': i, 'b': 200-i}::VARIANT FROM range(50) i(i)
+
+query I
+SELECT count(*) FROM inlined WHERE v.a = 10
+----
+1
+
+query I
+SELECT v.b FROM inlined WHERE v.a = 10
+----
+190
+
+query I
+SELECT count(*) FROM inlined WHERE v.b = 151
+----
+1

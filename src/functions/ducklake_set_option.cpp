@@ -4,6 +4,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
+#include "storage/ducklake_insert.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_schema_entry.hpp"
@@ -166,6 +167,13 @@ static unique_ptr<FunctionData> DuckLakeSetOptionBind(ClientContext &context, Ta
 		value = val.CastAs(context, LogicalType::BOOLEAN).GetValue<bool>() ? "true" : "false";
 	} else if (option == "sort_on_insert") {
 		value = val.CastAs(context, LogicalType::BOOLEAN).GetValue<bool>() ? "true" : "false";
+	} else if (option == "parquet_shredding") {
+		if (val.IsNull()) {
+			throw BinderException("The %s option can't be null.", option.c_str());
+		}
+		value = val.ToString();
+		// parse eagerly so that a malformed schema is reported here rather than at the next INSERT
+		DuckLakeInsert::ParseShreddingOption(value);
 	} else {
 		throw NotImplementedException("Unsupported option %s", option);
 	}
