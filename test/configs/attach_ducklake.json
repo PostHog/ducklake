@@ -21,6 +21,7 @@
     "RETURNING clause",
     "DuckLake does not support sequences",
     "DuckLake does not support user-defined types",
+    "Unsupported user-defined type",
     "Parquet files do not support negative intervals",
     "The same row was updated multiple times - this is not (yet) supported in DuckLake",
     "Failed to convert DuckDB type to DuckLake - unsupported type",
@@ -43,7 +44,8 @@
     "reserved by DuckLake",
     "We cannot add a column with a non-literal default value",
     "Can't convert TableFilterType",
-    "Triggers are not supported for this table type"
+    "Triggers are not supported for this table type",
+    "Failed to cast value: Unimplemented type for cast"
   ],
   "skip_tests": [
     {
@@ -112,6 +114,7 @@
         "test/sql/logging/logging_types.test",
         "test/sql/logging/logging.test",
         "test/sql/logging/logging_csv.test",
+        "test/sql/logging/logging_buffer_size.test",
         "test/sql/storage/compression/roaring/roaring_bool_analyze_bitset.test",
         "test/sql/storage/compression/roaring/roaring_bool_analyze_run.test",
         "test/sql/storage/compression/roaring/roaring_bool_analyze_array.test",
@@ -138,6 +141,7 @@
         "test/sql/explain/explain_execute.test",
         "test/optimizer/pushdown/pushdown_filter_on_coalesced_equal_outer_join_keys.test",
         "test/optimizer/topn_window_elimination.test",
+        "test/sql/optimizer/topn_window_elimination_late_materialization.test",
         "test/optimizer/pushdown/filter_cannot_pushdown.test",
         "test/optimizer/pushdown/filters_on_limit_optimizer.test",
         "test/sql/explain/test_explain_table_scan.test",
@@ -148,13 +152,33 @@
         "test/optimizer/row_number_virtual_column.test",
         "test/sql/window/test_streaming_window.test",
         "test/sql/transactions/test_cardinality_estimation_uncommitted.test",
-        "test/sql/filter/test_struct_pushdown.test"
+        "test/sql/filter/test_struct_pushdown.test",
+        "test/optimizer/compressed_materialization_grouping_sets.test",
+        "test/optimizer/joins/fkpk_composite_key_ce.test",
+        "test/optimizer/partitioned_execution_coverage.test",
+        "test/sql/cte/materialized/materialized_cte_order_preservation.test",
+        "test/sql/cte/materialized/materialized_cte_parallel_buffered.test"
+      ]
+    },
+    {
+      "reason": "Locks DuckDB configuration (lock_configuration / allowed_configs), which prevents the DuckLake metadata catalog from operating and aborts its transaction. These tests exercise core config-locking, not DuckLake.",
+      "paths": [
+        "test/sql/settings/allowed_configs.test",
+        "test/sql/settings/lock_configuration_schema.test",
+        "test/sql/settings/test_lock_configuration.test"
+      ]
+    },
+    {
+      "reason": "Uses VACUUM for stats setup; DuckLake does not implement VACUUM, so the subsequent join-filter plan check cannot run.",
+      "paths": [
+        "test/optimizer/joins/join_filter_build_side.test"
       ]
     },
     {
       "reason": "Profiling",
       "paths": [
-        "test/sql/pragma/profiling/test_custom_profiling_rows_scanned.test"
+        "test/sql/pragma/profiling/test_custom_profiling_rows_scanned.test",
+        "test/sql/pragma/profiling/test_custom_profiling_row_group_metrics_local_storage.test"
       ]
     },
     {
@@ -274,7 +298,8 @@
       "reason": "Secret Manager Instantiation",
       "paths": [
         "test/sql/secrets/create_secret_hffs_autoload.test",
-        "test/sql/secrets/create_secret_persistence_no_client_context.test"
+        "test/sql/secrets/create_secret_persistence_no_client_context.test",
+        "test/sql/settings/test_external_access_metadata.test"
       ]
     },
     {
@@ -297,7 +322,19 @@
         "test/sql/storage/buffer_manager_temp_dir.test",
         "test/issues/internal/test_5457.test",
         "test/sql/copy/csv/code_cov/csv_disk_reload.test",
-        "test/sql/table_function/duckdb_eviction_queues.test"
+        "test/sql/table_function/duckdb_eviction_queues.test",
+        "test/sql/storage/temp_directory/test_default_temp_directory.test"
+      ]
+    },
+    {
+      "reason": "Tests DuckDB native-storage internals (load vX / pragma_storage_info: segment allocation, column metadata reuse, on-disk string stats). DuckLake stores data in Parquet, so native segment layout and stats have no equivalent.",
+      "paths": [
+        "test/sql/storage/adaptive_segment_allocation.test",
+        "test/sql/storage/pragma_storage_info_scan_type.test",
+        "test/sql/storage/metadata/partial_column_metadata_reuse.test",
+        "test/sql/storage/metadata/partial_column_metadata_reuse_v7.test",
+        "test/sql/storage/extended_string_stats.test",
+        "test/sql/storage/total_string_length_repeated_insert.test"
       ]
     },
     {
@@ -395,7 +432,6 @@
         "test/sql/function/list/list_value_nested_lists.test"
       ]
     },
-
     {
       "reason": "FIXME: BUGS? Weird behavior around hugeint",
       "paths": [
@@ -407,7 +443,8 @@
         "test/sql/join/inner/equality_join_limits.test",
         "test/sql/aggregate/group/group_by_limits.test",
         "test/sql/storage/types/test_uhugeint_storage.test",
-        "test/sql/export/parquet/export_parquet_hugeint.test"
+        "test/sql/export/parquet/export_parquet_hugeint.test",
+        "test/optimizer/statistics/statistics_numeric.test"
       ]
     },
     {
@@ -519,25 +556,25 @@
       "reason": "Prepared statement differs from original result!",
       "paths": [
         "test/sql/function/generic/test_connection_count.test"
-        ]
+      ]
     },
-     {
+    {
       "reason": "FIXME: DuckTransaction::Get called on non-DuckDB transaction",
       "paths": [
         "test/sql/function/timestamp/test_icu_makedate.test"
-        ]
+      ]
     },
     {
       "reason": "FIXME: Macros are currently not taken in for recursion",
       "paths": [
         "test/sql/catalog/function/test_recursive_macro.test"
-        ]
+      ]
     },
     {
       "reason": " Failed to parse DuckLake type - unsupported nested type",
       "paths": [
         "test/sql/catalog/function/test_macro_issue_13104.test"
-        ]
+      ]
     },
     {
       "reason": "Expected different behavior between duckdb and ducklake wrt macros. Notice these are not ducklake bugs just tests that do not fit.",
@@ -545,7 +582,7 @@
         "test/sql/catalog/function/test_table_macro_copy.test",
         "test/sql/catalog/function/test_macro_type_overloads.test",
         "test/sql/pragma/test_table_info.test"
-        ]
+      ]
     },
     {
       "reason": "Checkpoint in DuckLake doesn't produce expected result. Notice these are not ducklake bugs just tests that do not fit.",
@@ -603,53 +640,59 @@
     {
       "reason": "PARTITIONED BY is not supported for tables in a ducklake catalog",
       "paths": [
-          "test/sql/create/create_table_extra_options.test"
+        "test/sql/create/create_table_extra_options.test"
       ]
     },
     {
       "reason": "Different results",
       "paths": [
-          "test/sql/attach/show_schemas.test"
+        "test/sql/attach/show_schemas.test"
+      ]
+    },
+    {
+      "reason": "Flaky upstream: segment count sometimes 2 instead of 1, disabled in duckdb db513b8b51 (after current pin)",
+      "paths": [
+        "test/sql/storage/compression/fsst/fsst_greedy_long_strings.test"
       ]
     },
     {
       "reason": "FIXME: CI Deadlock?",
       "paths": [
-          "test/sql/update/test_stress_update_issue_19688.test"
+        "test/sql/update/test_stress_update_issue_19688.test"
       ]
     },
     {
       "reason": "FIXME: Internal error",
       "paths": [
-          "test/sql/copy/csv/test_copy_null.test"
+        "test/sql/copy/csv/test_copy_null.test"
       ]
     },
     {
       "reason": "Unsupported variant type in Parquet",
       "paths": [
-          "test/sql/function/variant/variant_typeof.test",
-          "test/sql/storage/types/variant/test_all_types_single_object.test",
-          "test/sql/storage/types/variant/struct_of_variant.test",
-          "test/sql/storage/types/variant/test_all_types_single_table.test",
-          "test/sql/storage/types/variant/test_all_types.test",
-          "test/sql/storage/types/variant/test_all_types_variant.test"
+        "test/sql/function/variant/variant_typeof.test",
+        "test/sql/storage/types/variant/test_all_types_single_object.test",
+        "test/sql/storage/types/variant/struct_of_variant.test",
+        "test/sql/storage/types/variant/test_all_types_single_table.test",
+        "test/sql/storage/types/variant/test_all_types.test",
+        "test/sql/storage/types/variant/test_all_types_variant.test"
       ]
     },
     {
       "reason": "Variant shredding stats are different between Parquet <> DuckDB",
       "paths": [
-          "test/sql/storage/types/variant/variant_extract_stats.test"
+        "test/sql/storage/types/variant/variant_extract_stats.test"
       ]
     },
     {
-        "reason": "FIXME: GEOMETRY limitations (stats are different in DuckLake, shredding is not supported)",
-        "paths": [
-            "test/sql/types/geo/geometry_stats.test",
-            "test/sql/types/geo/geometry_shred_list.test",
-            "test/sql/types/geo/geometry_shred_limit.test",
-            "test/sql/types/geo/geometry_crs.test",
-            "test/sql/types/geo/geometry_shred.test"
-        ]
+      "reason": "FIXME: GEOMETRY limitations (stats are different in DuckLake, shredding is not supported)",
+      "paths": [
+        "test/sql/types/geo/geometry_stats.test",
+        "test/sql/types/geo/geometry_shred_list.test",
+        "test/sql/types/geo/geometry_shred_limit.test",
+        "test/sql/types/geo/geometry_crs.test",
+        "test/sql/types/geo/geometry_shred.test"
+      ]
     },
     {
       "reason": "Multiple require storage sections create same-named tables, causing conflicts in DuckLake",
@@ -663,7 +706,198 @@
       "paths": [
         "test/parquet/variant/variant_comparison.test",
         "test/sql/storage/types/variant/variant_shredding_omit_untyped.test",
-        "test/parquet/variant/variant_json_copy.test"
+        "test/parquet/variant/variant_json_copy.test",
+        "test/sql/function/variant/variant_extract_string_shredded.test"
+      ]
+    },
+    {
+      "reason": "External extension test suites (quack/sqlite_scanner/httpfs _deps) assume a plain DuckDB default catalog or a live server; not meaningful with a DuckLake default catalog.",
+      "paths": [
+        "test/sql/attach.test",
+        "test/sql/attach_views.test",
+        "test/sql/authn_swap.test",
+        "test/sql/lookup_overwrite.test",
+        "test/sql/pgbench.test",
+        "test/sql/pushdown.test",
+        "test/sql/rpc.test",
+        "test/sql/scanner/borked.test",
+        "test/sql/scanner/chinook.test",
+        "test/sql/scanner/count_star.test",
+        "test/sql/scanner/decimal.test",
+        "test/sql/scanner/emptytype.test",
+        "test/sql/scanner/float.test",
+        "test/sql/scanner/longvarchar.test",
+        "test/sql/scanner/sakila.test",
+        "test/sql/storage/attach_debug_print_unharmful.test",
+        "test/sql/logging/http_logging.test",
+        "test/sql/metadata_stats.test",
+        "test/sql/quack_active_connections.test",
+        "test/sql/copy/csv/test_csv_httpfs.test"
+      ]
+    },
+    {
+      "reason": "duckdb's CONNECT-over-quack test targets duckdb's older quack pin ",
+      "paths": [
+        "test/sql/connect/connect_quack.test"
+      ]
+    },
+    {
+      "reason": "Asserts DuckDB-native storage plans and statistics (row-group pruning, string statistics, sequential-scan operators) that do not apply to DuckLake's parquet storage.",
+      "paths": [
+        "test/optimizer/compressed_materialization_variant.test",
+        "test/optimizer/partition_stats_exactness.test",
+        "test/optimizer/pushdown/join_filter_pushdown_cast_variant.test",
+        "test/optimizer/pushdown/starts_with_pushdown.test",
+        "test/optimizer/statistics/statistics_contains.test",
+        "test/optimizer/statistics/statistics_string_length.test",
+        "test/optimizer/statistics/statistics_suffix.test",
+        "test/optimizer/string_prefix.test",
+        "test/sql/optimizer/empty_string_concat_pruning.test",
+        "test/sql/optimizer/instr_zonemap_pruning.test",
+        "test/sql/optimizer/late_materialization_table_filters.test",
+        "test/sql/optimizer/monotone_function_zonemap_pruning.test",
+        "test/sql/optimizer/monotone_preimage.test",
+        "test/sql/optimizer/not_conjunction_simplification.test",
+        "test/sql/optimizer/power_zonemap_pruning.test",
+        "test/sql/optimizer/test_rowid_pruning.test",
+        "test/sql/sample/test_system_rows.test",
+        "test/sql/optimizer/substring_zonemap_pruning.test"
+      ]
+    },
+    {
+      "reason": "Asserts DuckDB-native BASE_TABLE memory accounting via duckdb_memory().",
+      "paths": [
+        "test/sql/delete/bulk_delete_version_info_memory.test",
+        "test/sql/delete/delete_compression_blocked_by_old_snapshot.test",
+        "test/sql/delete/partial_delete_version_info_memory.test",
+        "test/sql/storage/partial_delete_pending_compress.test",
+        "test/sql/storage/partial_delete_checkpoint_mask.test"
+      ]
+    },
+    {
+      "reason": "Asserts native-storage write-write conflict behavior on full-vector deletes; DuckLake resolves these without conflict.",
+      "paths": [
+        "test/sql/delete/full_vector_delete_conflict.test",
+        "test/sql/delete/full_vector_delete_rollback.test"
+      ]
+    },
+    {
+      "reason": "DuckLake does not support nested schemas.",
+      "paths": [
+        "test/sql/catalog/nested_schema/create_nested_schema.test",
+        "test/sql/catalog/nested_schema/drop_nested_schema.test",
+        "test/sql/catalog/nested_schema/drop_nested_schema_persist.test",
+        "test/sql/catalog/nested_schema/nested_schema_storage_version.test",
+        "test/sql/catalog/nested_schema/nested_table.test",
+        "test/sql/catalog/nested_schema/nested_table_persist.test",
+        "test/sql/catalog/nested_schema/persist.test"
+      ]
+    },
+    {
+      "reason": "DuckLake reports a different error message for a missing schema.",
+      "paths": [
+        "test/sql/catalog/sequence/test_sequence_google_fuzz.test",
+        "test/sql/attach/attach_hidden.test",
+        "test/sql/settings/test_disabled_file_systems.test"
+      ]
+    },
+    {
+      "reason": "DuckLake table entries get a new object id on ALTER, the test asserts oid stability.",
+      "paths": [
+        "test/sql/catalog/test_alter_oid_stability.test"
+      ]
+    },
+    {
+      "reason": "Test assumes tables vanish on restart (in-memory catalog); DuckLake persists them.",
+      "paths": [
+        "test/sql/aggregate/aggregate_state_export/test_state_export_quantile.test",
+        "test/sql/aggregate/aggregate_state_export/test_state_export_string_agg.test"
+      ]
+    },
+    {
+      "reason": "DuckDB-native compression and storage-file internals (pragma_storage_info, native string statistics, corrupted duckdb files).",
+      "paths": [
+        "test/sql/storage/compression/default_storage_dict_fsst.test",
+        "test/sql/storage/compression/dict_fsst/dict_fsst_expression_filter.test",
+        "test/sql/storage/compression/dict_fsst/repeated_string_stats.test",
+        "test/sql/storage/compression/dictionary/total_string_length_dictionary.test",
+        "test/sql/storage/compression/patas/patas_corrupted_file.test",
+        "test/sql/storage/compression/rle/rle_corrupted_count_offset.test"
+      ]
+    },
+    {
+      "reason": "Native database-file invalidation, checkpoint and WAL-revert semantics.",
+      "paths": [
+        "test/sql/storage/attach/attach_invalidation_default_db.test",
+        "test/sql/storage/checkpoint/initial_database_autocheckpoint_failure.test",
+        "test/sql/transactions/commit_revert_failure.test"
+      ]
+    },
+    {
+      "reason": "Parquet writer does not support non-root VARIANT columns; native shredded-variant statistics do not apply.",
+      "paths": [
+        "test/sql/storage/types/variant/variant_comparator_stats.test",
+        "test/sql/storage/types/variant/variant_shredded_extract_non_object.test",
+        "test/sql/types/variant/variant_map_to_variant_filter.test"
+      ]
+    },
+    {
+      "reason": "FIXME: inlined data flush renders shredded-variant struct values with empty keys as positional arguments in generated SQL.",
+      "paths": [
+        "test/sql/storage/types/variant/variant_shredding_empty_keys.test"
+      ]
+    },
+    {
+      "reason": "FIXME: reading transaction-local inlined data after in-transaction ALTER TYPE looks up the inlined table of the new schema version, which is only created at commit.",
+      "paths": [
+        "test/sql/alter/alter_type/test_alter_type_active_transaction_visibility.test"
+      ]
+    },
+    {
+      "reason": "Native geometry statistics propagation differs through parquet storage.",
+      "paths": [
+        "test/sql/types/geo/geometry_from_wkb_stats.test",
+        "test/sql/types/geo/geometry_vertex_extract.test"
+      ]
+    },
+    {
+      "reason": "The DuckLake catalog is the default catalog (USE dl), so unqualified names do not resolve in the attached/system catalog the test expects.",
+      "paths": [
+        "test/sql/function/string/regex_operators_v1_5_view.test",
+        "test/sql/table_function/external_resource_logging.test"
+      ]
+    },
+    {
+      "reason": "icu is statically loaded, enabling TIMESTAMPTZ casts the test expects to fail.",
+      "paths": [
+        "test/sql/cast/timestamp_casts.test"
+      ]
+    },
+    {
+      "reason": "TIMETZ offsets with second precision are quantized by parquet storage.",
+      "paths": [
+        "test/sql/function/timetz/test_extract.test"
+      ]
+    },
+    {
+      "reason": "FIXME: NavigateNestedSchema unchecked cast breaks DuckLake nested schema DDL",
+      "paths": [
+        "test/sql/catalog/nested_schema/nested_alter.test",
+        "test/sql/catalog/nested_schema/nested_constraints.test",
+        "test/sql/catalog/nested_schema/nested_entries.test",
+        "test/sql/catalog/nested_schema/nested_entries_persist.test",
+        "test/sql/catalog/nested_schema/nested_export.test",
+        "test/sql/catalog/nested_schema/nested_schema_limits.test",
+        "test/sql/catalog/nested_schema/nested_table_columnref.test",
+        "test/sql/catalog/nested_schema/nested_table_dml.test",
+        "test/sql/catalog/nested_schema/nested_table_dml_persist.test",
+        "test/sql/catalog/nested_schema/nested_wal_replay.test"
+      ]
+    },
+    {
+      "reason": "FIXME: ADD COLUMN ... DEFAULT false is rejected as a non-literal default",
+      "paths": [
+        "test/sql/alter/add_col/test_add_col_if_not_exists_default.test"
       ]
     }
   ]
