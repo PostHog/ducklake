@@ -157,6 +157,8 @@ jobs:
       GEN: ninja
       CC: clang-20
       CXX: clang++-20
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      USE_MERGED_VCPKG_MANIFEST: 1
       # Enable -DDEBUG slow verifiers (expression verifier, operator
       # round-trips, etc.) without changing the optimization level.
       FORCE_DEBUG: 1
