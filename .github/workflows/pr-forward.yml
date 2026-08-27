@@ -33,6 +33,9 @@ name: Forward PR events to pr-tracker
 #   duckdblabs/pr-tracker ONLY, with Contents: write (the minimum that
 #   repository_dispatch requires). Nothing else — keep blast radius tiny.
 
+# nosemgrep: semgrep.rules.github-actions-pull-request-target
+# Justification: see the SECURITY block in the header — no PR-head code is
+# checked out or run; only GitHub-supplied coordinates are dispatched via jq.
 on:
   pull_request_target:
     types: [opened, reopened, ready_for_review, converted_to_draft, closed, labeled, unlabeled]

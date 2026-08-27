@@ -8,7 +8,6 @@ on:
       - labeled
 
 env:
-  GH_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
   TITLE_PREFIX: "[ducklake/#${{ github.event.issue.number || github.event.discussion.number }}]"
   PUBLIC_ISSUE_TITLE: ${{ github.event.issue.title }}
 
@@ -18,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Add comment
+        env:
+          GH_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
         run: |
           cat > needs-reproducible-example-comment.md << EOF
           Thanks for opening this issue in the DuckLake issue tracker! To resolve this issue, our team needs a reproducible example. This includes:
@@ -36,21 +37,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Remove 'needs triage' / 'under review' if 'reproduced'
+        env:
+          GH_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
         if: github.event.label.name == 'reproduced'
         run: |
           gh issue edit --repo duckdb/ducklake ${{ github.event.issue.number || github.event.discussion.number }} --remove-label "needs triage" --remove-label "under review" --remove-label "needs reproducible example"
 
       - name: Remove 'needs triage' / 'reproduced' if 'under review'
+        env:
+          GH_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
         if: github.event.label.name == 'under review'
         run: |
           gh issue edit --repo duckdb/ducklake ${{ github.event.issue.number || github.event.discussion.number }} --remove-label "needs triage" --remove-label "reproduced"
 
       - name: Remove 'needs triage' if 'expected behavior'
+        env:
+          GH_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
         if: github.event.label.name == 'expected behavior'
         run: |
           gh issue edit --repo duckdb/ducklake ${{ github.event.issue.number || github.event.discussion.number }} --remove-label "needs triage"
 
       - name: Get mirror issue number
+        env:
+          GH_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
         run: |
           gh issue list --repo duckdblabs/duckdb-internal --search "${TITLE_PREFIX}" --json title,number --state all --jq ".[] | select(.title | startswith(\"$TITLE_PREFIX\")).number" > mirror_issue_number.txt
           echo "MIRROR_ISSUE_NUMBER=$(cat mirror_issue_number.txt)" >> $GITHUB_ENV
@@ -74,6 +83,8 @@ jobs:
           fi
 
       - name: Create or label issue
+        env:
+          GH_TOKEN: ${{ secrets.DUCKDBLABS_BOT_TOKEN }}
         run: |
           if [ "$MIRROR_ISSUE_NUMBER" == "" ]; then
             gh issue create --repo duckdblabs/duckdb-internal --label "$LABEL" --label "ducklake" --title "$TITLE_PREFIX - $PUBLIC_ISSUE_TITLE" --body "See https://github.com/duckdb/ducklake/issues/${{ github.event.issue.number || github.event.discussion.number }}"

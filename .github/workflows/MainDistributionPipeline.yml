@@ -87,7 +87,11 @@ jobs:
     # Vendored copy of duckdb/extension-ci-tools _extension_deploy.yml (v1.5.2);
     # see .github/workflows/_extension_deploy.yml for source SHA and rationale.
     uses: ./.github/workflows/_extension_deploy.yml
-    secrets: inherit
+    secrets:
+      DUCKDB_EXTENSIONS_NIGHTLY_S3_ENDPOINT: ${{ secrets.DUCKDB_EXTENSIONS_NIGHTLY_S3_ENDPOINT }}
+      DUCKDB_EXTENSIONS_NIGHTLY_S3_ID: ${{ secrets.DUCKDB_EXTENSIONS_NIGHTLY_S3_ID }}
+      DUCKDB_EXTENSIONS_NIGHTLY_S3_KEY: ${{ secrets.DUCKDB_EXTENSIONS_NIGHTLY_S3_KEY }}
+      S3_DUCKDB_ORG_EXTENSION_SIGNING_PK: ${{ secrets.S3_DUCKDB_ORG_EXTENSION_SIGNING_PK }}
     with:
       extension_name: ducklake
       duckdb_version: ${{ needs.get-duckdb-version.outputs.duckdb_version }}
@@ -181,10 +185,14 @@ jobs:
         with:
           max-size: 5GB
           evict-old-files: job
-      - name: Build (relassert → ASan + UBSan + LSan)
-        uses: duckdb/duckdb-ci/build-duckdb@5e04c42652e82b5b453c843b0ba8665be33c4a69 # main (2026-08-26)
+      # Inlined from duckdb/duckdb-ci/build-duckdb: that composite action
+      # references unpinned actions internally, which the PostHog org
+      # full-SHA-pin policy rejects.
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@abed23940f9d7bc267b0e1a21ee7b699a3794baa # v11.1
         with:
-          build-type: relassert
-          build: python3 duckdb/scripts/ci/retry.py -- make relassert
-          test: make unittest_relassert
-          vcpkg-commit: 84bab45d415d22042bd0b9081aea57f362da3f35
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+      - name: Build (relassert → ASan + UBSan + LSan)
+        run: python3 duckdb/scripts/ci/retry.py -- make relassert
+      - name: Test
+        run: make unittest_relassert

@@ -75,6 +75,18 @@ on:
         required: false
         type: string
         default: 'auto'
+    # Fork-side patch (not upstream): declare the secrets referenced below so
+    # callers can pass them explicitly instead of `secrets: inherit` (Semgrep
+    # yaml.github-actions.security.secrets-inherit).
+    secrets:
+      DUCKDB_EXTENSIONS_NIGHTLY_S3_ENDPOINT:
+        required: false
+      DUCKDB_EXTENSIONS_NIGHTLY_S3_ID:
+        required: false
+      DUCKDB_EXTENSIONS_NIGHTLY_S3_KEY:
+        required: false
+      S3_DUCKDB_ORG_EXTENSION_SIGNING_PK:
+        required: false
 
 jobs:
   generate_matrix:
