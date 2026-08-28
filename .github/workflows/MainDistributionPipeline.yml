@@ -83,7 +83,8 @@ jobs:
   duckdb-next-deploy:
     name: Deploy extension binaries
     needs: [get-duckdb-version, duckdb-next-build, gcc12-compatibility-build]
-    if: github.ref != 'refs/heads/main'
+    # Only the duckdb org holds the nightly S3 credentials; skip elsewhere.
+    if: github.ref != 'refs/heads/main' && github.repository_owner == 'duckdb'
     # Vendored copy of duckdb/extension-ci-tools _extension_deploy.yml (v1.5.2);
     # see .github/workflows/_extension_deploy.yml for source SHA and rationale.
     uses: ./.github/workflows/_extension_deploy.yml
