@@ -12,6 +12,7 @@
 
 namespace duckdb {
 class BaseStatistics;
+struct DuckLakeDataFile;
 
 //! Returns true for types that require value-based (not lexicographic string) comparison for min/max stats
 inline bool RequiresValueComparison(const LogicalType &type) {
@@ -19,6 +20,7 @@ inline bool RequiresValueComparison(const LogicalType &type) {
 }
 
 struct DuckLakeColumnStats;
+struct DuckLakeGlobalColumnStatsInfo;
 
 struct DuckLakeColumnStats {
 	explicit DuckLakeColumnStats(LogicalType type_p);
@@ -41,6 +43,8 @@ struct DuckLakeColumnStats {
 	bool has_min = false;
 	bool has_max = false;
 	bool any_valid = true;
+	//! Invalidated bounds must never be reseeded
+	bool bounds_unknown = false;
 	bool has_contains_nan = false;
 
 	bool AnyValid() const {
@@ -53,6 +57,9 @@ struct DuckLakeColumnStats {
 	unique_ptr<DuckLakeColumnExtraStats> extra_stats;
 
 public:
+	static DuckLakeColumnStats FromGlobalStats(const LogicalType &type, const DuckLakeGlobalColumnStatsInfo &col,
+	                                           bool table_has_rows);
+	static bool BoundsSurviveTypePromotion(const LogicalType &source, const LogicalType &target);
 	unique_ptr<BaseStatistics> ToStats() const;
 	void MergeStats(const DuckLakeColumnStats &new_stats);
 
@@ -71,6 +78,8 @@ struct DuckLakeTableStats {
 	map<FieldIndex, DuckLakeColumnStats> column_stats;
 
 	void MergeStats(FieldIndex col_id, const DuckLakeColumnStats &file_stats);
+
+	void MergeFileStats(const DuckLakeDataFile &file);
 };
 
 struct DuckLakeStats {

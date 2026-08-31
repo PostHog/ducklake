@@ -1,4 +1,6 @@
 #include "functions/ducklake_table_functions.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/file_system.hpp"
 
 #include "duckdb/common/operator/subtract.hpp"
 #include "duckdb/common/string.hpp"
@@ -50,7 +52,7 @@ struct CleanupBindData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> CleanupBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names,
+                                            vector<LogicalType> &return_types, vector<Identifier> &names,
                                             CleanupType type) {
 	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]);
 	auto result = make_uniq<CleanupBindData>(catalog, type);
@@ -62,12 +64,11 @@ static unique_ptr<FunctionData> CleanupBind(ClientContext &context, TableFunctio
 	bool has_timestamp = false;
 	bool cleanup_all = false;
 	for (auto &entry : input.named_parameters) {
-		if (StringUtil::CIEquals(entry.first, "dry_run")) {
+		if (entry.first == "dry_run") {
 			result->dry_run = entry.second.GetValue<bool>();
-			;
-		} else if (StringUtil::CIEquals(entry.first, "cleanup_all")) {
+		} else if (entry.first == "cleanup_all") {
 			cleanup_all = entry.second.GetValue<bool>();
-		} else if (StringUtil::CIEquals(entry.first, "older_than")) {
+		} else if (entry.first == "older_than") {
 			from_timestamp = entry.second.GetValue<timestamp_tz_t>();
 			has_timestamp = true;
 		} else {
@@ -105,13 +106,14 @@ static unique_ptr<FunctionData> CleanupBind(ClientContext &context, TableFunctio
 	return std::move(result);
 }
 static unique_ptr<FunctionData> DuckLakeCleanupOldFilesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                                            vector<LogicalType> &return_types,
+                                                            vector<Identifier> &names) {
 	return CleanupBind(context, input, return_types, names, CleanupType::OLD_FILES);
 }
 
 static unique_ptr<FunctionData> DuckLakeCleanupOrphanedFilesBind(ClientContext &context, TableFunctionBindInput &input,
                                                                  vector<LogicalType> &return_types,
-                                                                 vector<string> &names) {
+                                                                 vector<Identifier> &names) {
 	return CleanupBind(context, input, return_types, names, CleanupType::ORPHANED_FILES);
 }
 

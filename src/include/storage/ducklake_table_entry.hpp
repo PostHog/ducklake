@@ -9,6 +9,8 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "storage/ducklake_stats.hpp"
 #include "storage/ducklake_partition_data.hpp"
@@ -55,12 +57,21 @@ public:
 	optional_ptr<DuckLakePartition> GetPartitionData() {
 		return partition_data.get();
 	}
+	optional_ptr<const DuckLakePartition> GetPartitionData() const {
+		return partition_data.get();
+	}
 	//! Returns SQL expressions for each partition field (e.g., "region", "year(ts)")
 	vector<string> GetPartitionSQLExpressions() const;
 	optional_ptr<DuckLakeSort> GetSortData() {
 		return sort_data.get();
 	}
+	optional_ptr<const DuckLakeSort> GetSortData() const {
+		return sort_data.get();
+	}
 	DuckLakeFieldData &GetFieldData() {
+		return *field_data;
+	}
+	const DuckLakeFieldData &GetFieldData() const {
 		return *field_data;
 	}
 	const ColumnChangeInfo &GetChangedFields() const {
@@ -75,10 +86,10 @@ public:
 	//! Returns the field id of a column by a column path.
 	// If name_offset is provided and column_names points to a field **within** the variant, the variant column is
 	// returned and the offset in the column_names vector where the variant is located
-	const DuckLakeFieldId &GetFieldId(const vector<string> &column_names,
+	const DuckLakeFieldId &GetFieldId(const vector<Identifier> &column_names,
 	                                  optional_ptr<optional_idx> name_offset = nullptr) const;
 	//! Returns the field id of a column by a column path if it exists (and nullptr otherwise)
-	optional_ptr<const DuckLakeFieldId> TryGetFieldId(const vector<string> &column_names,
+	optional_ptr<const DuckLakeFieldId> TryGetFieldId(const vector<Identifier> &column_names,
 	                                                  optional_ptr<optional_idx> name_offset = nullptr) const;
 	//! Returns the field id of a column by a field index
 	optional_ptr<const DuckLakeFieldId> GetFieldId(FieldIndex field_index) const;
@@ -104,7 +115,7 @@ public:
 
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
-	unique_ptr<CatalogEntry> Alter(DuckLakeTransaction &transaction, AlterTableInfo &info);
+	unique_ptr<CatalogEntry> Alter(ClientContext &context, DuckLakeTransaction &transaction, AlterTableInfo &info);
 	unique_ptr<CatalogEntry> Alter(DuckLakeTransaction &transaction, SetCommentInfo &info);
 	unique_ptr<CatalogEntry> Alter(DuckLakeTransaction &transaction, SetColumnCommentInfo &info);
 
@@ -128,10 +139,11 @@ public:
 private:
 	unique_ptr<CatalogEntry> AlterTable(DuckLakeTransaction &transaction, RenameTableInfo &info);
 	unique_ptr<CatalogEntry> AlterTable(DuckLakeTransaction &transaction, SetPartitionedByInfo &info);
-	unique_ptr<CatalogEntry> AlterTable(DuckLakeTransaction &transaction, SetNotNullInfo &info);
+	unique_ptr<CatalogEntry> AlterTable(ClientContext &context, DuckLakeTransaction &transaction, SetNotNullInfo &info);
 	unique_ptr<CatalogEntry> AlterTable(DuckLakeTransaction &transaction, DropNotNullInfo &info);
-	unique_ptr<CatalogEntry> AlterTable(DuckLakeTransaction &transaction, RenameColumnInfo &info);
-	unique_ptr<CatalogEntry> AlterTable(DuckLakeTransaction &transaction, AddColumnInfo &info);
+	unique_ptr<CatalogEntry> AlterTable(ClientContext &context, DuckLakeTransaction &transaction,
+	                                    RenameColumnInfo &info);
+	unique_ptr<CatalogEntry> AlterTable(ClientContext &context, DuckLakeTransaction &transaction, AddColumnInfo &info);
 	unique_ptr<CatalogEntry> AlterTable(DuckLakeTransaction &transaction, RemoveColumnInfo &info);
 	unique_ptr<CatalogEntry> AlterTable(DuckLakeTransaction &transaction, ChangeColumnTypeInfo &info);
 	unique_ptr<CatalogEntry> AlterTable(DuckLakeTransaction &transaction, AddFieldInfo &info);

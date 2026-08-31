@@ -34,6 +34,14 @@ enum class CompactionType {
 	REWRITE_DELETES        // Rewrite deletes that delete more than a % of the table, might also do merge of files.
 };
 
+inline const char *CompactionTypeToString(CompactionType type) {
+	return type == CompactionType::REWRITE_DELETES ? "rewrite_delete" : "merge_adjacent";
+}
+
+inline CompactionType CompactionTypeFromString(const string &str) {
+	return str == "rewrite_delete" ? CompactionType::REWRITE_DELETES : CompactionType::MERGE_ADJACENT_TABLES;
+}
+
 enum class CleanupType {
 	OLD_FILES,     // If the files are old, e.g., from an expired snapshot and can now be removed.
 	ORPHANED_FILES // If the file is an orphan e.g., the file was generated but never committed to the catalog
@@ -152,6 +160,7 @@ struct DuckLakeFileInfo {
 	idx_t row_count;
 	idx_t file_size_bytes;
 	optional_idx footer_size;
+	optional_idx row_group_count;
 	optional_idx row_id_start;
 	optional_idx partition_id;
 	optional_idx begin_snapshot;
@@ -190,6 +199,7 @@ struct DuckLakeDeleteFileInfo {
 	idx_t delete_count;
 	idx_t file_size_bytes;
 	idx_t footer_size;
+	optional_idx row_group_count;
 	string encryption_key;
 	optional_idx begin_snapshot;
 	//! Optional max_snapshot information for partial deletion files.
@@ -297,10 +307,17 @@ struct DuckLakeSnapshotInfo {
 	idx_t id;
 	timestamp_tz_t time;
 	idx_t schema_version;
+	idx_t next_file_id;
 	SnapshotChangeInfo change_info;
 	Value author;
 	Value commit_message;
 	Value commit_extra_info;
+};
+
+struct DuckLakeViewColumnTag {
+	string column_name;
+	string key;
+	Value value;
 };
 
 struct DuckLakeViewInfo {
@@ -312,6 +329,14 @@ struct DuckLakeViewInfo {
 	vector<string> column_aliases;
 	string sql;
 	vector<DuckLakeTag> tags;
+	vector<DuckLakeViewColumnTag> column_tags;
+};
+
+struct DuckLakeViewColumnTagInfo {
+	TableIndex view_id;
+	string column_name;
+	string key;
+	Value value;
 };
 
 struct DuckLakeTagInfo {
@@ -447,10 +472,14 @@ struct DuckLakeCompactionFileEntry {
 	vector<DuckLakeCompactionDeleteFileData> delete_files;
 	optional_idx max_partial_file_snapshot;
 	idx_t schema_version;
+	//! Snapshot and schema version used to resolve the file's partition spec.
+	optional_idx partition_snapshot_id;
+	optional_idx partition_schema_version;
 	//! Inlined file deletions stored in the metadata database rather than delete files.
 	set<idx_t> inlined_file_deletions;
 	//! Whether this file has any inlined deletions (cheap flag; set for all compaction types).
 	bool has_inlined_deletions = false;
+	double delete_ratio = 0;
 };
 
 struct DuckLakeRewriteFileEntry {
@@ -462,7 +491,7 @@ struct DuckLakeRewriteFileEntry {
 
 struct DuckLakeCompactionEntry {
 	vector<DuckLakeCompactionFileEntry> source_files;
-	DuckLakeDataFile written_file;
+	vector<DuckLakeDataFile> written_files;
 	optional_idx row_id_start;
 	CompactionType type;
 };
@@ -482,15 +511,18 @@ struct DuckLakeCompactedFileInfo {
 };
 
 struct DuckLakeMergeAdjacentOptions {
-	uint64_t max_files;
 	optional_idx min_file_size;
 	optional_idx max_file_size;
+	//! If set, only files written at or after this timestamp are considered for compaction
+	Value newer_than;
 };
 
 struct DuckLakeFileSizeOptions {
 	optional_idx min_file_size;
 	optional_idx max_file_size;
 	idx_t target_file_size;
+	//! If set, only files written at or after this timestamp are considered for compaction
+	Value newer_than;
 };
 
 struct DuckLakeTableSizeInfo {

@@ -1,5 +1,11 @@
 # VENDORED COPY of duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml
 # Source SHA: 344397bb848aac786d260daf396ad09fc6a1d21f (v1.5.2)
+# with the following changes ported from v1.5-variegata (72e76e99):
+#   - macos job runs-on from matrix.runner
+#   - Windows CC/CXX default to cl (MSVC) instead of empty (fixes
+#     MSVC/MinGW mixed link of vcpkg-built libs)
+#   - vcvars resolution with VS 2022/18 fallback
+#   - emscripten-core/setup-emsdk action (moved from mymindstorm org)
 # Reason: PostHog org policy requires all action uses to be pinned to full
 # commit SHAs, which the upstream copy of this reusable workflow violates.
 # To update: re-run scripts/vendor-extension-ci-tools.sh (or equivalent) to
@@ -558,7 +564,7 @@ jobs:
 
   macos:
     name: MacOS
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     needs:
@@ -861,8 +867,8 @@ jobs:
       # Misc
       BUILD_SHELL: ${{ inputs.build_duckdb_shell && '1' || '0' }}
       DUCKDB_PLATFORM: ${{ matrix.duckdb_arch }}
-      CC: ${{ (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw') && 'gcc' || '' }}
-      CXX: ${{ (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw') && 'g++' || '' }}
+      CC: ${{ (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw') && 'gcc' || 'cl' }}
+      CXX: ${{ (matrix.duckdb_arch == 'windows_amd64_rtools' || matrix.duckdb_arch == 'windows_amd64_mingw') && 'g++' || 'cl' }}
       GEN: ninja
 
     steps:
@@ -1060,12 +1066,21 @@ jobs:
           BUILD_TYPE_INPUT: ${{ inputs.build_type }}
         shell: cmd
         run: |
+          setlocal EnableDelayedExpansion
           if "%DUCKDB_PLATFORM_RTOOLS%" == "0" (
+            set "VCVARS_BAT="
             if "%DUCKDB_PLATFORM%" == "windows_amd64" (
-              call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+              set "VCVARS_BAT=vcvars64.bat"
             )
             if "%DUCKDB_PLATFORM%" == "windows_arm64" (
-              call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsarm64.bat"
+              set "VCVARS_BAT=vcvarsarm64.bat"
+            )
+            if defined VCVARS_BAT (
+              if exist "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\!VCVARS_BAT!" (
+                call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\!VCVARS_BAT!"
+              ) else (
+                call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\!VCVARS_BAT!"
+              )
             )
             REM Rename link.exe to link-git.exe to avoid conflicts with git supplied linker.
             mv "C:\Program Files\Git\usr\bin\link.exe" "C:\Program Files\Git\usr\bin\link-git.exe"
@@ -1213,7 +1228,7 @@ jobs:
         run: |
           DUCKDB_TAG="$DUCKDB_TAG_INPUT" make set_duckdb_tag
 
-      - uses: mymindstorm/setup-emsdk@d233ac12b0102f74ca199f5dad7a4e2c13a8a745 # v13
+      - uses: emscripten-core/setup-emsdk@d233ac12b0102f74ca199f5dad7a4e2c13a8a745 # v13
         with:
           version: 3.1.71
 

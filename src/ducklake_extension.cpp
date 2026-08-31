@@ -1,4 +1,5 @@
 #include "ducklake_extension.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -37,6 +38,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          Value::UBIGINT(10), nullptr, SetScope::GLOBAL);
 	config.AddExtensionOption("ducklake_default_version", "Default DuckLake version for new catalogs",
 	                          LogicalType::VARCHAR, Value(), nullptr, SetScope::GLOBAL);
+	auto set_target_file_size = [](ClientContext &, SetScope, Value &parameter) {
+		if (!parameter.IsNull() && !parameter.ToString().empty()) {
+			DBConfig::ParseMemoryLimit(parameter.ToString());
+		}
+	};
+	config.AddExtensionOption("ducklake_target_file_size", "Target file size for insertion and compaction",
+	                          LogicalType::VARCHAR, Value(), set_target_file_size, SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "ducklake_write_deletion_vectors",
 	    "[EXPERIMENTAL] Write Iceberg V3 deletion vectors (puffin) instead of positional delete files (parquet)",
@@ -98,6 +106,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	DuckLakeSettingsFunction settings;
 	loader.RegisterFunction(settings);
+
+	DuckLakeCommitFunction commit;
+	loader.RegisterFunction(commit);
 
 	// Register ducklake_scan so it can be found during deserialization
 	auto ducklake_scan = DuckLakeFunctions::GetDuckLakeScanFunction(loader.GetDatabaseInstance());

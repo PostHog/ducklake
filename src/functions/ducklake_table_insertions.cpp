@@ -1,4 +1,5 @@
 #include "functions/ducklake_table_functions.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "common/ducklake_util.hpp"
 #include "storage/ducklake_transaction_changes.hpp"
@@ -21,7 +22,11 @@ TableCatalogEntry &GetTableEntry(ClientContext &context, Catalog &catalog, const
 		throw BinderException("Schema cannot be NULL");
 	}
 	auto schema_name = schema.GetValue<string>();
-	auto entry = catalog.GetEntry(context, schema_name, lookup, OnEntryNotFound::THROW_EXCEPTION);
+	auto entry = catalog.GetEntry(context, Identifier(schema_name), lookup, OnEntryNotFound::THROW_EXCEPTION);
+	if (entry->type != CatalogType::TABLE_ENTRY) {
+		throw BinderException("\"%s\" is a %s, not a table. Data change feed functions only support tables.",
+		                      lookup.GetEntryName(), CatalogTypeToString(entry->type));
+	}
 	return entry->Cast<TableCatalogEntry>();
 }
 
@@ -40,14 +45,14 @@ BoundAtClause AtClauseFromValue(const Value &input) {
 }
 
 static unique_ptr<FunctionData> DuckLakeTableChangesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names,
+                                                         vector<LogicalType> &return_types, vector<Identifier> &names,
                                                          DuckLakeScanType scan_type) {
 	auto start_at_clause = AtClauseFromValue(input.inputs[3]);
 	auto end_at_clause = AtClauseFromValue(input.inputs[4]);
 
 	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]);
 	auto table_name = GetTableName(input.inputs[2]);
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table_name, end_at_clause, QueryErrorContext());
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, Identifier(table_name), end_at_clause, QueryErrorContext());
 	auto &table = GetTableEntry(context, catalog, lookup, input.inputs[1]);
 	auto &transaction = DuckLakeTransaction::Get(context, catalog);
 
@@ -55,7 +60,7 @@ static unique_ptr<FunctionData> DuckLakeTableChangesBind(ClientContext &context,
 	input.table_function = table.GetScanFunction(context, bind_data, lookup);
 
 	auto &function_info = input.table_function.function_info->Cast<DuckLakeFunctionInfo>();
-	names = function_info.column_names;
+	names = StringsToIdentifiers(function_info.column_names);
 	return_types = function_info.column_types;
 	function_info.start_snapshot =
 	    make_uniq<DuckLakeSnapshot>(transaction.GetSnapshot(start_at_clause, SnapshotBound::LOWER_BOUND));
@@ -64,12 +69,14 @@ static unique_ptr<FunctionData> DuckLakeTableChangesBind(ClientContext &context,
 }
 
 static unique_ptr<FunctionData> DuckLakeTableInsertionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                            vector<LogicalType> &return_types, vector<string> &names) {
+                                                            vector<LogicalType> &return_types,
+                                                            vector<Identifier> &names) {
 	return DuckLakeTableChangesBind(context, input, return_types, names, DuckLakeScanType::SCAN_INSERTIONS);
 }
 
 static unique_ptr<FunctionData> DuckLakeTableDeletionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                                           vector<LogicalType> &return_types,
+                                                           vector<Identifier> &names) {
 	return DuckLakeTableChangesBind(context, input, return_types, names, DuckLakeScanType::SCAN_DELETIONS);
 }
 
