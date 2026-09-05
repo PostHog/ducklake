@@ -6,6 +6,12 @@ control plane. Companion docs in this directory:
 
 - [ducklake-api-map.md](ducklake-api-map.md) — every API the DuckLake extension + pyducklake
   expose today, what it does, what's wrong with it.
+- [iceberg-federation.md](iceberg-federation.md) — what v1 must get
+  right for the Iceberg REST facade to work (field IDs, transforms,
+  delete encoding, stats bounds, metadata artifacts).
+- [trino-integration.md](trino-integration.md) — Trino as the facade's
+  first consumer, and the commit-shape choices that keep append-only
+  Trino writes a translation away.
 - [metadata-schema.md](metadata-schema.md) — the current `ducklake_*` metadata schema, its
   invariants, and the migration story (current: none).
 
@@ -327,7 +333,7 @@ Not decided; criteria that matter, given the above:
 
 | Criterion | JVM | Rust | Go |
 |---|---|---|---|
-| Parquet write quality | parquet-java (the pain you know) | arrow-rs/parquet-rs: excellent | weakest of the three |
+| Parquet write quality | parquet-java (the pain you know); **[Hardwood](https://github.com/hardwood-hq/hardwood) to investigate** — modern minimal-dependency parquet reader/writer (no Hadoop/Avro tree, multithreaded, GraalVM-ready; 1.1.0.Beta1 as of 2026-08) | arrow-rs/parquet-rs: excellent | weakest of the three |
 | Iceberg REST facade leverage | iceberg-java: best | iceberg-rust: maturing | iceberg-go: partial |
 | Trino affinity (future native connector) | native | via REST only | via REST only |
 | Postgres story | mature | sqlx/tokio-postgres: mature | mature |
@@ -338,6 +344,18 @@ Note the escape hatch: if the server never touches parquet bytes
 protocol above), the JVM's parquet weakness mostly stops mattering,
 and the language choice becomes an API-server choice. That argues for
 deciding the commit protocol *before* the language.
+
+On the JVM-and-Arrow question specifically (2026-09-04 assessment):
+there is no meaningful *performance* penalty for the architecture as
+designed. Arrow Java stores data off-heap (no GC tax on the data
+plane) and Flight/IPC serving from the JVM runs at wire speed. The
+real costs are (1) ergonomics — reference-counted buffers with manual
+close discipline, `--add-opens` module flags, allocator tuning; (2)
+arrow-java is a container/interchange library with thin compute
+kernels vs arrow-rs — fine while the server shovels Arrow rather than
+computing over it; (3) parquet-java, which the footer-shipping commit
+protocol confines to footer parsing during hydration (thrift metadata
+decode, not data pages) — and which Hardwood may replace outright.
 
 ## Phases
 
