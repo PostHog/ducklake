@@ -1,0 +1,9 @@
+build/
+.gradle/
+.kotlin/
+*.log
+.flox/run/
+.flox/cache/
+.flox/lib/
+.flox/log/
+.flox/telemetry_id

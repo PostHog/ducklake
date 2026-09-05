@@ -1,0 +1,553 @@
+openapi: 3.0.3
+info:
+  title: hoglake
+  version: 0.1.0
+  description: |
+    The hoglake control plane: a Postgres-native lakehouse catalog.
+    Clients never touch the backing Postgres; parquet lives in object
+    storage and is written by clients, registered here via
+    footer-shipping commits. Append-only v1: no delete files, no
+    row-level mutation. Auth is out of scope for v1.
+servers:
+  - url: /v1
+paths:
+  /catalogs:
+    get:
+      operationId: listCatalogs
+      summary: List catalogs
+      responses:
+        "200":
+          description: Catalogs
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Catalog" }
+    post:
+      operationId: createCatalog
+      summary: Create a catalog
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateCatalogRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Catalog" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /catalogs/{catalog}:
+    get:
+      operationId: getCatalog
+      summary: Catalog info (head snapshot, schema version, data path)
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Catalog
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Catalog" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/namespaces:
+    get:
+      operationId: listNamespaces
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Namespaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Namespace" }
+    post:
+      operationId: createNamespace
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables:
+    get:
+      operationId: listTables
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: Tables (live at head)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TableSummary" }
+    post:
+      operationId: createTable
+      summary: Create a table (DDL commit; produces a snapshot)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTableRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Table" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}:
+    get:
+      operationId: getTable
+      summary: Table schema, identity, and stats (optionally at a snapshot)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - { $ref: "#/components/parameters/snapshot" }
+      responses:
+        "200":
+          description: Table
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Table" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: dropTable
+      summary: Drop a table (DDL commit; produces a snapshot)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+      responses:
+        "200":
+          description: Dropped; returns the snapshot that recorded it
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
+    get:
+      operationId: listFiles
+      summary: Physical files backing the table at a snapshot (read planning)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - { $ref: "#/components/parameters/snapshot" }
+      responses:
+        "200":
+          description: Files
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DataFile" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/changes:
+    get:
+      operationId: getChanges
+      summary: >
+        Changefeed plan: files + row-id ranges for rows appended in
+        (from_snapshot, to_snapshot]. Metadata only; the client reads the
+        parquet itself. Append-only v1: insertions only.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - name: from_snapshot
+          in: query
+          required: true
+          schema: { type: integer, format: int64 }
+        - name: to_snapshot
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Change plan
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangePlan" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410":
+          description: Range no longer available (expired below from_snapshot)
+
+  /catalogs/{catalog}/snapshots:
+    get:
+      operationId: listSnapshots
+      summary: Snapshots, paginated (never the full catalog in one response)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: after
+          in: query
+          description: Return snapshots with id > after
+          schema: { type: integer, format: int64, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 1000, maximum: 10000 }
+      responses:
+        "200":
+          description: Snapshot page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotPage" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/commit:
+    post:
+      operationId: commit
+      summary: >
+        The append commit: register client-written parquet files with
+        footer-derived stats. record_count is mandatory per file (row-id
+        range assignment); column stats may be omitted (stats_mode=deferred)
+        and are then hydrated asynchronously.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CommitRequest" }
+      responses:
+        "200":
+          description: Committed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "409":
+          description: >
+            Commit conflict (concurrent DDL on a touched table). The
+            client refreshes its read snapshot and retries.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "422":
+          description: Validation failure (unknown table, bad stats shape,
+            unknown field ids)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/consumers/{consumer}/offsets:
+    get:
+      operationId: listConsumerOffsets
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/consumer" }
+      responses:
+        "200":
+          description: Offsets for this consumer
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ConsumerOffset" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/consumers/{consumer}/offsets/{tableUuid}:
+    put:
+      operationId: commitConsumerOffset
+      summary: >
+        Commit a consumer offset. Monotonic: a snapshot below the stored
+        offset is rejected with 409.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/consumer" }
+        - name: tableUuid
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [snapshot_id]
+              properties:
+                snapshot_id: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsumerOffset" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+components:
+  parameters:
+    catalog:
+      name: catalog
+      in: path
+      required: true
+      schema: { type: string }
+    namespace:
+      name: namespace
+      in: path
+      required: true
+      schema: { type: string }
+    table:
+      name: table
+      in: path
+      required: true
+      schema: { type: string }
+    consumer:
+      name: consumer
+      in: path
+      required: true
+      schema: { type: string }
+    snapshot:
+      name: snapshot
+      in: query
+      required: false
+      description: Time travel; defaults to head.
+      schema: { type: integer, format: int64 }
+
+  responses:
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    Conflict:
+      description: Conflict
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+
+  schemas:
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        detail: { type: string }
+
+    Catalog:
+      type: object
+      required: [name, data_path, head_snapshot_id, schema_version]
+      properties:
+        name: { type: string }
+        data_path: { type: string }
+        head_snapshot_id: { type: integer, format: int64 }
+        schema_version: { type: integer, format: int64 }
+
+    CreateCatalogRequest:
+      type: object
+      required: [name, data_path]
+      properties:
+        name: { type: string }
+        data_path: { type: string }
+
+    Namespace:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+
+    ColumnDef:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string }
+        type:
+          type: string
+          enum: [boolean, int, long, float, double, decimal, date, time,
+                 timestamp, timestamptz, string, uuid, binary]
+        type_params:
+          type: object
+          additionalProperties: true
+        nullable: { type: boolean, default: true }
+
+    Column:
+      allOf:
+        - $ref: "#/components/schemas/ColumnDef"
+        - type: object
+          required: [field_id, ordinal]
+          properties:
+            field_id: { type: integer, format: int64 }
+            ordinal: { type: integer }
+
+    CreateTableRequest:
+      type: object
+      required: [name, columns]
+      properties:
+        name: { type: string }
+        columns:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/ColumnDef" }
+
+    TableSummary:
+      type: object
+      required: [name, table_uuid]
+      properties:
+        name: { type: string }
+        table_uuid: { type: string, format: uuid }
+
+    Table:
+      type: object
+      required: [name, namespace, table_uuid, columns, record_count,
+                 file_count, file_size_bytes]
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        table_uuid: { type: string, format: uuid }
+        columns:
+          type: array
+          items: { $ref: "#/components/schemas/Column" }
+        record_count: { type: integer, format: int64 }
+        file_count: { type: integer, format: int64 }
+        file_size_bytes: { type: integer, format: int64 }
+
+    ColumnStats:
+      type: object
+      required: [field_id, value_count, null_count]
+      properties:
+        field_id: { type: integer, format: int64 }
+        value_count: { type: integer, format: int64 }
+        null_count: { type: integer, format: int64 }
+        nan_count: { type: integer, format: int64 }
+        size_bytes: { type: integer, format: int64 }
+        lower_bound:
+          type: string
+          format: byte
+          description: Iceberg single-value binary serialization, base64.
+        upper_bound:
+          type: string
+          format: byte
+
+    FileRegistration:
+      type: object
+      required: [path, record_count, file_size_bytes]
+      properties:
+        path: { type: string, description: Absolute object-store URI }
+        record_count: { type: integer, format: int64 }
+        file_size_bytes: { type: integer, format: int64 }
+        footer_size: { type: integer, format: int64 }
+        column_stats:
+          type: array
+          description: Omit for deferred stats (file registers as pending).
+          items: { $ref: "#/components/schemas/ColumnStats" }
+
+    TableAppend:
+      type: object
+      required: [namespace, table, files]
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        files:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/FileRegistration" }
+
+    CommitRequest:
+      type: object
+      required: [appends]
+      properties:
+        read_snapshot:
+          type: integer
+          format: int64
+          description: >
+            The snapshot the writer planned against. Conflicts are
+            evaluated against changes after this point. Defaults to head
+            (no conflict window) for blind appends.
+        appends:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/TableAppend" }
+        author: { type: string }
+        message: { type: string }
+
+    CommitResult:
+      type: object
+      required: [snapshot_id]
+      properties:
+        snapshot_id: { type: integer, format: int64 }
+        schema_version: { type: integer, format: int64 }
+
+    DataFile:
+      type: object
+      required: [data_file_id, path, file_format, record_count,
+                 file_size_bytes, row_id_start, stats_state, begin_snapshot]
+      properties:
+        data_file_id: { type: integer, format: int64 }
+        path: { type: string }
+        file_format: { type: string }
+        record_count: { type: integer, format: int64 }
+        file_size_bytes: { type: integer, format: int64 }
+        footer_size: { type: integer, format: int64 }
+        row_id_start: { type: integer, format: int64 }
+        stats_state: { type: string, enum: [provided, pending, failed] }
+        begin_snapshot: { type: integer, format: int64 }
+
+    ChangePlan:
+      type: object
+      required: [table_uuid, from_snapshot, to_snapshot, files]
+      properties:
+        table_uuid: { type: string, format: uuid }
+        from_snapshot: { type: integer, format: int64 }
+        to_snapshot: { type: integer, format: int64 }
+        files:
+          type: array
+          items: { $ref: "#/components/schemas/DataFile" }
+
+    Snapshot:
+      type: object
+      required: [snapshot_id, snapshot_time, schema_version]
+      properties:
+        snapshot_id: { type: integer, format: int64 }
+        snapshot_time: { type: string, format: date-time }
+        schema_version: { type: integer, format: int64 }
+        author: { type: string }
+        message: { type: string }
+        changes:
+          type: array
+          items:
+            type: object
+            required: [kind]
+            properties:
+              kind: { type: string }
+              object_id: { type: integer, format: int64 }
+
+    SnapshotPage:
+      type: object
+      required: [snapshots, has_more]
+      properties:
+        snapshots:
+          type: array
+          items: { $ref: "#/components/schemas/Snapshot" }
+        has_more: { type: boolean }
+
+    ConsumerOffset:
+      type: object
+      required: [consumer_id, table_uuid, committed_snapshot, updated_at]
+      properties:
+        consumer_id: { type: string }
+        table_uuid: { type: string, format: uuid }
+        committed_snapshot: { type: integer, format: int64 }
+        updated_at: { type: string, format: date-time }

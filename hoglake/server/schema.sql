@@ -1,0 +1,205 @@
+-- Canonical hoglake schema: the complete desired state (README.md,
+-- schema/migrations mechanism). CI asserts fold(migrations) == this file.
+
+--
+-- Design positions this encodes (see hoglake/README.md):
+--  * Real integrity: PKs, FKs with ON DELETE CASCADE, NOT NULL where the
+--    code assumes it, partial indexes for the hot predicates.
+--  * Versioned-row pattern where time travel needs it: a row is visible
+--    at snapshot S iff begin_snapshot <= S AND (end_snapshot IS NULL OR
+--    S < end_snapshot).
+--  * Identity vs. version split: hog_table is the immutable identity
+--    (table_id, table_uuid); hog_table_version carries the mutable,
+--    versioned bits (name, namespace).
+--  * Id allocation: per-catalog counters on hog_catalog / hog_table,
+--    advanced inside the serialized commit tail (advisory xact lock), so
+--    ids are dense and ordered with commit order.
+--  * Typed conflict vocabulary: hog_snapshot_change replaces DuckLake's
+--    comma-encoded changes_made string.
+--  * No inlined data, no delete files (v1 is append-only), no macros,
+--    views, or tags yet.
+
+CREATE TABLE hog_catalog (
+    catalog_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name             text NOT NULL UNIQUE CHECK (name ~ '^[a-z][a-z0-9_-]{0,62}$'),
+    data_path        text NOT NULL,
+    -- Allocators, advanced only inside the commit tail / DDL txn.
+    last_snapshot_id bigint NOT NULL DEFAULT 0,
+    schema_version   bigint NOT NULL DEFAULT 0,
+    next_table_id    bigint NOT NULL DEFAULT 1,
+    next_file_id     bigint NOT NULL DEFAULT 1,
+    next_namespace_id bigint NOT NULL DEFAULT 1,
+    created_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE hog_snapshot (
+    catalog_id     bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
+    snapshot_id    bigint NOT NULL,
+    snapshot_time  timestamptz NOT NULL DEFAULT now(),
+    schema_version bigint NOT NULL,
+    author         text,
+    commit_message text,
+    PRIMARY KEY (catalog_id, snapshot_id)
+);
+
+-- Typed change vocabulary. kind is closed: conflict detection joins on it.
+CREATE TABLE hog_snapshot_change (
+    catalog_id  bigint NOT NULL,
+    snapshot_id bigint NOT NULL,
+    kind        text   NOT NULL CHECK (kind IN (
+                    'namespace_created', 'namespace_dropped',
+                    'table_created', 'table_dropped', 'table_altered',
+                    'table_inserted_into')),
+    object_id   bigint,  -- table_id or namespace_id; NULL only for catalog-level kinds
+    FOREIGN KEY (catalog_id, snapshot_id)
+        REFERENCES hog_snapshot ON DELETE CASCADE
+);
+-- The conflict check: changes of these kinds against this object since my
+-- read snapshot. One indexed anti-join, never a string parse.
+CREATE INDEX hog_snapshot_change_conflict
+    ON hog_snapshot_change (catalog_id, object_id, kind, snapshot_id);
+CREATE INDEX hog_snapshot_change_by_snapshot
+    ON hog_snapshot_change (catalog_id, snapshot_id);
+
+-- Namespaces are not snapshot-versioned in v1: rename is disallowed,
+-- drop requires emptiness (live-table check in the service).
+CREATE TABLE hog_namespace (
+    catalog_id   bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
+    namespace_id bigint NOT NULL,
+    name         text NOT NULL,
+    dropped      boolean NOT NULL DEFAULT false,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (catalog_id, namespace_id)
+);
+CREATE UNIQUE INDEX hog_namespace_live_name
+    ON hog_namespace (catalog_id, name) WHERE NOT dropped;
+
+-- Immutable table identity. table_uuid is the contract consumers key
+-- cursors to: it survives rename, changes on drop+recreate.
+CREATE TABLE hog_table (
+    catalog_id    bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
+    table_id      bigint NOT NULL,
+    table_uuid    uuid   NOT NULL DEFAULT gen_random_uuid(),
+    created_snapshot bigint NOT NULL,
+    dropped_snapshot bigint,
+    next_field_id bigint NOT NULL DEFAULT 1,
+    PRIMARY KEY (catalog_id, table_id),
+    UNIQUE (catalog_id, table_uuid)
+);
+
+-- Versioned mutable bits of a table (name, namespace).
+CREATE TABLE hog_table_version (
+    catalog_id     bigint NOT NULL,
+    table_id       bigint NOT NULL,
+    begin_snapshot bigint NOT NULL,
+    end_snapshot   bigint,
+    namespace_id   bigint NOT NULL,
+    name           text   NOT NULL,
+    PRIMARY KEY (catalog_id, table_id, begin_snapshot),
+    FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
+    FOREIGN KEY (catalog_id, namespace_id) REFERENCES hog_namespace,
+    CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
+);
+CREATE UNIQUE INDEX hog_table_version_live_name
+    ON hog_table_version (catalog_id, namespace_id, name)
+    WHERE end_snapshot IS NULL;
+CREATE INDEX hog_table_version_live
+    ON hog_table_version (catalog_id, table_id) WHERE end_snapshot IS NULL;
+
+-- Versioned column definitions. field_id is the stable identity embedded
+-- in parquet files (PARQUET:field_id) — see iceberg-federation.md.
+CREATE TABLE hog_column (
+    catalog_id     bigint NOT NULL,
+    table_id       bigint NOT NULL,
+    field_id       bigint NOT NULL,
+    begin_snapshot bigint NOT NULL,
+    end_snapshot   bigint,
+    name           text   NOT NULL,
+    -- Closed type set: every member has a defined Iceberg mapping
+    -- (iceberg-federation.md §2). Extend by migration, never ad hoc.
+    col_type       text   NOT NULL CHECK (col_type IN (
+                       'boolean', 'int', 'long', 'float', 'double',
+                       'decimal', 'date', 'time', 'timestamp',
+                       'timestamptz', 'string', 'uuid', 'binary')),
+    type_params    jsonb,          -- e.g. {"precision":38,"scale":9} for decimal
+    nullable       boolean NOT NULL DEFAULT true,
+    ordinal        int    NOT NULL,
+    PRIMARY KEY (catalog_id, table_id, field_id, begin_snapshot),
+    FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
+    CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
+);
+CREATE INDEX hog_column_live
+    ON hog_column (catalog_id, table_id) WHERE end_snapshot IS NULL;
+
+-- Table-level rollup + the row-id allocator. One row per table, created
+-- with the table.
+CREATE TABLE hog_table_stats (
+    catalog_id      bigint NOT NULL,
+    table_id        bigint NOT NULL,
+    record_count    bigint NOT NULL DEFAULT 0,
+    file_size_bytes bigint NOT NULL DEFAULT 0,
+    next_row_id     bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (catalog_id, table_id),
+    FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE
+);
+
+-- The file manifest. Append-only v1: files are never end-snapshotted by
+-- deletes, only (later) by compaction/expiry.
+CREATE TABLE hog_data_file (
+    catalog_id      bigint NOT NULL,
+    data_file_id    bigint NOT NULL,
+    table_id        bigint NOT NULL,
+    begin_snapshot  bigint NOT NULL,
+    end_snapshot    bigint,
+    path            text   NOT NULL,   -- absolute object-store URI; no relative chains
+    file_format     text   NOT NULL DEFAULT 'parquet'
+                    CHECK (file_format IN ('parquet')),
+    record_count    bigint NOT NULL CHECK (record_count >= 0),
+    file_size_bytes bigint NOT NULL CHECK (file_size_bytes >= 0),
+    footer_size     bigint,
+    row_id_start    bigint NOT NULL,   -- lineage guarantee: always assigned at commit
+    -- Deferred-stats mode: 'pending' files are never pruned; the hydrator
+    -- flips them to 'provided' or 'failed'.
+    stats_state     text   NOT NULL DEFAULT 'provided'
+                    CHECK (stats_state IN ('provided', 'pending', 'failed')),
+    PRIMARY KEY (catalog_id, data_file_id),
+    FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
+    CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
+);
+CREATE INDEX hog_data_file_live
+    ON hog_data_file (catalog_id, table_id, begin_snapshot)
+    WHERE end_snapshot IS NULL;
+CREATE INDEX hog_data_file_pending
+    ON hog_data_file (catalog_id, data_file_id)
+    WHERE stats_state = 'pending';
+
+-- Per-file, per-column zone maps. Bounds are stored in Iceberg
+-- single-value binary serialization (opaque to Postgres) so manifest
+-- generation for the facade is a mechanical re-encode.
+CREATE TABLE hog_file_column_stats (
+    catalog_id   bigint NOT NULL,
+    data_file_id bigint NOT NULL,
+    field_id     bigint NOT NULL,
+    value_count  bigint NOT NULL CHECK (value_count >= 0),
+    null_count   bigint NOT NULL CHECK (null_count >= 0),
+    nan_count    bigint,
+    size_bytes   bigint,
+    lower_bound  bytea,
+    upper_bound  bytea,
+    PRIMARY KEY (catalog_id, data_file_id, field_id),
+    FOREIGN KEY (catalog_id, data_file_id)
+        REFERENCES hog_data_file ON DELETE CASCADE
+);
+
+-- Log primitives: per-consumer committed offsets, keyed by table_uuid so
+-- an incarnation change is visible to the consumer, not deduced.
+CREATE TABLE hog_consumer_offset (
+    catalog_id         bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
+    consumer_id        text   NOT NULL CHECK (length(consumer_id) BETWEEN 1 AND 128),
+    table_uuid         uuid   NOT NULL,
+    committed_snapshot bigint NOT NULL,
+    updated_at         timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (catalog_id, consumer_id, table_uuid)
+);
+CREATE INDEX hog_consumer_offset_retention_floor
+    ON hog_consumer_offset (catalog_id, committed_snapshot);
