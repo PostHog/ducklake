@@ -1,10 +1,9 @@
-# GAMEPLAN.md — hoglake
+# README.md — hoglake
 
 2026-09-04. The plan for building hoglake: a DuckLake-shaped lakehouse
 catalog rebuilt as a Postgres-native service behind a Lakekeeper-style
 control plane. Companion docs in this directory:
 
-- [plan.md](plan.md) — the ground rules (source of truth for scope).
 - [ducklake-api-map.md](ducklake-api-map.md) — every API the DuckLake extension + pyducklake
   expose today, what it does, what's wrong with it.
 - [metadata-schema.md](metadata-schema.md) — the current `ducklake_*` metadata schema, its
@@ -374,7 +373,7 @@ deciding the commit protocol *before* the language.
    parity) before the duckling flips. Fork enters maintenance-only
    mode at phase 5, dies after 7.
 
-## Decisions (2026-09-04, from plan.md)
+## Decisions (2026-09-04)
 
 - **Inlined data: DROPPED from v1** — consequences folded into the
   schema section above. Refinement (same day): if inlining ever
