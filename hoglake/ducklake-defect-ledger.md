@@ -40,8 +40,8 @@ cycles run. This is also the only GC site for inline tables.
 only ever drop the 825 superseded entries; the 111,694 single-version
 inline tables are structurally invisible.
 
-**→ Hoglake correction**: inlining is **dropped entirely** (GAMEPLAN
-Decisions, 2026-09-04). No dynamic per-schema-version tables exist, so
+**→ Hoglake correction**: inlining is **dropped entirely**
+([README.md](README.md) Decisions, 2026-09-04). No dynamic per-schema-version tables exist, so
 neither the GC bug nor the registry walk is representable. Migration
 flushes residual inlined rows to parquet once, at cutover.
 
@@ -71,7 +71,8 @@ FIRST mismatch); `work_mem=512MB` halves server time at best. The real
 fix is the write-set filter.
 
 **→ Hoglake correction**: commit is a server-side operation scoped to
-the write set by construction (GAMEPLAN, commit protocol). A
+the write set by construction ([README.md](README.md), commit
+protocol). A
 catalog-global load on the commit path is not an optimization target —
 it is structurally impossible to write, and commit admission (§7 of the
 experience record) bounds what concurrent load can do to latency.

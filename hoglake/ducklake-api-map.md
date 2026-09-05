@@ -2,7 +2,7 @@
 
 Survey of the PostHog fork (`~/src/hoglake`, merged with upstream main @
 2026-08-26) for the hoglake control-plane design. Companion to
-[pyducklake-api-map.md](pyducklake-api-map.md) and [GAMEPLAN.md](GAMEPLAN.md). Paths are repo-relative.
+[pyducklake-api-map.md](pyducklake-api-map.md) and [README.md](README.md). Paths are repo-relative.
 
 Registration entry point: [`src/ducklake_extension.cpp:20`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/ducklake_extension.cpp#L20)
 (`LoadInternal`). Everything a SQL client can reach is one of: (a) a

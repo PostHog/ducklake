@@ -2,7 +2,7 @@
 
 Survey of the catalog schema as defined in the fork source, for the
 hoglake design. Companion to [ducklake-api-map.md](ducklake-api-map.md),
-[pyducklake-api-map.md](pyducklake-api-map.md), [GAMEPLAN.md](GAMEPLAN.md).
+[pyducklake-api-map.md](pyducklake-api-map.md), [README.md](README.md).
 
 Source of truth: [`src/storage/ducklake_metadata_manager.cpp`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp)
 (`GetCreateTableStatements`, lines 237–310) plus the v1.1 overlay in
@@ -286,5 +286,5 @@ drains the deletion queue (`:5017`, `:5158`).
 - The dynamic per-schema-version inlined-data tables are the schema's
   biggest wart (the 112K-table registry incident). DECIDED 2026-09-04:
   inlining is dropped from hoglake entirely; migration flushes any
-  residual inlined rows to parquet at cutover (see [GAMEPLAN.md](GAMEPLAN.md)
+  residual inlined rows to parquet at cutover (see [README.md](README.md)
   Decisions).

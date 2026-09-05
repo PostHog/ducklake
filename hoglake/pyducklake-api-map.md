@@ -2,7 +2,7 @@
 
 Survey of the installed client (`pyducklake-1.0.18`, from viaduck's venv)
 for the hoglake control-plane design. Companion to [ducklake-api-map.md](ducklake-api-map.md)
-(the extension surface) and [GAMEPLAN.md](GAMEPLAN.md). Line pointers are relative to
+(the extension surface) and [README.md](README.md). Line pointers are relative to
 the installed package; caller-side pointers are into `~/src/viaduck`.
 
 Note: [`__init__.py:116`](https://github.com/jghoman/pyducklake/blob/v1.0.18/src/pyducklake/__init__.py#L116) still declares `__version__ = "0.1.0"` — the
