@@ -1,4 +1,4 @@
-# GAMEPLAN.md — hoglake
+# README.md — hoglake
 
 2026-09-04. The plan for building hoglake: a DuckLake-shaped lakehouse
 catalog rebuilt as a Postgres-native service behind a Lakekeeper-style
