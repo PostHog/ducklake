@@ -2,6 +2,7 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.service.CatalogService
+import com.posthog.hoglake.service.ScanService
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
@@ -156,6 +157,26 @@ fun Application.installApiRoutes(catalogs: CatalogService, commits: CommitServic
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * GET .../tables/{table}/scan?snapshot= — read planning (openapi
+ * planScan): data files paired with their visible deletion vectors.
+ * Installed separately so App.kt wires it with its own ScanService.
+ */
+fun Application.installScanRoutes(scan: ScanService) {
+    routing {
+        get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
+            call.respond(
+                scan.planScan(
+                    call.catalog(),
+                    call.namespace(),
+                    call.table(),
+                    call.longQuery("snapshot"),
+                ).map { it.toDto() },
+            )
         }
     }
 }

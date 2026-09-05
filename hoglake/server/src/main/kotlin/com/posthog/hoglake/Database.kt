@@ -23,6 +23,10 @@ object Database {
             password = cfg.dbPassword
             maximumPoolSize = cfg.dbPoolSize
             poolName = "hoglake"
+            // Fail fast when the catalog is unreachable — a request must
+            // 500/503 quickly, never hang on connection acquisition.
+            connectionTimeout = 5_000
+            validationTimeout = 2_500
             // No idle-in-transaction squatters, ever (README.md §7).
             connectionInitSql =
                 "SET idle_in_transaction_session_timeout = '30s'; SET statement_timeout = '60s'"

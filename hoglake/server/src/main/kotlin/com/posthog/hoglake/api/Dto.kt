@@ -9,11 +9,15 @@ import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.DataFile
+import com.posthog.hoglake.model.DeleteFile
+import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
+import com.posthog.hoglake.model.ScanFile
 import com.posthog.hoglake.model.Snapshot
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.TableInfo
 import java.time.Instant
 import java.util.UUID
@@ -150,6 +154,7 @@ data class FileRegistrationDto(
     val fileSizeBytes: Long,
     val footerSize: Long? = null,
     val columnStats: List<ColumnStatsDto>? = null,
+    val partitionValues: List<String?>? = null,
 ) {
     fun toModel() = FileRegistration(
         path = path,
@@ -157,6 +162,7 @@ data class FileRegistrationDto(
         fileSizeBytes = fileSizeBytes,
         footerSize = footerSize,
         columnStats = columnStats?.map { it.toModel() },
+        partitionValues = partitionValues,
     )
 }
 
@@ -173,15 +179,46 @@ data class TableAppendDto(
     }
 }
 
+data class DeleteFileRegistrationDto(
+    val dataFileId: Long,
+    val path: String,
+    val deleteCount: Long,
+    val fileSizeBytes: Long,
+) {
+    fun toModel() = DeleteFileRegistration(
+        dataFileId = dataFileId,
+        path = path,
+        deleteCount = deleteCount,
+        fileSizeBytes = fileSizeBytes,
+    )
+}
+
+data class TableDeletesDto(
+    val namespace: String,
+    val table: String,
+    val files: List<DeleteFileRegistrationDto>,
+) {
+    fun toModel(): TableDeletes {
+        if (files.isEmpty()) {
+            throw HoglakeException.Validation("deletes for $namespace.$table have no files")
+        }
+        return TableDeletes(namespace, table, files.map { it.toModel() })
+    }
+}
+
 data class CommitRequestDto(
     val readSnapshot: Long? = null,
-    val appends: List<TableAppendDto>,
+    // Both default empty per the spec: at least one must be non-empty,
+    // which CommitService enforces (422 validation, not a 400).
+    val appends: List<TableAppendDto> = emptyList(),
+    val deletes: List<TableDeletesDto> = emptyList(),
     val author: String? = null,
     val message: String? = null,
 ) {
     fun toModel() = CommitRequest(
         readSnapshot = readSnapshot,
         appends = appends.map { it.toModel() },
+        deletes = deletes.map { it.toModel() },
         author = author,
         message = message,
     )
@@ -203,6 +240,10 @@ data class DataFileDto(
     val rowIdStart: Long,
     val statsState: String,
     val beginSnapshot: Long,
+    // Partitioning binding; NON_NULL inclusion drops both when absent
+    // (unpartitioned file, or a read path that does not load them).
+    val specId: Long? = null,
+    val partitionValues: List<String?>? = null,
 )
 
 fun DataFile.toDto() = DataFileDto(
@@ -215,6 +256,40 @@ fun DataFile.toDto() = DataFileDto(
     rowIdStart = rowIdStart,
     statsState = statsState.wire,
     beginSnapshot = beginSnapshot,
+    specId = specId,
+    partitionValues = partitionValues,
+)
+
+// ---- scan planning -------------------------------------------------------
+
+data class DeleteFileDto(
+    val deleteFileId: Long,
+    val dataFileId: Long,
+    val path: String,
+    val fileFormat: String,
+    val deleteCount: Long,
+    val fileSizeBytes: Long,
+    val beginSnapshot: Long,
+)
+
+fun DeleteFile.toDto() = DeleteFileDto(
+    deleteFileId = deleteFileId,
+    dataFileId = dataFileId,
+    path = path,
+    fileFormat = fileFormat,
+    deleteCount = deleteCount,
+    fileSizeBytes = fileSizeBytes,
+    beginSnapshot = beginSnapshot,
+)
+
+data class ScanFileDto(
+    val dataFile: DataFileDto,
+    val deleteFile: DeleteFileDto? = null,
+)
+
+fun ScanFile.toDto() = ScanFileDto(
+    dataFile = dataFile.toDto(),
+    deleteFile = deleteFile?.toDto(),
 )
 
 data class ChangePlanDto(

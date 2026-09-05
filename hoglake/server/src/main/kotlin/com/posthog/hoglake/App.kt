@@ -5,13 +5,18 @@ import com.fasterxml.jackson.databind.PropertyNamingStrategies
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import com.posthog.hoglake.api.installAlterRoutes
 import com.posthog.hoglake.api.installApiRoutes
+import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
+import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
+import com.posthog.hoglake.service.ScanService
 import io.ktor.http.ContentType
+import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.jackson.jackson
 import io.ktor.server.application.Application
 import io.ktor.server.application.install
@@ -35,6 +40,8 @@ class App private constructor(
 ) {
     private val catalogService = CatalogService(jdbi)
     private val commitService = CommitService(jdbi)
+    private val alterService = AlterService(jdbi)
+    private val scanService = ScanService(jdbi)
 
     companion object {
         fun build(cfg: Config, jdbi: Jdbi): App = App(cfg, jdbi)
@@ -55,8 +62,21 @@ class App private constructor(
         app.install(CallLogging)
         app.install(StatusPages) { installErrorMapping() }
         app.routing {
-            get("/healthz") {
+            // Process liveness only — never touches the database.
+            get("/livez") {
                 call.respondText("ok")
+            }
+            // Readiness: the catalog must be reachable. A dead pool must
+            // read as unhealthy, not hang (the zombie-server incident:
+            // /healthz said ok while every /v1 call hung on a dead PG).
+            get("/healthz") {
+                val ok = runCatching {
+                    jdbi.withHandle<Int, Exception> { h ->
+                        h.createQuery("SELECT 1").mapTo(Int::class.javaObjectType).one()
+                    }
+                }.isSuccess
+                if (ok) call.respondText("ok")
+                else call.respondText("db unreachable", status = HttpStatusCode.ServiceUnavailable)
             }
             get("/openapi.yaml") {
                 val spec = javaClass.getResource("/openapi/hoglake.yaml")!!.readText()
@@ -64,6 +84,8 @@ class App private constructor(
             }
         }
         app.installApiRoutes(catalogService, commitService)
+        app.installAlterRoutes(alterService)
+        app.installScanRoutes(scanService)
     }
 
     /**

@@ -148,6 +148,65 @@ paths:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter:
+    post:
+      operationId: alterTable
+      summary: >
+        Schema evolution as one DDL commit: typed ops applied atomically
+        in order (add/drop/rename/promote column, rename table, set
+        partition spec). Produces a snapshot with a table_altered change.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ops]
+              properties:
+                ops:
+                  type: array
+                  minItems: 1
+                  items: { $ref: "#/components/schemas/AlterOp" }
+      responses:
+        "200":
+          description: Applied; the table after evolution
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Table" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid op (unknown column, illegal promotion,
+            duplicate name, bad spec)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan:
+    get:
+      operationId: planScan
+      summary: >
+        Read planning: data files paired with their live deletion
+        vectors at a snapshot.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - { $ref: "#/components/parameters/snapshot" }
+      responses:
+        "200":
+          description: Scan plan
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ScanFile" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
     get:
       operationId: listFiles
@@ -423,6 +482,7 @@ components:
         record_count: { type: integer, format: int64 }
         file_count: { type: integer, format: int64 }
         file_size_bytes: { type: integer, format: int64 }
+        partition_spec: { $ref: "#/components/schemas/PartitionSpec" }
 
     ColumnStats:
       type: object
@@ -453,6 +513,13 @@ components:
           type: array
           description: Omit for deferred stats (file registers as pending).
           items: { $ref: "#/components/schemas/ColumnStats" }
+        partition_values:
+          type: array
+          description: >
+            Transformed partition values by key_index of the table's live
+            spec. Required with matching arity when the table is
+            partitioned; forbidden when not.
+          items: { type: string, nullable: true }
 
     TableAppend:
       type: object
@@ -467,7 +534,7 @@ components:
 
     CommitRequest:
       type: object
-      required: [appends]
+      description: At least one of appends/deletes must be non-empty.
       properties:
         read_snapshot:
           type: integer
@@ -475,13 +542,101 @@ components:
           description: >
             The snapshot the writer planned against. Conflicts are
             evaluated against changes after this point. Defaults to head
-            (no conflict window) for blind appends.
+            (no conflict window) for blind appends. REQUIRED when
+            deletes are present (deletes always conflict-check).
         appends:
           type: array
-          minItems: 1
           items: { $ref: "#/components/schemas/TableAppend" }
+        deletes:
+          type: array
+          items: { $ref: "#/components/schemas/TableDeletes" }
         author: { type: string }
         message: { type: string }
+
+    DeleteFileRegistration:
+      type: object
+      required: [data_file_id, path, delete_count, file_size_bytes]
+      properties:
+        data_file_id: { type: integer, format: int64 }
+        path: { type: string, description: Puffin deletion-vector file URI }
+        delete_count:
+          type: integer
+          format: int64
+          description: >
+            Total deleted positions in the DV. Must be >= the superseded
+            DV's count (vectors only grow) and <= the data file's
+            record_count.
+        file_size_bytes: { type: integer, format: int64 }
+
+    TableDeletes:
+      type: object
+      required: [namespace, table, files]
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        files:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/DeleteFileRegistration" }
+
+    DeleteFile:
+      type: object
+      required: [delete_file_id, data_file_id, path, file_format,
+                 delete_count, file_size_bytes, begin_snapshot]
+      properties:
+        delete_file_id: { type: integer, format: int64 }
+        data_file_id: { type: integer, format: int64 }
+        path: { type: string }
+        file_format: { type: string, enum: [puffin-dv] }
+        delete_count: { type: integer, format: int64 }
+        file_size_bytes: { type: integer, format: int64 }
+        begin_snapshot: { type: integer, format: int64 }
+
+    ScanFile:
+      type: object
+      required: [data_file]
+      properties:
+        data_file: { $ref: "#/components/schemas/DataFile" }
+        delete_file: { $ref: "#/components/schemas/DeleteFile" }
+
+    PartitionField:
+      type: object
+      required: [source_field_id, transform]
+      properties:
+        source_field_id: { type: integer, format: int64 }
+        transform:
+          type: string
+          enum: [identity, bucket, year, month, day, hour]
+        transform_param:
+          type: integer
+          description: bucket(n) only.
+
+    PartitionSpec:
+      type: object
+      required: [spec_id, fields]
+      properties:
+        spec_id: { type: integer, format: int64 }
+        fields:
+          type: array
+          items: { $ref: "#/components/schemas/PartitionField" }
+
+    AlterOp:
+      type: object
+      required: [op]
+      description: Discriminated by `op`.
+      properties:
+        op:
+          type: string
+          enum: [add_column, drop_column, rename_column, promote_column,
+                 rename_table, set_partition_spec]
+        column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
+        name: { type: string }        # drop_column, promote_column
+        from: { type: string }        # rename_column
+        to: { type: string }          # rename_column; promote_column target type
+        new_name: { type: string }    # rename_table
+        fields:                       # set_partition_spec ([] = unpartitioned)
+          type: array
+          items: { $ref: "#/components/schemas/PartitionField" }
 
     CommitResult:
       type: object
@@ -504,6 +659,10 @@ components:
         row_id_start: { type: integer, format: int64 }
         stats_state: { type: string, enum: [provided, pending, failed] }
         begin_snapshot: { type: integer, format: int64 }
+        spec_id: { type: integer, format: int64 }
+        partition_values:
+          type: array
+          items: { type: string, nullable: true }
 
     ChangePlan:
       type: object

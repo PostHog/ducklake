@@ -31,10 +31,48 @@ enum class StatsState { PROVIDED, PENDING, FAILED;
 /** Typed conflict vocabulary — mirrors the CHECK constraint on hog_snapshot_change. */
 enum class ChangeKind {
     NAMESPACE_CREATED, NAMESPACE_DROPPED,
-    TABLE_CREATED, TABLE_DROPPED, TABLE_ALTERED, TABLE_INSERTED_INTO;
+    TABLE_CREATED, TABLE_DROPPED, TABLE_ALTERED, TABLE_INSERTED_INTO,
+    TABLE_DELETED_FROM;
 
     val wire: String get() = name.lowercase()
     companion object { fun fromWire(s: String) = valueOf(s.uppercase()) }
+}
+
+/** Iceberg-semantics partition transforms (iceberg-federation.md §3). */
+enum class Transform {
+    IDENTITY, BUCKET, YEAR, MONTH, DAY, HOUR;
+    val wire: String get() = name.lowercase()
+    companion object { fun fromWire(s: String) = valueOf(s.uppercase()) }
+}
+
+data class PartitionFieldDef(
+    val sourceFieldId: Long,
+    val transform: Transform,
+    /** bucket(n): required for BUCKET, forbidden otherwise. */
+    val transformParam: Int? = null,
+)
+
+data class PartitionSpec(
+    val specId: Long,
+    val fields: List<PartitionFieldDef>,
+)
+
+/** Widening promotions the ALTER path permits (Iceberg-compatible set). */
+fun ColType.canPromoteTo(target: ColType): Boolean = when (this) {
+    ColType.INT -> target == ColType.LONG
+    ColType.FLOAT -> target == ColType.DOUBLE
+    else -> false
+}
+
+/** One typed ALTER TABLE operation. */
+sealed class AlterOp {
+    data class AddColumn(val def: ColumnDef) : AlterOp()
+    data class DropColumn(val name: String) : AlterOp()
+    data class RenameColumn(val from: String, val to: String) : AlterOp()
+    data class PromoteColumn(val name: String, val to: ColType) : AlterOp()
+    data class RenameTable(val newName: String) : AlterOp()
+    /** Replace the partition spec (empty list = unpartitioned). */
+    data class SetPartitionSpec(val fields: List<PartitionFieldDef>) : AlterOp()
 }
 
 data class CatalogInfo(
@@ -72,6 +110,8 @@ data class TableInfo(
     val recordCount: Long,
     val fileCount: Long,
     val fileSizeBytes: Long,
+    /** Live partition spec; null = unpartitioned. */
+    val partitionSpec: PartitionSpec? = null,
 )
 
 data class Snapshot(
@@ -99,6 +139,26 @@ data class DataFile(
     val rowIdStart: Long,
     val statsState: StatsState,
     val beginSnapshot: Long,
+    val specId: Long? = null,
+    /** Transformed partition values by key_index; null when unpartitioned. */
+    val partitionValues: List<String?>? = null,
+)
+
+/** A registered deletion-vector file (one live DV per data file). */
+data class DeleteFile(
+    val deleteFileId: Long,
+    val dataFileId: Long,
+    val path: String,
+    val fileFormat: String,
+    val deleteCount: Long,
+    val fileSizeBytes: Long,
+    val beginSnapshot: Long,
+)
+
+/** A data file paired with its live deletion vector, for read planning. */
+data class ScanFile(
+    val dataFile: DataFile,
+    val deleteFile: DeleteFile?,
 )
 
 data class ColumnStats(
@@ -127,6 +187,12 @@ data class FileRegistration(
     val footerSize: Long? = null,
     /** null = deferred stats: the file registers as PENDING for the hydrator. */
     val columnStats: List<ColumnStats>? = null,
+    /**
+     * Transformed partition values by key_index of the table's live spec.
+     * Required (with matching arity) when the table is partitioned;
+     * forbidden when it is not.
+     */
+    val partitionValues: List<String?>? = null,
 )
 
 data class TableAppend(
@@ -135,9 +201,24 @@ data class TableAppend(
     val files: List<FileRegistration>,
 )
 
+/** One deletion-vector registration: supersedes the file's live DV. */
+data class DeleteFileRegistration(
+    val dataFileId: Long,
+    val path: String,
+    val deleteCount: Long,
+    val fileSizeBytes: Long,
+)
+
+data class TableDeletes(
+    val namespace: String,
+    val table: String,
+    val files: List<DeleteFileRegistration>,
+)
+
 data class CommitRequest(
     val readSnapshot: Long? = null,
-    val appends: List<TableAppend>,
+    val appends: List<TableAppend> = emptyList(),
+    val deletes: List<TableDeletes> = emptyList(),
     val author: String? = null,
     val message: String? = null,
 )

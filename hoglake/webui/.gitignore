@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.flox/run/
+.flox/cache/
+.flox/lib/
+.flox/log/
+.flox/telemetry_id
