@@ -73,5 +73,15 @@ class IncarnationChangedError(HoglakeError):
     carry over."""
 
 
+class MalformedResponseError(HoglakeError):
+    """A response body did not match the wire contract: a required field
+    was missing, or a field/nested object had the wrong shape.
+
+    Raised client-side by every model's ``from_wire``; the message names
+    the model and the offending field. Replaces the leaked
+    ``KeyError``/``AttributeError``/``TypeError`` trio the hand-rolled
+    parsers used to disagree on (bugs.md #24)."""
+
+
 class UnsupportedTypeError(HoglakeError, TypeError):
     """An Arrow type with no hoglake column-type mapping."""

@@ -21,6 +21,7 @@ import pyarrow as pa
 from pyhoglake import (
     ChangesPlan,
     Column,
+    CommitConflictError,
     CommitResult,
     ConsumerOffset,
     DataFile,
@@ -140,6 +141,8 @@ class FakeDestTable:
     calls: list = dc_field(default_factory=list)
     appended: list[pa.Table] = dc_field(default_factory=list)
     fail_on_append_call: int | None = None  # 1-based index of the call to fail
+    # first N append calls 409 with a RETRYABLE commit conflict
+    conflict_first_n_appends: int = 0
     _append_calls: int = 0
     _next_snapshot: int = 100
 
@@ -147,6 +150,11 @@ class FakeDestTable:
         self._append_calls += 1
         if self.fail_on_append_call == self._append_calls:
             raise CrashRequested("crash injected during append")
+        if self._append_calls <= self.conflict_first_n_appends:
+            raise CommitConflictError(
+                "commit_conflict: concurrent DDL touched the table",
+                status_code=409,
+            )
         # Mimic the SERVER-side atomic commit guard: expected_table_uuid
         # rides the commit body, and the server 409s the whole commit —
         # zero writes — when the live table's uuid differs. pyhoglake

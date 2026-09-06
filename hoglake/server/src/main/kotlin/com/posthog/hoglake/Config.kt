@@ -15,6 +15,14 @@ data class Config(
     val s3PathStyle: Boolean = env("HOGLAKE_S3_PATH_STYLE", "true").toBoolean(),
     /** Hydrator poll interval; 0 disables the background loop (tests drive it directly). */
     val hydratorIntervalMs: Long = env("HOGLAKE_HYDRATOR_INTERVAL_MS", "5000").toLong(),
+    /**
+     * Cap on the hydrator's whole-object fallback fetch (used when a
+     * registration has no usable footer_size): a larger file is marked
+     * 'failed' (structural) instead of being buffered on the heap —
+     * the OOM guard. Default 256 MiB.
+     */
+    val hydratorMaxWholeObjectBytes: Long =
+        env("HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES", "${256L * 1024 * 1024}").toLong(),
     /** Expiry sweep interval; 0 disables. Sweeps are incremental (bounded per run). */
     val expiryIntervalMs: Long = env("HOGLAKE_EXPIRY_INTERVAL_MS", "60000").toLong(),
     /** Max snapshots expired per sweep per catalog (incremental expiry). */

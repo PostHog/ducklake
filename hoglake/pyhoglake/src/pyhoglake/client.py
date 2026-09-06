@@ -167,10 +167,22 @@ class HoglakeClient:
         if params:
             params = {k: v for k, v in params.items() if v is not None}
         resp = self._http.request(method, path, json=json, params=params or None)
-        if resp.status_code < 400:
+        if resp.status_code < 300:
             if not resp.content:
                 return None
             return resp.json()
+        if resp.status_code < 400:
+            # Redirects are not followed (httpx default) and the hoglake
+            # API never issues them: treating a 3xx as success would feed
+            # an empty/HTML body to resp.json() and leak a raw
+            # JSONDecodeError outside the error taxonomy (bugs.md #19).
+            location = resp.headers.get("location")
+            raise HoglakeError(
+                f"unexpected redirect HTTP {resp.status_code} from the "
+                "hoglake API (redirects are not followed; check base_url)",
+                status_code=resp.status_code,
+                detail=f"Location: {location}" if location else None,
+            )
         self._raise(resp, conflict)
 
     @staticmethod
@@ -351,7 +363,7 @@ class Catalog:
     ) -> ConsumerOffset:
         body = self._client._request(
             "PUT",
-            self._path(f"/consumers/{_seg(consumer_id)}/offsets/{table_uuid}"),
+            self._path(f"/consumers/{_seg(consumer_id)}/offsets/{_seg(table_uuid)}"),
             json={"snapshot_id": snapshot_id},
             conflict=OffsetRegressionError,
         )
@@ -374,7 +386,9 @@ class Catalog:
         try:
             body = self._client._request(
                 "GET",
-                self._path(f"/consumers/{_seg(consumer_id)}/offsets/{table_uuid}"),
+                self._path(
+                    f"/consumers/{_seg(consumer_id)}/offsets/{_seg(table_uuid)}"
+                ),
             )
         except NotFoundError:
             return None
@@ -753,9 +767,18 @@ def _align_table(data: pa.Table, target: pa.Schema) -> pa.Table:
 
 
 def _footer_size(raw: bytes) -> int:
-    # trailing 8 bytes: 4-byte LE footer length + b"PAR1"
+    """Thrift footer-metadata length for the commit's ``footer_size``.
+
+    Wire convention (bugs.md #7): ``footer_size`` is EXACTLY the 4-byte
+    LE length stored in the parquet trailer — the serialized thrift
+    FileMetaData size, EXCLUDING the trailing 8-byte suffix (4-byte
+    length + ``PAR1`` magic). The server's hydrator tail-reads
+    ``[file_size - footer_size - 8, file_size)`` and compaction stores
+    the same value for its own outputs; shipping ``meta_len + 8`` here
+    (the old behavior) made every client-written file 8 bytes off.
+    """
     (meta_len,) = struct.unpack("<I", raw[-8:-4])
-    return meta_len + 8
+    return meta_len
 
 
 def _upload(fs, uri: str, raw: bytes) -> None:

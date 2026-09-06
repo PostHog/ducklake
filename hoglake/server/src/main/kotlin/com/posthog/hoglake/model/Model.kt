@@ -427,6 +427,15 @@ data class VerifyReport(
     val checks: List<VerifyCheck>,
 )
 
+/**
+ * One rehydrate request's outcome (POST /maintenance/rehydrate):
+ * how many 'failed' files were flipped back to 'pending' for the
+ * hydrator to retry.
+ */
+data class RehydrateResult(
+    val requeued: Long,
+)
+
 /** One cleanup drain's outcome. */
 data class CleanupResult(
     val removed: Long,

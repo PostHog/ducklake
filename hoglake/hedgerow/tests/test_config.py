@@ -138,6 +138,47 @@ def test_filter_equals_null_refused():
         HedgerowConfig.parse(raw)
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_filter_equals_nan_inf_refused(value):
+    # bugs.md #4 regression: NaN == x is False for EVERY row (IEEE 754),
+    # so a NaN filter is vacuous — 100% of rows dropped while the offset
+    # advances. Same silent-data-loss class as the null filter.
+    raw = _valid()
+    raw["filter"] = {"column": "team_id", "equals": value}
+    with pytest.raises(ConfigError, match="finite"):
+        HedgerowConfig.parse(raw)
+
+
+def test_filter_equals_yaml_nan_refused(tmp_path):
+    # the real-world shape: YAML `.nan` safe_loads to float('nan')
+    raw = _valid()
+    del raw["filter"]
+    text = yaml.safe_dump(raw) + "filter:\n  column: team_id\n  equals: .nan\n"
+    p = tmp_path / "nan.yaml"
+    p.write_text(text)
+    with pytest.raises(ConfigError, match="finite"):
+        load_config(str(p), environ={})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_poll_interval_nan_inf_refused_at_startup(value):
+    # bugs.md #21 regression: isinstance(nan, float) passes and
+    # `nan < 0.1` is False, so without the finite check the daemon would
+    # start and explode at the first time.sleep(nan) mid-loop.
+    raw = _valid()
+    raw["replication"]["poll_interval_s"] = value
+    with pytest.raises(ConfigError, match="poll_interval_s must be a finite"):
+        HedgerowConfig.parse(raw)
+
+
+def test_poll_interval_yaml_nan_refused_via_env(tmp_path):
+    # env overrides are YAML-parsed scalars: ".nan" -> float('nan')
+    p = tmp_path / "ok.yaml"
+    p.write_text(yaml.safe_dump(_valid()))
+    with pytest.raises(ConfigError, match="poll_interval_s must be a finite"):
+        load_config(str(p), environ={"HEDGEROW__REPLICATION__POLL_INTERVAL_S": ".nan"})
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -150,6 +191,8 @@ def test_filter_equals_null_refused():
         ("max_rows_per_append", 1.5),
         ("max_window_replays", -1),
         ("max_window_replays", 1.5),
+        ("max_append_retries", -1),
+        ("max_append_retries", 1.5),
     ],
 )
 def test_replication_bounds(field, value):
@@ -164,6 +207,13 @@ def test_max_window_replays_default_and_parse():
     assert HedgerowConfig.parse(raw).replication.max_window_replays == 3
     raw["replication"]["max_window_replays"] = 0  # halt on first failure
     assert HedgerowConfig.parse(raw).replication.max_window_replays == 0
+
+
+def test_max_append_retries_default_and_parse():
+    raw = _valid()
+    assert HedgerowConfig.parse(raw).replication.max_append_retries == 3
+    raw["replication"]["max_append_retries"] = 0  # escalate on first conflict
+    assert HedgerowConfig.parse(raw).replication.max_append_retries == 0
 
 
 def test_type_errors_are_precise():

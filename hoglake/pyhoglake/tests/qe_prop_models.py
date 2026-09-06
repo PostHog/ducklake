@@ -7,9 +7,10 @@ Claims under test:
 * Error responses (any status 400-599, any body JSON shape or raw
   bytes) always map to the right HoglakeError subclass, never crash the
   mapper, and always stringify.
-* Missing REQUIRED fields / wrong-typed nested containers should raise
-  cleanly (TypeError/ValueError) — today they leak KeyError and
-  AttributeError; pinned as xfail BUGs below.
+* Missing REQUIRED fields / wrong-typed nested containers raise ONE
+  typed client-side error — MalformedResponseError — naming the model
+  and the offending field (bugs.md #24; formerly leaked KeyError,
+  AttributeError, or TypeError depending on the model's parse style).
 """
 
 import httpx
@@ -22,6 +23,7 @@ from pyhoglake import (
     CommitConflictError,
     ExpiredError,
     HoglakeError,
+    MalformedResponseError,
     NotFoundError,
     ValidationError,
 )
@@ -309,55 +311,62 @@ def test_models_required_values_survive_verbatim(case):
         assert getattr(obj, k) == v
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "BUG (pyhoglake models, minor): hand-rolled from_wire bodies index "
-        "required keys directly (d['snapshot_id'], d['updated_at'], "
-        "d['name'], d['data_file']), so a response missing a required "
-        "field leaks KeyError instead of a clean TypeError/ValueError. "
-        "The _pick(**) models raise TypeError for the same defect — the "
-        "two styles disagree. Repro: Snapshot.from_wire({}) -> KeyError."
-    ),
-)
+# Regression (bugs.md #24, formerly an xfail BUG pin): a response
+# missing a required field must raise MalformedResponseError — never a
+# leaked KeyError (direct-index parsers) or TypeError (_pick parsers).
+# Removing an OPTIONAL field must still parse cleanly.
 @given(model_case, st.data())
-def test_missing_required_field_never_leaks_keyerror_BUG(case, data):
+def test_missing_required_field_raises_malformed_response(case, data):
     cls, wire, _ = case
     victim = data.draw(st.sampled_from(sorted(wire)))
     broken = {k: v for k, v in wire.items() if k != victim}
     try:
-        cls.from_wire(broken)
-    except KeyError:
-        pytest.fail(f"{cls.__name__}.from_wire leaked KeyError for {victim!r}")
-    except (TypeError, ValueError):
-        pass  # clean-enough raise
+        cls.from_wire(broken)  # a removed OPTIONAL field parses fine
+    except MalformedResponseError as e:
+        # the one sanctioned parse error, naming the model
+        assert cls.__name__ in str(e)
+    # anything else (KeyError, TypeError, AttributeError...) propagates
+    # out of the test and fails it
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "BUG (pyhoglake models, minor): non-dict entries inside nested "
-        "arrays (Snapshot.changes, TableInfo.columns, ChangesPlan.files) "
-        "leak AttributeError(\"'str' object has no attribute 'items'\") "
-        "from _pick. Repro: Snapshot.from_wire({..., 'changes': ['x']})."
-    ),
-)
+# Regression (bugs.md #24, formerly an xfail BUG pin): non-dict entries
+# inside nested arrays (Snapshot.changes, TableInfo.columns,
+# ChangesPlan.files) must raise MalformedResponseError naming the nested
+# model — never AttributeError("'str' object has no attribute 'items'")
+# out of _pick.
 @given(
     st.one_of(st.text(max_size=4), st.integers(), st.lists(st.integers(), max_size=2))
 )
-def test_wrong_typed_nested_entries_never_leak_attributeerror_BUG(junk):
+def test_wrong_typed_nested_entries_raise_malformed_response(junk):
     wire = {
         "snapshot_id": 1,
         "snapshot_time": "2026-09-04T12:00:00Z",
         "schema_version": 1,
         "changes": [junk],
     }
-    try:
+    with pytest.raises(MalformedResponseError) as ei:
         Snapshot.from_wire(wire)
-    except AttributeError:
-        pytest.fail("AttributeError leaked from nested parse")
-    except (TypeError, ValueError):
-        pass
+    assert "SnapshotChange" in str(ei.value)
+
+
+def test_missing_required_field_message_names_model_and_field():
+    with pytest.raises(MalformedResponseError, match="Snapshot.*snapshot_id"):
+        Snapshot.from_wire({})
+    with pytest.raises(MalformedResponseError, match="CatalogInfo.*name"):
+        CatalogInfo.from_wire({"data_path": "s3://x/"})
+    with pytest.raises(MalformedResponseError, match="ScanFile.*data_file"):
+        ScanFile.from_wire({})
+
+
+def test_non_object_body_raises_malformed_response():
+    for junk in ("nope", 7, [1, 2], None):
+        with pytest.raises(MalformedResponseError, match="expected a JSON object"):
+            CommitResult.from_wire(junk)
+
+
+def test_malformed_response_is_a_hoglake_error():
+    # callers catching the taxonomy root must see parse failures too
+    assert issubclass(MalformedResponseError, HoglakeError)
 
 
 # -- datetime parsing pedantry ---------------------------------------------

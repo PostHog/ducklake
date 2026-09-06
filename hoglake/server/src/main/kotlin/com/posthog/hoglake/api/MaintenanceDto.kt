@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.CatalogOptions
 import com.posthog.hoglake.model.CleanupResult
 import com.posthog.hoglake.model.CompactionResult
 import com.posthog.hoglake.model.ExpiryResult
+import com.posthog.hoglake.model.RehydrateResult
 import com.posthog.hoglake.model.VerifyCheck
 import com.posthog.hoglake.model.VerifyReport
 import com.posthog.hoglake.service.PatchField
@@ -79,6 +80,12 @@ fun CompactionResult.toDto() =
         bytesOut = bytesOut,
         skippedConflicts = skippedConflicts,
     )
+
+data class RehydrateResultDto(
+    val requeued: Long,
+)
+
+fun RehydrateResult.toDto() = RehydrateResultDto(requeued = requeued)
 
 data class VerifyCheckDto(
     val check: String,

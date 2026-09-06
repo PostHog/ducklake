@@ -76,6 +76,15 @@ def test_uncastable_filter_value_rejected():
         build_filter(FilterConfig(column="team_id", equals="not-a-number"), SRC)
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nan_inf_filter_value_rejected_on_direct_construction(value):
+    # bugs.md #4 regression, direct-construction path: pc.equal(col, nan)
+    # is False for every row, so the filter silently drops 100% of rows
+    # while the offset advances. Refused next to the null guard.
+    with pytest.raises(ConfigError, match="finite"):
+        build_filter(FilterConfig(column="team_id", equals=value), SRC)
+
+
 def test_filter_preserves_schema():
     f = build_filter(FilterConfig(column="team_id", equals=1), SRC)
     batch = _batch(

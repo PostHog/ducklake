@@ -63,6 +63,12 @@ Permanent client errors (validation, not-found, already-exists) skip the
 replay budget entirely and halt immediately — a retry would fail
 identically while still re-appending rows.
 
+Retryable **commit conflicts** on a destination append (409, concurrent
+DDL) never reach the replay path directly: the single append is retried
+in place, duplicate-free, up to `replication.max_append_retries` times
+with a short backoff. Only an exhausted (or non-retryable) conflict
+escalates to the window replay above.
+
 ## Config reference
 
 ```yaml
@@ -99,6 +105,10 @@ replication:
   max_window_replays: 3             # transient-failure retries per window;
                                     # each replay may duplicate the window's
                                     # rows; exhausting it HALTS (exit 9)
+  max_append_retries: 3             # retryable commit conflicts per append:
+                                    # duplicate-free single-append retries
+                                    # (short backoff) BEFORE escalating to
+                                    # the window-replay path above
 
 metrics:
   port: 0                           # 0 = disabled; >0 serves /metrics

@@ -19,6 +19,7 @@ import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
+import com.posthog.hoglake.stats.IcebergSingleValue
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -216,25 +217,41 @@ class AlterService(private val jdbi: Jdbi) {
         // is live (visible at head) would silently NULL that column's
         // history in readers, so the rename is refused (409) until the
         // id-less files are compacted, expired, or otherwise retired.
+        // 'pending' files count too — missing_field_ids is only written by
+        // the hydrator's footer read, so a not-yet-hydrated file's id state
+        // is UNKNOWN and must be treated as id-less until proven otherwise
+        // (the TOCTOU: commit deferred-stats id-less file -> rename slips
+        // through before the sweep -> the flag arrives too late).
         // RenameTable is unaffected — table binding rides table_uuid.
-        val idlessLive =
+        val (idlessLive, pendingLive) =
             h.createQuery(
                 """
-                SELECT count(*) FROM hog_data_file
+                SELECT count(*) FILTER (WHERE missing_field_ids) AS idless,
+                       count(*) FILTER (WHERE stats_state = 'pending' AND NOT missing_field_ids) AS pending
+                FROM hog_data_file
                 WHERE catalog_id = :catalogId AND table_id = :tableId
-                  AND end_snapshot IS NULL AND missing_field_ids
+                  AND end_snapshot IS NULL
+                  AND (missing_field_ids OR stats_state = 'pending')
                 """,
             )
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
-                .mapTo(Long::class.javaObjectType)
+                .map { rs, _ -> rs.getLong("idless") to rs.getLong("pending") }
                 .one()
-        if (idlessLive > 0) {
+        if (idlessLive > 0 || pendingLive > 0) {
+            val blockers =
+                buildList {
+                    if (idlessLive > 0) add("$idlessLive id-less")
+                    if (pendingLive > 0) {
+                        add(
+                            "$pendingLive not-yet-hydrated (id state unknown until the footer is read)",
+                        )
+                    }
+                }.joinToString(" and ")
             throw HoglakeException.IdlessFilesPresent(
-                "cannot rename column '${op.from}' to '${op.to}': $idlessLive live data " +
-                    "file(s) lack parquet field ids and bind columns by name — renaming " +
-                    "would silently NULL their history in readers; rewrite or retire the " +
-                    "id-less files first",
+                "cannot rename column '${op.from}' to '${op.to}': $blockers live data " +
+                    "file(s) may bind columns by name — renaming would silently NULL " +
+                    "their history in readers; hydrate, rewrite, or retire them first",
             )
         }
         endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
@@ -261,7 +278,97 @@ class AlterService(private val jdbi: Jdbi) {
         val promoted = col.copy(def = col.def.copy(type = op.to))
         TableRepo.insertColumns(h, catalogId, tableId, snapshot, listOf(promoted))
         state.cols[state.cols.indexOf(col)] = promoted
+        reencodeStatsOnPromote(h, catalogId, tableId, col.fieldId, col.def.type, op.to)
     }
+
+    /**
+     * Same-transaction stats re-encode for a width-changing promote:
+     * existing hog_file_column_stats bounds for the column were written
+     * in the OLD type's 4-byte Iceberg encoding; readers and compaction's
+     * bound-merge decode bounds under the LIVE type (8 bytes after
+     * int->long / float->double), so stale-width rows would either fail
+     * decoding forever (the poison-group compaction wedge) or be skipped.
+     * Values are preserved exactly — both promotions are lossless widens.
+     *
+     * Caveat, stated: a time-travel reader decoding these bounds at a
+     * PRE-promote snapshot (column type still int/float there) sees
+     * 8-byte encodings. Bounds are advisory pruning metadata, and the
+     * head-correctness + never-wedge-compaction trade wins; clients that
+     * cannot decode a bound must treat it as absent (the "NULL, never
+     * guessed" contract's read-side dual).
+     *
+     * Bounded work: only this column's rows with 4-byte bounds, under the
+     * catalog lock — promote is rare DDL. Rows hydrated concurrently under
+     * the old type can still slip in AFTER this (hydrator race);
+     * compaction's bound-merge skips undecodable widths as the backstop.
+     */
+    private fun reencodeStatsOnPromote(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        fieldId: Long,
+        from: ColType,
+        to: ColType,
+    ) {
+        val widen: (ByteArray) -> ByteArray =
+            when {
+                from == ColType.INT && to == ColType.LONG -> ::widenIntToLong
+                from == ColType.FLOAT && to == ColType.DOUBLE -> ::widenFloatToDouble
+                else -> return
+            }
+
+        data class Stale(val dataFileId: Long, val lower: ByteArray?, val upper: ByteArray?)
+
+        val stale =
+            h.createQuery(
+                """
+                SELECT s.data_file_id, s.lower_bound, s.upper_bound
+                FROM hog_file_column_stats s
+                JOIN hog_data_file f
+                  ON f.catalog_id = s.catalog_id AND f.data_file_id = s.data_file_id
+                WHERE s.catalog_id = :catalogId AND f.table_id = :tableId
+                  AND s.field_id = :fieldId
+                  AND (octet_length(s.lower_bound) = 4 OR octet_length(s.upper_bound) = 4)
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("fieldId", fieldId)
+                .map {
+                        rs,
+                        _,
+                    ->
+                    Stale(rs.getLong("data_file_id"), rs.getBytes("lower_bound"), rs.getBytes("upper_bound"))
+                }
+                .list()
+        if (stale.isEmpty()) return
+        val batch =
+            h.prepareBatch(
+                """
+                UPDATE hog_file_column_stats
+                   SET lower_bound = :lower, upper_bound = :upper
+                 WHERE catalog_id = :catalogId AND data_file_id = :dataFileId AND field_id = :fieldId
+                """,
+            )
+        for (row in stale) {
+            batch
+                .bind("lower", row.lower?.let { if (it.size == 4) widen(it) else it })
+                .bind("upper", row.upper?.let { if (it.size == 4) widen(it) else it })
+                .bind("catalogId", catalogId)
+                .bind("dataFileId", row.dataFileId)
+                .bind("fieldId", fieldId)
+                .add()
+        }
+        batch.execute()
+    }
+
+    /** Lossless width promotion of one 4-byte int bound to the long encoding. */
+    private fun widenIntToLong(b: ByteArray): ByteArray =
+        IcebergSingleValue.encode(ColType.LONG, (IcebergSingleValue.decode(ColType.INT, b) as Int).toLong())
+
+    /** Lossless width promotion of one 4-byte float bound to the double encoding. */
+    private fun widenFloatToDouble(b: ByteArray): ByteArray =
+        IcebergSingleValue.encode(ColType.DOUBLE, (IcebergSingleValue.decode(ColType.FLOAT, b) as Float).toDouble())
 
     private fun renameTable(
         h: Handle,

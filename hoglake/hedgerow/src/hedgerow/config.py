@@ -15,6 +15,7 @@ values parsed as YAML scalars::
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -201,7 +202,21 @@ class FilterConfig:
                 "filter matches nothing (NULLs never match an equality "
                 "filter — see README)"
             )
-        return cls(column=column, equals=d["equals"])
+        v = d["equals"]
+        if isinstance(v, float) and not math.isfinite(v):
+            # YAML `.nan`/`.inf` parse to floats through safe_load. NaN
+            # never compares equal to anything (IEEE 754: NaN != NaN), so
+            # the filter would be vacuous: every cycle reads the window,
+            # appends ZERO rows, and still advances the offset — the
+            # dropped rows are silently, permanently skipped (same trap
+            # as the null filter). Inf is refused with it: non-finite
+            # equality filters are always a config mistake.
+            raise ConfigError(
+                f"{where}.equals filter value must be finite, got {v!r}; "
+                "a NaN filter matches no row (NaN never equals anything), "
+                "so it would drop 100% of rows while the offset advances"
+            )
+        return cls(column=column, equals=v)
 
 
 @dataclass(frozen=True)
@@ -213,6 +228,11 @@ class ReplicationConfig:
     # whole window (duplicates possible per replay); after this many
     # consecutive failed cycles hedgerow halts as persistent (BUG-3).
     max_window_replays: int = 3
+    # Retryable-conflict budget PER APPEND: a retryable
+    # CommitConflictError from the destination commit gets this many
+    # single-append retries (duplicate-free) before the error escalates
+    # to the window-replay path above (bugs.md #13).
+    max_append_retries: int = 3
 
     @classmethod
     def parse(cls, d: Any, where: str = "replication") -> ReplicationConfig:
@@ -227,12 +247,21 @@ class ReplicationConfig:
                 "max_snapshot_window",
                 "max_rows_per_append",
                 "max_window_replays",
+                "max_append_retries",
             },
             where,
         )
         poll = d.get("poll_interval_s", 5.0)
         if isinstance(poll, bool) or not isinstance(poll, (int, float)):
             raise ConfigError(f"{where}.poll_interval_s must be a number, got {poll!r}")
+        if not math.isfinite(poll):
+            # YAML `.nan`/`.inf` are floats, isinstance passes, and
+            # `nan < 0.1` is False — without this check the daemon would
+            # start and only explode at the first `time.sleep(nan)`
+            # mid-loop. Fail at startup instead (bugs.md #21).
+            raise ConfigError(
+                f"{where}.poll_interval_s must be a finite number, got {poll!r}"
+            )
         if poll < 0.1:
             # 0 would busy-spin the loop (and hot-loop error retries)
             raise ConfigError(f"{where}.poll_interval_s must be >= 0.1, got {poll}")
@@ -246,6 +275,9 @@ class ReplicationConfig:
             ),
             max_window_replays=_int(
                 d, "max_window_replays", where, default=3, minimum=0
+            ),
+            max_append_retries=_int(
+                d, "max_append_retries", where, default=3, minimum=0
             ),
         )
 

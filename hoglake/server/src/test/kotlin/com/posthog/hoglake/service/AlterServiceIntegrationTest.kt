@@ -124,8 +124,8 @@ class AlterServiceIntegrationTest {
             alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
         }
             .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
-            .hasMessageContaining("1 live data file(s)")
-            .hasMessageContaining("field ids")
+            .hasMessageContaining("1 id-less")
+            .hasMessageContaining("live data file(s)")
         // The refused request minted nothing: head unchanged, column intact.
         assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name }).contains("name")
 
@@ -185,6 +185,156 @@ class AlterServiceIntegrationTest {
         val old = catalogs.getTable(cat, ns, "t", snapshot = before).columns
         assertThat(old.single { it.def.name == "count" }.def.type).isEqualTo(ColType.INT)
         assertThat(old.single { it.def.name == "score" }.def.type).isEqualTo(ColType.FLOAT)
+    }
+
+    @Test
+    fun `rename column is refused while a live file is still pending hydration`() {
+        // Pinned regression (bug hunt #6, the rename-guard TOCTOU): a
+        // deferred-stats file has missing_field_ids=false (schema default)
+        // until the hydrator's footer read — its id state is UNKNOWN, so
+        // the guard must block on 'pending' too, not only on the flag.
+        val (cat, ns) = fixture()
+        val tableId = catalogs.getTable(cat, ns, "t").tableId
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start, stats_state)
+                VALUES (?, 1, ?, 2, 's3://bucket/deferred.parquet', 10, 100, 0, 'pending')
+                """,
+                catId(cat),
+                tableId,
+            )
+        }
+        assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
+        }
+            .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+            .hasMessageContaining("1 not-yet-hydrated")
+        assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name }).contains("name")
+
+        // Hydration lands an id-bearing verdict: pending -> provided with
+        // missing_field_ids=false. The rename is now allowed.
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_data_file SET stats_state = 'provided' WHERE catalog_id = ? AND data_file_id = 1",
+                catId(cat),
+            )
+        }
+        val info = alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
+        assertThat(info.columns.map { it.def.name }).contains("label")
+    }
+
+    @Test
+    fun `rename guard message distinguishes id-less from not-yet-hydrated blockers`() {
+        val (cat, ns) = fixture()
+        val tableId = catalogs.getTable(cat, ns, "t").tableId
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start, missing_field_ids)
+                VALUES (?, 1, ?, 2, 's3://bucket/idless.parquet', 10, 100, 0, true)
+                """,
+                catId(cat),
+                tableId,
+            )
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start, stats_state)
+                VALUES (?, 2, ?, 2, 's3://bucket/pending.parquet', 10, 100, 10, 'pending')
+                """,
+                catId(cat),
+                tableId,
+            )
+        }
+        assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
+        }
+            .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+            .hasMessageContaining("1 id-less")
+            .hasMessageContaining("1 not-yet-hydrated")
+    }
+
+    @Test
+    fun `promote re-encodes existing 4-byte stats bounds to the new width, values preserved`() {
+        // Pinned regression (bug hunt #5): int->long / float->double left
+        // hog_file_column_stats bounds in the old 4-byte encoding, which
+        // the live-typed decode (compaction bound-merge, readers) rejects.
+        val (cat, ns) = fixture()
+        val tableId = catalogs.getTable(cat, ns, "t").tableId
+        val countField = catalogs.getTable(cat, ns, "t").columns.single { it.def.name == "count" }.fieldId
+        val scoreField = catalogs.getTable(cat, ns, "t").columns.single { it.def.name == "score" }.fieldId
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start)
+                VALUES (?, 1, ?, 2, 's3://bucket/promote.parquet', 10, 100, 0)
+                """,
+                catId(cat),
+                tableId,
+            )
+            for ((field, lower, upper) in listOf(
+                Triple(
+                    countField,
+                    com.posthog.hoglake.stats.IcebergSingleValue.encodeInt(-7),
+                    com.posthog.hoglake.stats.IcebergSingleValue.encodeInt(123),
+                ),
+                Triple(
+                    scoreField,
+                    com.posthog.hoglake.stats.IcebergSingleValue.encodeFloat(1.5f),
+                    com.posthog.hoglake.stats.IcebergSingleValue.encodeFloat(3.25f),
+                ),
+            )) {
+                h.execute(
+                    """
+                    INSERT INTO hog_file_column_stats
+                        (catalog_id, data_file_id, field_id, value_count, null_count, lower_bound, upper_bound)
+                    VALUES (?, 1, ?, 10, 0, ?, ?)
+                    """,
+                    catId(cat),
+                    field,
+                    lower,
+                    upper,
+                )
+            }
+        }
+
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(
+                AlterOp.PromoteColumn("count", ColType.LONG),
+                AlterOp.PromoteColumn("score", ColType.DOUBLE),
+            ),
+        )
+
+        val bounds =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT field_id, lower_bound, upper_bound FROM hog_file_column_stats
+                    WHERE catalog_id = ? AND data_file_id = 1
+                    """,
+                ).bind(0, catId(cat))
+                    .map { rs, _ ->
+                        rs.getLong("field_id") to Pair(rs.getBytes("lower_bound"), rs.getBytes("upper_bound"))
+                    }
+                    .list().toMap()
+            }
+        // 8-byte encodings under the NEW types, values preserved exactly
+        // (sign extension included — the negative int is the sharp edge).
+        assertThat(bounds[countField]!!.first)
+            .isEqualTo(com.posthog.hoglake.stats.IcebergSingleValue.encodeLong(-7L))
+        assertThat(bounds[countField]!!.second)
+            .isEqualTo(com.posthog.hoglake.stats.IcebergSingleValue.encodeLong(123L))
+        assertThat(bounds[scoreField]!!.first)
+            .isEqualTo(com.posthog.hoglake.stats.IcebergSingleValue.encodeDouble(1.5))
+        assertThat(bounds[scoreField]!!.second)
+            .isEqualTo(com.posthog.hoglake.stats.IcebergSingleValue.encodeDouble(3.25))
     }
 
     @Test

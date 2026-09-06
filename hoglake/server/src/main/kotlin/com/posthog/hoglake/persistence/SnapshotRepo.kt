@@ -20,6 +20,17 @@ object SnapshotRepo {
             )
         }
 
+    /**
+     * snapshot_time is stamped with clock_timestamp() (statement time),
+     * NOT the column default now() (transaction start time): every
+     * caller runs inside a transaction that may have QUEUED on the
+     * per-catalog advisory commit lock before reaching this insert, and
+     * now() would predate that wait — letting a convoyed commit record
+     * a time OLDER than an earlier-committed snapshot's. Statement time
+     * executes under the lock, so snapshot_time stays monotone with
+     * snapshot id (modulo the DB clock stepping backwards), which is
+     * the premise TimeTravelRepo.resolveTimestamp documents.
+     */
     fun insert(
         handle: Handle,
         catalogId: Long,
@@ -30,8 +41,8 @@ object SnapshotRepo {
     ) {
         handle.createUpdate(
             """
-            INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version, author, commit_message)
-            VALUES (:catalogId, :snapshotId, :schemaVersion, :author, :message)
+            INSERT INTO hog_snapshot (catalog_id, snapshot_id, snapshot_time, schema_version, author, commit_message)
+            VALUES (:catalogId, :snapshotId, clock_timestamp(), :schemaVersion, :author, :message)
             """,
         )
             .bind("catalogId", catalogId)

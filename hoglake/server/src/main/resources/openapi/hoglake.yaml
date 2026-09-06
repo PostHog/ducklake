@@ -430,6 +430,43 @@ paths:
               schema: { $ref: "#/components/schemas/VerifyReport" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /catalogs/{catalog}/maintenance/rehydrate:
+    post:
+      operationId: runRehydrate
+      summary: >
+        Requeue structurally-failed stats hydrations: flips
+        stats_state 'failed' back to 'pending' so the hydrator sweep
+        retries them — the operator recovery path after the cause is
+        fixed (object re-uploaded, registration corrected, whole-object
+        cap raised). Whole catalog by default; scope to one table by
+        supplying BOTH namespace and table (supplying only one is a
+        422). Transient object-store failures never need this: they
+        leave files 'pending' and retry on their own.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: namespace
+          in: query
+          required: false
+          description: Table scope, with `table`. Both or neither.
+          schema: { type: string }
+        - name: table
+          in: query
+          required: false
+          description: Table scope, with `namespace`. Both or neither.
+          schema: { type: string }
+      responses:
+        "200":
+          description: How many failed files were requeued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RehydrateResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: namespace/table supplied without the other
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
   /catalogs/{catalog}/maintenance/cleanup:
     post:
       operationId: runCleanup
@@ -1238,6 +1275,15 @@ components:
         removed: { type: integer, format: int64 }
         missing: { type: integer, format: int64 }
         still_referenced: { type: integer, format: int64 }
+
+    RehydrateResult:
+      type: object
+      required: [requeued]
+      properties:
+        requeued:
+          type: integer
+          format: int64
+          description: Failed files flipped back to pending.
 
     VerifyCheck:
       type: object

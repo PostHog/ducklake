@@ -65,8 +65,18 @@ object TimeTravelRepo {
      * - before the earliest RETAINED snapshot's time ->
      *   [HoglakeException.Expired] (that history is gone);
      * - between two snapshots -> the lower one;
-     * - after head's time -> head (snapshot_time is monotone with id
-     *   because every snapshot is minted under the catalog commit lock).
+     * - after head's time -> head.
+     *
+     * Ordering premise, stated honestly: snapshot_time is stamped with
+     * clock_timestamp() INSIDE the commit tail, after the per-catalog
+     * advisory lock is held (SnapshotRepo.insert / CommitService), so
+     * times are non-decreasing in snapshot-id order — UNLESS the
+     * database clock steps backwards (NTP correction). Under a clock
+     * regression max(id) can prefer a later snapshot whose recorded
+     * time is <= :ts while an earlier-id snapshot's is not; the result
+     * still honors the snapshots' own RECORDED times (the contract),
+     * just not wall-clock intuition. Callers get "the largest retained
+     * id whose recorded snapshot_time <= ts", nothing stronger.
      */
     fun resolveTimestamp(
         handle: Handle,

@@ -143,7 +143,9 @@ def test_append_full(table, httpx_mock, fake_s3):
     raw = fake_s3.files[key]
     assert file_reg["record_count"] == 3
     assert file_reg["file_size_bytes"] == len(raw)
-    expected_footer = struct.unpack("<I", raw[-8:-4])[0] + 8
+    # wire convention (bugs.md #7): footer_size == the trailer's 4-byte LE
+    # thrift length EXACTLY — it EXCLUDES the 8-byte length+magic suffix
+    expected_footer = struct.unpack("<I", raw[-8:-4])[0]
     assert file_reg["footer_size"] == expected_footer
 
     # stats: base64 Iceberg single-value bounds
@@ -175,6 +177,35 @@ def test_append_full(table, httpx_mock, fake_s3):
         if r.method == "GET" and str(r.url).endswith("/tables/events")
     ]
     assert len(table_gets) == 2
+
+
+def test_footer_size_wire_convention():
+    """bugs.md #7 regression: ``footer_size`` is the serialized thrift
+    FileMetaData length — the DB convention proven by the server's
+    hydrator tail math (``[file_size - footer_size - 8, file_size)``) and
+    by compaction's stored value — EXCLUDING the trailing 8-byte suffix
+    (4-byte LE length + b"PAR1"). pyhoglake used to ship ``meta_len + 8``;
+    the hydrator's tail read absorbed the 8-byte over-read, so files
+    registered with the old value need no repair — but any consumer
+    treating footer_size as exact would mis-slice every client-written
+    file. Pinned against a real pyarrow-written file with the trailer
+    parsed by hand."""
+    from pyhoglake.client import _footer_size
+
+    sink = io.BytesIO()
+    pq.write_table(pa.table({"id": [1, 2, 3], "name": ["a", "b", None]}), sink)
+    raw = sink.getvalue()
+
+    # parse the parquet trailer ourselves: ... [metadata][len LE32]["PAR1"]
+    assert raw[-4:] == b"PAR1"
+    (meta_len,) = struct.unpack("<I", raw[-8:-4])
+
+    assert _footer_size(raw) == meta_len  # NOT meta_len + 8
+    # and the value really delimits the serialized footer: the region the
+    # server's tail read covers, [file_size - footer_size - 8, file_size),
+    # starts exactly at the thrift metadata
+    footer_region = raw[len(raw) - meta_len - 8 : len(raw) - 8]
+    assert len(footer_region) == meta_len
 
 
 def test_append_deferred_stats(table, httpx_mock, fake_s3):

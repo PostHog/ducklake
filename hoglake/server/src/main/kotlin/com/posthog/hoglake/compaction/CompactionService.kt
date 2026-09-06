@@ -701,7 +701,24 @@ class CompactionService(
         takeUpper: Boolean,
     ): ByteArray? {
         if (bounds.any { it == null }) return null
-        val decoded = bounds.map { IcebergSingleValue.decode(type, it!!) }
+        // A bound that does not decode under the LIVE type (wrong width —
+        // e.g. a 4-byte int bound left behind by a pre-fix promote, or one
+        // a racing hydrator wrote under the pre-promote type) is treated
+        // as ABSENT, nulling this column's merged bound: honest missing
+        // metadata over a poison group that would throw here every sweep
+        // until the inputs expire. The sweep must never wedge on stats.
+        val decoded =
+            bounds.map { bound ->
+                try {
+                    IcebergSingleValue.decode(type, bound!!)
+                } catch (e: IllegalArgumentException) {
+                    log.warn {
+                        "compaction bound-merge: input bound (${bound!!.size} bytes) does not " +
+                            "decode as ${type.wire} (${e.message}); treating as absent"
+                    }
+                    return null
+                }
+            }
         val winner =
             decoded.reduce { a, b ->
                 val cmp = IcebergSingleValue.compareValues(type, a, b)

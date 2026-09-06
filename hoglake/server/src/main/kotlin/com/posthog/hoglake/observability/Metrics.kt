@@ -51,6 +51,14 @@ object Metrics {
     /** hoglake_stats_hydrated_total{result=provided|failed} */
     fun statsHydrated(result: String) = increment("hoglake_stats_hydrated_total", 1.0, "result", result)
 
+    /**
+     * hoglake_hydrator_transient_errors_total — footer fetches that
+     * failed transiently (S3 throttle/5xx, connection/timeout): the
+     * file STAYS 'pending' and the next sweep retries it, so this is
+     * the only trace a throttle storm leaves.
+     */
+    fun hydratorTransientError() = increment("hoglake_hydrator_transient_errors_total", 1.0)
+
     /** hoglake_compaction_groups_total{catalog} — groups successfully rewritten + committed. */
     fun compactionGroups(
         catalog: String,

@@ -9,10 +9,31 @@ by the catalog column type.
 
 from __future__ import annotations
 
+import struct
+
 import pyarrow.parquet as pq
 
 from .bounds import encode_bound
 from .models import Column, ColumnStats
+
+# Column types whose bounds are IEEE floats: min/max over row-group
+# bounds must use total-order semantics (see _float_total_order_key).
+_FLOAT_TYPES = frozenset({"float", "double"})
+
+
+def _float_total_order_key(v: float) -> int:
+    """IEEE-754 total-order sort key: the semantics of Kotlin/Java's
+    ``Double.compare``, under which ``-0.0 < 0.0``.
+
+    Python's ``min``/``max`` treat ``-0.0 == 0.0`` and keep the FIRST of
+    equal values, so the winning zero's sign — and therefore the encoded
+    bound bytes — would depend on row-group order (bugs.md #20). Mapping
+    the float's bit pattern (sign-magnitude) to a monotone integer makes
+    the choice deterministic: a min bound prefers -0.0 over +0.0, a max
+    bound prefers +0.0 over -0.0, regardless of order.
+    """
+    (bits,) = struct.unpack("<q", struct.pack("<d", v))
+    return bits if bits >= 0 else -(bits & 0x7FFFFFFFFFFFFFFF) - 1
 
 
 def extract_column_stats(
@@ -71,8 +92,14 @@ def extract_column_stats(
 
         lower = upper = None
         if have_min_max and mins:
-            lower = encode_bound(col.type, min(mins), col.type_params)
-            upper = encode_bound(col.type, max(maxs), col.type_params)
+            if col.type in _FLOAT_TYPES:
+                lo = min(mins, key=_float_total_order_key)
+                hi = max(maxs, key=_float_total_order_key)
+            else:
+                lo = min(mins)
+                hi = max(maxs)
+            lower = encode_bound(col.type, lo, col.type_params)
+            upper = encode_bound(col.type, hi, col.type_params)
 
         out.append(
             ColumnStats(

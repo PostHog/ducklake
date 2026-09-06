@@ -6,6 +6,7 @@ import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.CompactionService
+import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
@@ -90,6 +91,9 @@ class MaintenanceApiTest {
                         CompactionConfig(targetBytes = 512L * 1024 * 1024, minInputFiles = 4, maxGroupsPerRun = 1),
                     ),
                     VerifyService(db.jdbi),
+                    // Rehydrate is metadata-only (a stats_state flip); the
+                    // store is never contacted by these tests.
+                    Hydrator(db.jdbi, compactionStore),
                 )
             }
             block(client)
@@ -359,6 +363,58 @@ class MaintenanceApiTest {
 
             assertApiError(
                 client.postJson("/v1/catalogs/mnt-nope/maintenance/verify"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+        }
+
+    // ---- maintenance/rehydrate ----------------------------------------------
+
+    @Test
+    fun `rehydrate endpoint requeues failed files and validates scope per the spec`() =
+        api { client ->
+            client.createCatalog("mnt-rehydrate")
+            client.postJson("/v1/catalogs/mnt-rehydrate/namespaces", """{"name": "ns"}""")
+            // A failed file, seeded directly (structural hydration outcomes
+            // are exercised in HydratorIntegrationTest; this is the wire).
+            db.jdbi.useHandleUnchecked { h ->
+                val catalogId =
+                    h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = 'mnt-rehydrate'")
+                        .mapTo(Long::class.java).one()
+                h.execute(
+                    "INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (?, 1, 1)",
+                    catalogId,
+                )
+                h.execute(
+                    """
+                    INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                        path, record_count, file_size_bytes, row_id_start, stats_state)
+                    VALUES (?, 1, 1, 1, 's3://b/failed.parquet', 10, 100, 0, 'failed')
+                    """,
+                    catalogId,
+                )
+            }
+
+            val result =
+                body(
+                    client.postJson("/v1/catalogs/mnt-rehydrate/maintenance/rehydrate").also {
+                        assertThat(it.status).isEqualTo(HttpStatusCode.OK)
+                    },
+                )
+            assertThat(result["requeued"].asLong()).isEqualTo(1)
+            // Idempotent second call: nothing left to requeue.
+            assertThat(
+                body(client.postJson("/v1/catalogs/mnt-rehydrate/maintenance/rehydrate"))["requeued"].asLong(),
+            ).isEqualTo(0)
+
+            // Half a table scope -> 422; unknown catalog -> 404.
+            assertApiError(
+                client.postJson("/v1/catalogs/mnt-rehydrate/maintenance/rehydrate?namespace=ns"),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            assertApiError(
+                client.postJson("/v1/catalogs/mnt-nope/maintenance/rehydrate"),
                 HttpStatusCode.NotFound,
                 "not_found",
             )

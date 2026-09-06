@@ -72,6 +72,9 @@ class App private constructor(
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
     private val objectStore = ObjectStore(cfg)
+
+    /** One hydrator: the background sweep loop AND the rehydrate route. */
+    private val hydrator = Hydrator(jdbi, objectStore, maxWholeObjectBytes = cfg.hydratorMaxWholeObjectBytes)
     private val compactionService =
         CompactionService(
             jdbi,
@@ -176,7 +179,14 @@ class App private constructor(
         app.installAlterRoutes(alterService)
         app.installScanRoutes(scanService)
         app.installViewRoutes(viewService)
-        app.installMaintenanceRoutes(optionsService, expiryService, cleanupService, compactionService, verifyService)
+        app.installMaintenanceRoutes(
+            optionsService,
+            expiryService,
+            cleanupService,
+            compactionService,
+            verifyService,
+            hydrator,
+        )
         app.installPublicationRoutes()
     }
 
@@ -188,7 +198,6 @@ class App private constructor(
      */
     fun startBackground(): AutoCloseable {
         val loops = BackgroundLoops()
-        val hydrator = Hydrator(jdbi, objectStore)
         loops.register("hydrator", cfg.hydratorIntervalMs) { hydrator.runOnce() }
         loops.register("expiry", cfg.expiryIntervalMs) {
             expiryService.runOnceAllCatalogs(cfg.expiryBatchSize)

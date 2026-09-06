@@ -5,6 +5,7 @@ disposable: catalog ``pyhog-<runid>`` with data under
 ``s3://pyhog-itest/<runid>/``.
 """
 
+import struct
 import time
 import uuid
 from datetime import datetime
@@ -163,16 +164,46 @@ def test_append_lifecycle_roundtrip(client, catalog, ns, s3config):
     assert info.file_count == 1
 
 
-def test_deferred_append_stays_pending(catalog, ns):
+def test_deferred_append_hydrates_with_exact_footer_size(catalog, ns, s3config):
+    """Live regression for the footer_size wire convention (bugs.md #7):
+    deferred-stats append -> the hydrator tail-reads the footer with the
+    registered EXACT size -> the file flips to 'provided'.
+
+    footer_size must be the trailer's 4-byte LE thrift length, EXCLUDING
+    the 8-byte length+magic suffix (the convention the server's tail math
+    and compaction's stored value define). Files registered before this
+    fix carried meta_len + 8; the hydrator's tolerant tail read absorbs
+    that over-read, so no data repair is needed for them — this test pins
+    that the NEW exact value works end-to-end against the live server.
+    (Replaces test_deferred_append_stays_pending, whose premise — hydrator
+    loop off on the dev server — does not hold: the server runs the
+    hydrator at its 5s default.)"""
     table = ns.create_table("deferred", _events_schema())
     table.append(_events_data(50), deferred_stats=True)
     (f,) = table.files()
-    assert f.stats_state == "pending"
+    assert f.stats_state == "pending"  # no inline stats at commit
     assert f.record_count == 50  # record_count can never be deferred
-    # live server runs with the hydrator loop OFF: pending must persist
-    time.sleep(2)
-    (f,) = table.files()
-    assert f.stats_state == "pending"
+
+    # the registered footer_size is the exact trailer meta_len
+    fs = s3config.filesystem()
+    raw = fs.open_input_file(f.path[len("s3://") :]).read()
+    assert raw[-4:] == b"PAR1"
+    (meta_len,) = struct.unpack("<I", raw[-8:-4])
+    assert f.footer_size == meta_len
+
+    # the hydrator sweep (5s interval, 100 files/sweep on the dev server)
+    # picks it up and the stats land: 'provided' is flipped in the same
+    # transaction as the per-column stats upserts. Generous deadline: the
+    # qe_live_adversarial suite (which runs first in this session)
+    # fabricates ~1000 pending registrations that drain ahead of this
+    # file at ~100 per 5s sweep.
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        (f,) = table.files()
+        if f.stats_state != "pending":
+            break
+        time.sleep(1.0)
+    assert f.stats_state == "provided"
 
 
 def test_changes_correctness(catalog, ns):

@@ -419,6 +419,57 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
+    fun `a wrong-width stats bound never wedges the sweep - the group compacts with that bound null`() {
+        // Pinned regression (bug hunt #5, belt-and-braces half): a bound
+        // that does not decode under the live type (a 4-byte residue from
+        // a pre-fix promote, or a racing hydrator's stale-typed upsert)
+        // used to throw out of mergeBound EVERY sweep — a poison group
+        // wedged until its inputs expired. It must instead be treated as
+        // absent: the group compacts, that column's merged bound is null.
+        val fx = fixture()
+        db.jdbi.useHandleUnchecked { h ->
+            h.execute(
+                """
+                UPDATE hog_file_column_stats SET lower_bound = ?
+                WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = ?)
+                  AND data_file_id = ? AND field_id = 1
+                """,
+                IcebergSingleValue.encodeInt(-10),
+                fx.cat,
+                fx.fileIds[0],
+            )
+        }
+
+        val result = svc.runOnce(fx.cat, cfg)
+        assertThat(result.groupsCompacted).isEqualTo(1) // not wedged
+
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
+        val stats =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT field_id, lower_bound, upper_bound FROM hog_file_column_stats s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :cat AND s.data_file_id = :fileId
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .map { rs, _ ->
+                        rs.getLong("field_id") to Pair(rs.getBytes("lower_bound"), rs.getBytes("upper_bound"))
+                    }
+                    .list()
+                    .toMap()
+            }
+        // The poisoned side is null (honest absence), the clean side merged.
+        assertThat(stats[1L]!!.first).isNull()
+        assertThat(stats[1L]!!.second).isEqualTo(IcebergSingleValue.encodeLong(5))
+        // Untouched columns merged normally.
+        assertThat(stats[2L]!!.first).isEqualTo(IcebergSingleValue.encodeString("a"))
+        assertThat(stats[3L]!!.second).isEqualTo(IcebergSingleValue.encodeDouble(9.0))
+    }
+
+    @Test
     fun `changefeed replays original files and never the compacted output`() {
         val fx = fixture()
         svc.runOnce(fx.cat, cfg)

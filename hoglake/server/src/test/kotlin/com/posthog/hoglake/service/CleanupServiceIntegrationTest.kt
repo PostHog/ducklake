@@ -1,7 +1,9 @@
 package com.posthog.hoglake.service
 
 import com.posthog.hoglake.hydrator.ObjectStore
+import com.posthog.hoglake.model.CleanupResult
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -346,6 +348,49 @@ class CleanupServiceIntegrationTest {
         val rest = svc.runOnce("cl-batch", batchSize = 2)
         assertThat(rest.removed).isEqualTo(1)
         assertThat(queuedPaths(catalogId)).isEmpty()
+    }
+
+    @Test
+    fun `drain sub-batches take the per-catalog commit lock`() {
+        // Pinned regression (bug hunt #2, locking half): the reference
+        // check and the physical delete must be serialized against the
+        // commit tail via the SAME advisory lock every commit takes.
+        // Without it, an in-flight commit past its own removal-queue
+        // check could insert a hog_data_file row for a queued path that
+        // referencedPaths (READ COMMITTED) cannot see yet — the drain
+        // would delete the object under the about-to-commit live row.
+        // With the lock, the drain waits for the commit to finish (and
+        // then sees its rows), or the commit waits for the sub-batch.
+        // This test asserts the lock is actually taken: while a fake
+        // "commit" holds it, the drain makes no progress.
+        val catalogId = seedCatalog("cl-lock")
+        val path = "s3://$BUCKET/cl-lock/f.parquet"
+        putObject(path)
+        queue(catalogId, path)
+
+        val holder = jdbi.open()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            holder.begin()
+            Locks.acquireCatalogCommitLock(holder, catalogId)
+
+            val drain = executor.submit<CleanupResult> { svc.runOnce("cl-lock", batchSize = 100) }
+            Thread.sleep(500)
+            // Blocked behind the "commit": nothing settled, object intact.
+            assertThat(drain.isDone).isFalse()
+            assertThat(queuedPaths(catalogId)).containsExactly(path)
+            assertThat(removals.exists(path)).isTrue()
+
+            holder.rollback() // the "commit" finishes; the drain proceeds
+            val result = drain.get(30, java.util.concurrent.TimeUnit.SECONDS)
+            assertThat(result.removed).isEqualTo(1)
+            assertThat(queuedPaths(catalogId)).isEmpty()
+            assertThat(removals.exists(path)).isFalse()
+        } finally {
+            if (holder.isInTransaction) holder.rollback()
+            holder.close()
+            executor.shutdownNow()
+        }
     }
 
     @Test

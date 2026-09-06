@@ -200,6 +200,14 @@ class CatalogService(private val jdbi: Jdbi) {
                     t.tableId,
                 )
                 TableRepo.markDropped(h, cat.catalogId, t.tableId, alloc.snapshotId)
+                // DVs FIRST, same end-snapshot pattern as the data files: a
+                // live DV left open on a dropped table would be invisible
+                // to expiry's range predicates (end_snapshot IS NULL never
+                // sinks below the floor), leaking the row AND the object
+                // forever. End-snapshotted here, the superseded-DV
+                // lifecycle reclaims it: expiry queues the path once the
+                // drop snapshot falls under the retention floor.
+                FileRepo.endLiveDeleteFiles(h, cat.catalogId, t.tableId, alloc.snapshotId)
                 FileRepo.endLiveFiles(h, cat.catalogId, t.tableId, alloc.snapshotId)
                 CommitResult(snapshotId = alloc.snapshotId, schemaVersion = alloc.schemaVersion)
             }
@@ -416,6 +424,22 @@ class CatalogService(private val jdbi: Jdbi) {
                 if (snapshotId < 0 || snapshotId > cat.headSnapshotId) {
                     throw HoglakeException.Validation(
                         "snapshot $snapshotId out of range [0, ${cat.headSnapshotId}]",
+                    )
+                }
+                // The floor guard (mirrors every read path's 410 contract):
+                // a committed offset below earliest_snapshot_id is a
+                // position in expired history the consumer can never read
+                // from — and on consumer_floor catalogs it would pin every
+                // future expiry sweep to a zero-work return FOREVER (the
+                // sweep's min-offset bound could never rise above the
+                // floor, and no offset-delete API exists to unwedge it).
+                if (snapshotId < cat.earliestSnapshotId) {
+                    val floor = TimeTravelRepo.expiryFloor(h, cat.catalogId)
+                    throw HoglakeException.Expired(
+                        "cannot commit offset at snapshot $snapshotId: it is below the " +
+                            "expiry floor (earliest retained snapshot is " +
+                            "${floor.earliestSnapshotId}${floor.reachedAtSuffix()}); " +
+                            "reconcile from a full scan at a retained snapshot",
                     )
                 }
                 // The uuid must name a table this catalog has EVER had — any

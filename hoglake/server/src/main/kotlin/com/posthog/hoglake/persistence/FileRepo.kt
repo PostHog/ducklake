@@ -163,6 +163,30 @@ object FileRepo {
             .map(fileMapper)
             .list()
 
+    /**
+     * Drop tail, DV half: end-snapshot every live deletion vector of the
+     * table (same UPDATE pattern as [endLiveFiles]). Runs BEFORE the
+     * data-file pass in dropTable so no live DV survives its data file's
+     * retirement; expiry's step-1 range predicate then reclaims the row
+     * and queues the object once the drop snapshot sinks under the floor.
+     */
+    fun endLiveDeleteFiles(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ): Int =
+        handle.createUpdate(
+            """
+            UPDATE hog_delete_file SET end_snapshot = :snapshot
+            WHERE catalog_id = :catalogId AND table_id = :tableId AND end_snapshot IS NULL
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("snapshot", snapshot)
+            .execute()
+
     /** Drop tail: end-snapshot every live file of the table. */
     fun endLiveFiles(
         handle: Handle,

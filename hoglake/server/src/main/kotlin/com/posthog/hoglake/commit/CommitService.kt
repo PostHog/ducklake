@@ -131,6 +131,18 @@ class CommitService(
         return result
     }
 
+    /** hog_catalog head-of-line state, read once under the commit lock. */
+    private data class CatalogHead(
+        val head: Long,
+        val schemaVersion: Long,
+        val earliestSnapshotId: Long,
+        /** Expiry-floor anchor time; null until expiry first advances the floor. */
+        val earliestSnapshotTime: java.time.Instant?,
+    ) {
+        /** ", reached at <time>" suffix for 410 messages (TimeTravelRepo's convention). */
+        fun reachedAtSuffix(): String = earliestSnapshotTime?.let { ", reached at $it" } ?: ""
+    }
+
     /** Live partition spec header: id + field arity. */
     private data class LiveSpec(val specId: Long, val fieldCount: Int)
 
@@ -164,13 +176,25 @@ class CommitService(
                 .orElseThrow { HoglakeException.NotFound("catalog '$catalogName'") }
         Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
 
-        val (head, schemaVersion) =
+        val catalogHead =
             h.createQuery(
-                "SELECT last_snapshot_id, schema_version FROM hog_catalog WHERE catalog_id = ?",
+                """
+                SELECT last_snapshot_id, schema_version, earliest_snapshot_id, earliest_snapshot_time
+                FROM hog_catalog WHERE catalog_id = ?
+                """,
             )
                 .bind(0, catalogId)
-                .map { rs, _ -> rs.getLong(1) to rs.getLong(2) }
+                .map { rs, _ ->
+                    CatalogHead(
+                        head = rs.getLong(1),
+                        schemaVersion = rs.getLong(2),
+                        earliestSnapshotId = rs.getLong(3),
+                        earliestSnapshotTime =
+                            rs.getObject(4, java.time.OffsetDateTime::class.java)?.toInstant(),
+                    )
+                }
                 .one()
+        val (head, schemaVersion) = catalogHead.head to catalogHead.schemaVersion
 
         // 2. Merge duplicate (namespace, table) appends/deletes, preserving
         // request order (first occurrence for tables, concatenation for
@@ -250,6 +274,17 @@ class CommitService(
         }
         validateDeleteRegistrations(resolvedDeletes)
 
+        // 3b. Removal-queue collision check (under the commit lock, so it
+        // serializes with cleanup's drain sub-batches, which take the same
+        // lock): a registered path with an UNDRAINED hog_file_removal row
+        // is scheduled for physical deletion — accepting it would let the
+        // cleanup drain delete the object out from under the new live row
+        // (path reuse under a deterministic path scheme / writer retry).
+        // Duplicate paths against live/historical file rows stay legal —
+        // this rejects only paths the cleanup queue currently owns; once
+        // the entry drains (drained_at set) the path is registrable again.
+        checkRemovalQueueCollisions(h, catalogId, resolvedAppends, resolvedDeletes)
+
         // 4. Conflict check ('table_dropped'/'table_altered' since
         // readSnapshot on every touched table — appends and deletes share
         // the one-query pattern). readSnapshot is non-null whenever deletes
@@ -258,6 +293,24 @@ class CommitService(
             if (readSnapshot > head) {
                 throw HoglakeException.Validation(
                     "readSnapshot $readSnapshot is ahead of catalog head $head",
+                )
+            }
+            // The floor guard: expiry cascade-deletes hog_snapshot_change
+            // rows below earliest_snapshot_id, so a readSnapshot under the
+            // floor has a partly-expired conflict window — checkConflicts
+            // below could silently miss a 'table_altered'/'table_dropped'
+            // in the expired range. 410, matching every read path's
+            // below-floor contract: the writer's conflict basis is gone;
+            // it must re-read at a retained snapshot and re-commit.
+            // readSnapshot == earliest is fine (the window (earliest, head]
+            // is fully retained).
+            if (readSnapshot < catalogHead.earliestSnapshotId) {
+                throw HoglakeException.Expired(
+                    "read_snapshot $readSnapshot is below the expiry floor (earliest " +
+                        "retained snapshot is ${catalogHead.earliestSnapshotId}" +
+                        "${catalogHead.reachedAtSuffix()}): the conflict window since " +
+                        "that snapshot is partly expired; re-read at a retained " +
+                        "snapshot and re-commit",
                 )
             }
             val names = HashMap<Long, String>()
@@ -290,10 +343,17 @@ class CommitService(
         // 6. Writes: snapshot, change rows, then appends before deletes (a
         // delete targeting a same-commit data file is detected below by its
         // begin_snapshot and rejected, rolling the whole commit back).
+        // snapshot_time = clock_timestamp(), NOT the column default now():
+        // now() is the TRANSACTION start time, which predates the advisory
+        // lock wait, so defaulting it would let a queued commit record a
+        // time older than an earlier-committed snapshot's. clock_timestamp()
+        // executes here, under the lock, keeping snapshot_time monotone
+        // with snapshot id (modulo the DB clock stepping backwards) — the
+        // premise resolveTimestamp relies on.
         h.createUpdate(
             """
-            INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version, author, commit_message)
-            VALUES (:catalogId, :snapshotId, :schemaVersion, :author, :message)
+            INSERT INTO hog_snapshot (catalog_id, snapshot_id, snapshot_time, schema_version, author, commit_message)
+            VALUES (:catalogId, :snapshotId, clock_timestamp(), :schemaVersion, :author, :message)
             """,
         )
             .bind("catalogId", catalogId)
@@ -333,6 +393,45 @@ class CommitService(
         applyDeletes(h, catalogId, snapshotId, readSnapshot, nextFileId, resolvedDeletes)
 
         return CommitResult(snapshotId, schemaVersion)
+    }
+
+    /**
+     * Reject any registered path (data or DV) that has an undrained
+     * hog_file_removal row in this catalog: the path is scheduled for
+     * physical deletion and the cleanup drain (serialized against this
+     * check by the shared per-catalog advisory lock) would delete the
+     * object out from under the new row. Typed 409 — the writer retries
+     * with a fresh path, or after the drain settles the entry.
+     */
+    private fun checkRemovalQueueCollisions(
+        h: Handle,
+        catalogId: Long,
+        appends: List<ResolvedAppend>,
+        deletes: List<ResolvedDeletes>,
+    ) {
+        val paths =
+            (appends.flatMap { a -> a.files.map { it.path } } + deletes.flatMap { d -> d.files.map { it.path } })
+                .distinct()
+        if (paths.isEmpty()) return
+        val queued =
+            h.createQuery(
+                """
+                SELECT DISTINCT path FROM hog_file_removal
+                WHERE catalog_id = :catalogId AND drained_at IS NULL AND path = ANY(:paths)
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bindArray("paths", String::class.java, paths)
+                .mapTo(String::class.java)
+                .list()
+        if (queued.isNotEmpty()) {
+            throw HoglakeException.CommitConflict(
+                "path(s) scheduled for deletion by the cleanup queue: " +
+                    queued.sorted().joinToString(", ") +
+                    " — registering them would race the physical delete; use fresh " +
+                    "paths, or retry after the removal queue drains",
+            )
+        }
     }
 
     /** hog_data_file / hog_file_partition_value / hog_file_column_stats writes. Returns the next free file id. */
@@ -388,7 +487,17 @@ class CommitService(
                 } catch (_: ArithmeticException) {
                     throw HoglakeException.Validation("record_count sum overflows row-id space")
                 }
-            val byteSum = append.files.sumOf { it.fileSizeBytes }
+            // Overflow-checked like recordSum: a wrapped byte sum would
+            // corrupt the hog_table_stats rollup (and the CHECK
+            // (file_size_bytes >= 0) on hog_table_stats is the DB backstop).
+            val byteSum =
+                try {
+                    append.files.fold(0L) { acc, f -> Math.addExact(acc, f.fileSizeBytes) }
+                } catch (_: ArithmeticException) {
+                    throw HoglakeException.Validation(
+                        "file_size_bytes sum overflows for ${append.namespace}.${append.table}",
+                    )
+                }
             // Per-table row-id range: read the allocator, advance it with
             // the table's rollup (safe read-then-write — the per-catalog
             // advisory lock serializes every writer); each file gets a

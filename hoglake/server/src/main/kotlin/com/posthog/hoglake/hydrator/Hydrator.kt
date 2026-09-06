@@ -2,7 +2,13 @@ package com.posthog.hoglake.hydrator
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.RehydrateResult
+import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.NamespaceRepo
+import com.posthog.hoglake.persistence.TableRepo
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
@@ -10,7 +16,10 @@ import org.apache.parquet.io.InputFile
 import org.apache.parquet.io.SeekableInputStream
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
+import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.statement.Update
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException
+import software.amazon.awssdk.services.s3.model.S3Exception
 import java.io.EOFException
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -36,13 +45,36 @@ import java.sql.Types
  * Footer-only: nothing here decodes data pages. When the registration
  * carried `footer_size`, only the object's tail is fetched (ranged GET);
  * otherwise (or if the tail turns out not to contain everything the footer
- * parse needs) the whole object is fetched.
+ * parse needs) the whole object is fetched — capped at
+ * [maxWholeObjectBytes] (HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES): a
+ * larger file without a usable footer_size fails structurally instead of
+ * buffering unbounded bytes on the heap.
+ *
+ * Failure taxonomy: TRANSIENT object-store failures (throttle/5xx,
+ * connection, timeout — anything but a definitive 404/NoSuchKey) leave
+ * the file 'pending' (logged + `hoglake_hydrator_transient_errors_total`)
+ * for the next sweep; STRUCTURAL ones (object missing, unparseable
+ * footer, registration mismatch, over-cap) mark it 'failed'. 'failed' is
+ * terminal to the sweep but operator-recoverable: [rehydrateFailed]
+ * (POST /maintenance/rehydrate) flips failed rows back to pending.
+ *
+ * Work-claiming: one sweep is ONE transaction whose claim query uses
+ * FOR UPDATE SKIP LOCKED, so concurrent replicas hydrate DISJOINT sets
+ * instead of racing the same pending head through S3 (the guarded flip
+ * kept that correct but paid N× the GETs). The row locks are held across
+ * the footer fetches — acceptable for a background sweep bounded by
+ * [runOnce]'s limit; foreground paths never lock pending rows.
  */
-class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
+class Hydrator(
+    private val jdbi: Jdbi,
+    private val store: ObjectStore,
+    /** Whole-object fallback cap; see class KDoc. */
+    private val maxWholeObjectBytes: Long = DEFAULT_MAX_WHOLE_OBJECT_BYTES,
+) {
     private val log = KotlinLogging.logger {}
     private val json = ObjectMapper()
 
-    private data class PendingFile(
+    internal data class PendingFile(
         val catalogId: Long,
         val dataFileId: Long,
         val tableId: Long,
@@ -50,52 +82,145 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
         val recordCount: Long,
         val fileSizeBytes: Long,
         val footerSize: Long?,
+        val beginSnapshot: Long,
     )
 
-    /** One sweep: hydrate up to [limit] pending files. Returns files processed. */
-    fun runOnce(limit: Int = 100): Int {
-        val pending =
-            jdbi.withHandle<List<PendingFile>, Exception> { h ->
-                h.createQuery(
-                    """
-                SELECT catalog_id, data_file_id, table_id, path, record_count,
-                       file_size_bytes, footer_size
-                FROM hog_data_file
-                WHERE stats_state = 'pending'
-                ORDER BY catalog_id, data_file_id
-                LIMIT :limit
-                """,
+    /** A retryable object-store failure: the file must STAY pending. */
+    private class TransientFetchException(message: String, cause: Throwable) : RuntimeException(message, cause)
+
+    /**
+     * The sweep's claim query: pending rows in (catalog_id, data_file_id)
+     * order, locked FOR UPDATE with SKIP LOCKED so a concurrent replica's
+     * sweep claims a disjoint set. Must run inside the sweep transaction
+     * (the locks ARE the claim).
+     */
+    internal fun claimPending(
+        h: Handle,
+        limit: Int,
+    ): List<PendingFile> =
+        h.createQuery(
+            """
+            SELECT catalog_id, data_file_id, table_id, path, record_count,
+                   file_size_bytes, footer_size, begin_snapshot
+            FROM hog_data_file
+            WHERE stats_state = 'pending'
+            ORDER BY catalog_id, data_file_id
+            LIMIT :limit
+            FOR UPDATE SKIP LOCKED
+            """,
+        )
+            .bind("limit", limit)
+            .map { rs, _ ->
+                PendingFile(
+                    catalogId = rs.getLong("catalog_id"),
+                    dataFileId = rs.getLong("data_file_id"),
+                    tableId = rs.getLong("table_id"),
+                    path = rs.getString("path"),
+                    recordCount = rs.getLong("record_count"),
+                    fileSizeBytes = rs.getLong("file_size_bytes"),
+                    footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
+                    beginSnapshot = rs.getLong("begin_snapshot"),
                 )
-                    .bind("limit", limit)
-                    .map { rs, _ ->
-                        PendingFile(
-                            catalogId = rs.getLong("catalog_id"),
-                            dataFileId = rs.getLong("data_file_id"),
-                            tableId = rs.getLong("table_id"),
-                            path = rs.getString("path"),
-                            recordCount = rs.getLong("record_count"),
-                            fileSizeBytes = rs.getLong("file_size_bytes"),
-                            footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
-                        )
-                    }
-                    .list()
             }
-        for (file in pending) {
-            try {
-                hydrate(file)
-            } catch (e: Exception) {
-                // One bad file must not wedge the sweep.
-                log.error(e) {
-                    "hydration failed for file ${file.dataFileId} (${file.path}); marking failed"
+            .list()
+
+    /**
+     * One sweep: hydrate up to [limit] pending files. Returns files
+     * processed (transient failures included — they were claimed and
+     * attempted). Each file's writes ride a savepoint so one file's DB
+     * failure never poisons the sweep transaction for the rest.
+     */
+    fun runOnce(limit: Int = 100): Int =
+        jdbi.inTransaction<Int, Exception> { h ->
+            val pending = claimPending(h, limit)
+            for (file in pending) {
+                h.savepoint(FILE_SAVEPOINT)
+                try {
+                    hydrate(h, file)
+                } catch (e: TransientFetchException) {
+                    h.rollbackToSavepoint(FILE_SAVEPOINT)
+                    // Transient: the file STAYS pending; the next sweep
+                    // retries it. The counter is the throttle-storm trace.
+                    Metrics.hydratorTransientError()
+                    log.warn(e) {
+                        "transient object-store failure hydrating file ${file.dataFileId} " +
+                            "(${file.path}); leaving pending for the next sweep"
+                    }
+                } catch (e: Exception) {
+                    h.rollbackToSavepoint(FILE_SAVEPOINT)
+                    // Structural: one bad file must not wedge the sweep.
+                    log.error(e) {
+                        "hydration failed for file ${file.dataFileId} (${file.path}); marking failed"
+                    }
+                    markFailed(h, file)
                 }
-                markFailed(file)
+            }
+            pending.size
+        }
+
+    /**
+     * Operator requeue (POST /v1/catalogs/{c}/maintenance/rehydrate):
+     * flip the catalog's 'failed' files back to 'pending' — optionally
+     * scoped to one table — so the sweep retries them. The recovery path
+     * for structural failures whose cause was fixed (object re-uploaded,
+     * registration corrected, cap raised).
+     */
+    fun rehydrateFailed(
+        catalog: String,
+        namespace: String? = null,
+        table: String? = null,
+    ): RehydrateResult =
+        Audit.audited(
+            "rehydrate",
+            catalog,
+            table?.let { "$namespace.$it" },
+            detail = { "requeued=${it.requeued}" },
+        ) {
+            if ((namespace == null) != (table == null)) {
+                throw HoglakeException.Validation(
+                    "namespace and table must be supplied together (or neither, for the whole catalog)",
+                )
+            }
+            jdbi.inTransactionUnchecked { h ->
+                val cat = CatalogRepo.require(h, catalog)
+                val tableId =
+                    if (namespace != null && table != null) {
+                        val ns =
+                            NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)
+                                ?: throw HoglakeException.NotFound(
+                                    "namespace '$namespace' in catalog '$catalog'",
+                                )
+                        val t =
+                            TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
+                                ?: throw HoglakeException.NotFound(
+                                    "table '$namespace.$table' in catalog '$catalog'",
+                                )
+                        t.tableId
+                    } else {
+                        null
+                    }
+                val requeued =
+                    h.createUpdate(
+                        """
+                        UPDATE hog_data_file
+                           SET stats_state = 'pending'
+                        WHERE catalog_id = :catalogId AND stats_state = 'failed'
+                          AND (:tableId::bigint IS NULL OR table_id = :tableId)
+                        """,
+                    )
+                        .bind("catalogId", cat.catalogId)
+                        .apply {
+                            if (tableId == null) bindNull("tableId", Types.BIGINT) else bind("tableId", tableId)
+                        }
+                        .execute()
+                RehydrateResult(requeued.toLong())
             }
         }
-        return pending.size
-    }
 
-    private fun hydrate(file: PendingFile) {
-        val columns = liveColumns(file)
+    private fun hydrate(
+        h: Handle,
+        file: PendingFile,
+    ) {
         val footer = readFooter(file)
         // The field-id contract check rides the footer we already hold.
         val missingFieldIds = FooterStats.missingFieldIds(footer.fileMetaData.schema)
@@ -106,29 +231,40 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
                     "parquet footer has $footerRows rows but hog_data_file.record_count " +
                     "is ${file.recordCount}; marking failed, writing no stats"
             }
-            markFailed(file, missingFieldIds)
+            markFailed(h, file, missingFieldIds)
             return
         }
+        // Column binding: id-bearing files map by field id, a stable
+        // identity — the LIVE column set is correct at any time. Id-less
+        // files bind by NAME, so the names must resolve against the schema
+        // the file was committed under (visible at its begin_snapshot),
+        // never live-at-hydration: a drop+add-same-name between commit and
+        // this sweep would otherwise land the old incarnation's stats
+        // under the NEW field id, poisoning pruning on the new column.
+        val columns =
+            if (FooterStats.usesFieldIds(footer.fileMetaData.schema)) {
+                catalogColumns(h, file, at = null)
+            } else {
+                catalogColumns(h, file, at = file.beginSnapshot)
+            }
         val aggs = FooterStats.aggregate(footer, columns, file.path)
-        jdbi.useTransaction<Exception> { h ->
-            for (agg in aggs) upsertStats(h, file, agg)
-            val flipped =
-                h.createUpdate(
-                    """
+        for (agg in aggs) upsertStats(h, file, agg)
+        val flipped =
+            h.createUpdate(
+                """
                 UPDATE hog_data_file
                    SET stats_state = 'provided', missing_field_ids = :missingFieldIds
                 WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
                   AND stats_state = 'pending'
                 """,
-                )
-                    .bind("missingFieldIds", missingFieldIds)
-                    .bind("catalogId", file.catalogId)
-                    .bind("dataFileId", file.dataFileId)
-                    .execute()
-            if (flipped == 0) {
-                log.warn {
-                    "file ${file.dataFileId} left 'pending' concurrently; stats upserted anyway"
-                }
+            )
+                .bind("missingFieldIds", missingFieldIds)
+                .bind("catalogId", file.catalogId)
+                .bind("dataFileId", file.dataFileId)
+                .execute()
+        if (flipped == 0) {
+            log.warn {
+                "file ${file.dataFileId} left 'pending' concurrently; stats upserted anyway"
             }
         }
         Metrics.statsHydrated("provided")
@@ -177,65 +313,86 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
     /**
      * Flip to 'failed'; when the footer WAS parsed (record-count
      * mismatch), [missingFieldIds] still records the contract check.
+     * Rides the sweep transaction's handle (after a rollback to the
+     * per-file savepoint the transaction is healthy again).
      */
     private fun markFailed(
+        h: Handle,
         file: PendingFile,
         missingFieldIds: Boolean? = null,
     ) {
         Metrics.statsHydrated("failed")
         try {
-            jdbi.useHandle<Exception> { h ->
-                h.createUpdate(
-                    """
-                    UPDATE hog_data_file
-                       SET stats_state = 'failed',
-                           missing_field_ids = COALESCE(:missingFieldIds, missing_field_ids)
-                    WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
-                      AND stats_state = 'pending'
-                    """,
-                )
-                    .apply {
-                        if (missingFieldIds == null) {
-                            bindNull("missingFieldIds", Types.BOOLEAN)
-                        } else {
-                            bind("missingFieldIds", missingFieldIds)
-                        }
+            h.createUpdate(
+                """
+                UPDATE hog_data_file
+                   SET stats_state = 'failed',
+                       missing_field_ids = COALESCE(:missingFieldIds, missing_field_ids)
+                WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
+                  AND stats_state = 'pending'
+                """,
+            )
+                .apply {
+                    if (missingFieldIds == null) {
+                        bindNull("missingFieldIds", Types.BOOLEAN)
+                    } else {
+                        bind("missingFieldIds", missingFieldIds)
                     }
-                    .bind("catalogId", file.catalogId)
-                    .bind("dataFileId", file.dataFileId)
-                    .execute()
-            }
+                }
+                .bind("catalogId", file.catalogId)
+                .bind("dataFileId", file.dataFileId)
+                .execute()
         } catch (e: Exception) {
             log.error(e) { "could not mark file ${file.dataFileId} failed" }
         }
     }
 
-    private fun liveColumns(file: PendingFile): List<CatalogColumn> =
-        jdbi.withHandle<List<CatalogColumn>, Exception> { h ->
-            h.createQuery(
+    /**
+     * The table's catalog columns for stats binding: [at] null = the LIVE
+     * set (end_snapshot IS NULL — field-id binding); [at] non-null = the
+     * set visible at that snapshot (the versioned-row rule — name-fallback
+     * binding at the file's begin_snapshot).
+     */
+    private fun catalogColumns(
+        h: Handle,
+        file: PendingFile,
+        at: Long?,
+    ): List<CatalogColumn> =
+        h.createQuery(
+            if (at == null) {
                 """
                 SELECT field_id, name, col_type, type_params::text AS type_params
                 FROM hog_column
                 WHERE catalog_id = :catalogId AND table_id = :tableId
                   AND end_snapshot IS NULL
                 ORDER BY ordinal
-                """,
-            )
-                .bind("catalogId", file.catalogId)
-                .bind("tableId", file.tableId)
-                .map { rs, _ ->
-                    CatalogColumn(
-                        fieldId = rs.getLong("field_id"),
-                        name = rs.getString("name"),
-                        type = ColType.fromWire(rs.getString("col_type")),
-                        decimalScale =
-                            rs.getString("type_params")?.let { params ->
-                                json.readTree(params).get("scale")?.takeIf { it.isInt }?.asInt()
-                            },
-                    )
-                }
-                .list()
-        }
+                """
+            } else {
+                """
+                SELECT field_id, name, col_type, type_params::text AS type_params
+                FROM hog_column
+                WHERE catalog_id = :catalogId AND table_id = :tableId
+                  AND begin_snapshot <= :at
+                  AND (end_snapshot IS NULL OR :at < end_snapshot)
+                ORDER BY ordinal
+                """
+            },
+        )
+            .bind("catalogId", file.catalogId)
+            .bind("tableId", file.tableId)
+            .apply { if (at != null) bind("at", at) }
+            .map { rs, _ ->
+                CatalogColumn(
+                    fieldId = rs.getLong("field_id"),
+                    name = rs.getString("name"),
+                    type = ColType.fromWire(rs.getString("col_type")),
+                    decimalScale =
+                        rs.getString("type_params")?.let { params ->
+                            json.readTree(params).get("scale")?.takeIf { it.isInt }?.asInt()
+                        },
+                )
+            }
+            .list()
 
     // ---- footer fetch ------------------------------------------------------
 
@@ -244,20 +401,76 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
         if (footerSize != null && footerSize > 0 && footerSize + FOOTER_SUFFIX < file.fileSizeBytes) {
             try {
                 val tailStart = file.fileSizeBytes - footerSize - FOOTER_SUFFIX
-                val tail = store.getTail(file.path, tailStart)
+                // Fetch failures are classified HERE, not swallowed into the
+                // whole-object fallback: a throttled tail GET must surface as
+                // transient (stay pending), and a 404 as structural — falling
+                // back would turn an S3 blip into a whole-object fetch that
+                // can trip the size cap and wrongly fail a good registration.
+                val tail =
+                    try {
+                        store.getTail(file.path, tailStart)
+                    } catch (e: Exception) {
+                        throw classifyFetchFailure(e, file.path)
+                    }
                 return parseFooter(
                     RegionInputFile(file.fileSizeBytes, tailStart, tail, file.path),
                 )
+            } catch (e: TransientFetchException) {
+                throw e
             } catch (e: Exception) {
+                if (isMissingObject(e)) throw e
+                // The tail PARSED wrong (registered footer_size too small,
+                // region misses) — the whole-object fallback is for exactly
+                // this case.
                 log.debug(e) {
                     "tail read of ${file.path} (footer_size=$footerSize) insufficient; " +
                         "falling back to whole-object GET"
                 }
             }
         }
-        val bytes = store.get(file.path)
+        // The whole-object fallback buffers the object on the heap; the cap
+        // is the OOM guard. Over-cap without a usable footer_size is
+        // STRUCTURAL: retrying cannot shrink the file. file_size_bytes is
+        // the registered size — the only pre-GET signal we have.
+        if (file.fileSizeBytes > maxWholeObjectBytes) {
+            throw IllegalStateException(
+                "cannot hydrate ${file.path}: no usable footer_size and file_size_bytes " +
+                    "${file.fileSizeBytes} exceeds the whole-object fallback cap " +
+                    "$maxWholeObjectBytes bytes (HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES); " +
+                    "re-register with a correct footer_size or raise the cap, then rehydrate",
+            )
+        }
+        val bytes =
+            try {
+                store.get(file.path)
+            } catch (e: Exception) {
+                throw classifyFetchFailure(e, file.path)
+            }
         return parseFooter(RegionInputFile(bytes.size.toLong(), 0, bytes, file.path))
     }
+
+    /**
+     * Structural iff the object is definitively absent (NoSuchKey / bare
+     * 404); everything else the store can throw — throttle, 5xx, auth
+     * hiccups, connection resets, timeouts — is transient: retrying is
+     * free (the file just stays pending) and correct once the condition
+     * clears, whereas a terminal 'failed' would permanently de-stat every
+     * file swept through one throttle storm.
+     */
+    private fun classifyFetchFailure(
+        e: Exception,
+        path: String,
+    ): Exception =
+        if (isMissingObject(e)) {
+            e
+        } else {
+            TransientFetchException("transient object-store failure fetching $path", e)
+        }
+
+    private fun isMissingObject(e: Throwable): Boolean =
+        generateSequence(e) { it.cause }.any {
+            it is NoSuchKeyException || (it is S3Exception && it.statusCode() == 404)
+        }
 
     private fun parseFooter(input: InputFile): ParquetMetadata = ParquetFileReader.open(input).use { it.footer }
 
@@ -357,9 +570,15 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
         }
     }
 
-    private companion object {
+    companion object {
         /** 4-byte footer length + 4-byte "PAR1" magic at the end of the file. */
-        const val FOOTER_SUFFIX = 8L
+        private const val FOOTER_SUFFIX = 8L
+
+        /** Default whole-object fallback cap: 256 MiB. */
+        const val DEFAULT_MAX_WHOLE_OBJECT_BYTES: Long = 256L * 1024 * 1024
+
+        /** Per-file savepoint name inside the sweep transaction. */
+        private const val FILE_SAVEPOINT = "hoglake_hydrate_file"
     }
 }
 

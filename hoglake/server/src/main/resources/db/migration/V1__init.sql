@@ -166,7 +166,9 @@ CREATE TABLE hog_table_stats (
     catalog_id      bigint NOT NULL,
     table_id        bigint NOT NULL,
     record_count    bigint NOT NULL DEFAULT 0,
-    file_size_bytes bigint NOT NULL DEFAULT 0,
+    -- CHECK backstops the commit tail's overflow-checked byte rollup: a
+    -- wrapped (negative) sum must fail loudly, never land as drift.
+    file_size_bytes bigint NOT NULL DEFAULT 0 CHECK (file_size_bytes >= 0),
     -- CHECK is the DB backstop against row-id allocator overflow: a
     -- wrapped (negative) allocator would silently break the lineage
     -- guarantee. CommitService rejects overflowing sums before this.

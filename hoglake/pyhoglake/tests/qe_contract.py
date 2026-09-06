@@ -1103,23 +1103,11 @@ def test_unicode_names_percent_encoded_utf8(client, httpx_mock):
     assert client.catalog("café").name == "café"
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "BUG (pyhoglake client, medium): object names are f-string "
-        "interpolated into URL paths without percent-encoding reserved "
-        "characters. catalog('a?x=1') sends GET /v1/catalogs/a?x=1 (the "
-        "name's tail becomes a QUERY STRING), catalog('a#f') silently "
-        "requests catalog 'a', and 'a/b' walks into a different route. "
-        "Repro: HoglakeClient(base).catalog('a?x=1'); inspect request. "
-        "Fix: urllib.parse.quote(name, safe='') on every path segment."
-    ),
-)
-@pytest.mark.httpx_mock(
-    assert_all_responses_were_requested=False,
-    assert_all_requests_were_expected=False,
-)
 def test_reserved_characters_in_names_stay_in_the_path(client, httpx_mock):
+    # Regression (formerly an xfail BUG pin): object names are user data
+    # and every path segment goes through _seg (percent-encoding, safe="")
+    # — so catalog('a?x=1') must NOT turn the name's tail into a query
+    # string, 'a#f' into a fragment, or 'a/b' into a different route.
     httpx_mock.add_response(
         method="GET",
         url=f"{BASE}/v1/catalogs/a%3Fx%3D1",
@@ -1128,4 +1116,5 @@ def test_reserved_characters_in_names_stay_in_the_path(client, httpx_mock):
     client.catalog("a?x=1")
     req = _last(httpx_mock)
     assert dict(req.url.params) == {}
-    assert req.url.path == "/v1/catalogs/a%3Fx%3D1"
+    # url.path percent-DECODES; raw_path is what actually hit the wire
+    assert req.url.raw_path == b"/v1/catalogs/a%3Fx%3D1"
