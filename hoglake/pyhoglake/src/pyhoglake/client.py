@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 import httpx
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .errors import (
@@ -31,6 +32,8 @@ from .errors import (
     ValidationError,
 )
 from .models import (
+    AppendedFile,
+    AppendResult,
     CatalogInfo,
     CatalogOptions,
     ChangesPlan,
@@ -47,6 +50,7 @@ from .models import (
 )
 from .ops import AlterOp
 from .stats import extract_column_stats
+from .transforms import transform_strings
 from .types import columns_to_arrow_schema, schema_to_column_defs
 
 DEFAULT_TIMEOUT = 30.0
@@ -61,6 +65,25 @@ UNGUARDED = object()
 # a recreation refusal (IncarnationChangedError, never retryable) from an
 # ordinary commit conflict (CommitConflictError, retryable).
 _RECREATED_MARKER = "the table was recreated"
+
+# COLUMN names starting with this prefix are reserved for hoglake internals
+# (``_hog_row_id`` is compaction's row-id carrier); the server 422s them at
+# create/add/rename. Namespace/table/view names are NOT affected.
+_RESERVED_COLUMN_PREFIX = "_hog"
+
+
+def _check_reserved_columns(schema: pa.Schema) -> None:
+    """Fast-fail schema field names using the reserved ``_hog`` column
+    prefix BEFORE any request or parquet upload (the server would 422 the
+    create, and an append would waste the S3 write)."""
+    reserved = [n for n in schema.names if n.startswith(_RESERVED_COLUMN_PREFIX)]
+    if reserved:
+        raise ValidationError(
+            f"column names {reserved} use the reserved "
+            f"'{_RESERVED_COLUMN_PREFIX}' prefix (hoglake internal columns, "
+            "e.g. _hog_row_id); the server refuses these with 422",
+            status_code=None,
+        )
 
 
 def _seg(name: object) -> str:
@@ -167,10 +190,22 @@ class HoglakeClient:
         if params:
             params = {k: v for k, v in params.items() if v is not None}
         resp = self._http.request(method, path, json=json, params=params or None)
-        if resp.status_code < 400:
+        if resp.status_code < 300:
             if not resp.content:
                 return None
             return resp.json()
+        if resp.status_code < 400:
+            # Redirects are not followed (httpx default) and the hoglake
+            # API never issues them: treating a 3xx as success would feed
+            # an empty/HTML body to resp.json() and leak a raw
+            # JSONDecodeError outside the error taxonomy (bugs.md #19).
+            location = resp.headers.get("location")
+            raise HoglakeError(
+                f"unexpected redirect HTTP {resp.status_code} from the "
+                "hoglake API (redirects are not followed; check base_url)",
+                status_code=resp.status_code,
+                detail=f"Location: {location}" if location else None,
+            )
         self._raise(resp, conflict)
 
     @staticmethod
@@ -351,7 +386,7 @@ class Catalog:
     ) -> ConsumerOffset:
         body = self._client._request(
             "PUT",
-            self._path(f"/consumers/{_seg(consumer_id)}/offsets/{table_uuid}"),
+            self._path(f"/consumers/{_seg(consumer_id)}/offsets/{_seg(table_uuid)}"),
             json={"snapshot_id": snapshot_id},
             conflict=OffsetRegressionError,
         )
@@ -374,7 +409,9 @@ class Catalog:
         try:
             body = self._client._request(
                 "GET",
-                self._path(f"/consumers/{_seg(consumer_id)}/offsets/{table_uuid}"),
+                self._path(
+                    f"/consumers/{_seg(consumer_id)}/offsets/{_seg(table_uuid)}"
+                ),
             )
         except NotFoundError:
             return None
@@ -419,6 +456,7 @@ class Namespace:
     # -- tables ------------------------------------------------------------
 
     def create_table(self, name: str, schema: pa.Schema) -> Table:
+        _check_reserved_columns(schema)
         body = self._catalog._client._request(
             "POST",
             self._path("/tables"),
@@ -601,14 +639,31 @@ class Table:
         author: str | None = None,
         message: str | None = None,
         row_group_size: int | None = None,
-    ) -> CommitResult:
-        """Write ``data`` as one parquet file to the catalog's data path and
-        register it via a footer-shipping commit.
+    ) -> AppendResult:
+        """Write ``data`` to the catalog's data path and register it via a
+        footer-shipping commit: one parquet file for an unpartitioned
+        table, or — when the table has a live partition spec — one file
+        per distinct partition tuple (fanout), all registered in ONE
+        atomic commit.
 
         The parquet schema carries the catalog's field ids
         (``PARQUET:field_id``). Unless ``deferred_stats``, per-column stats
         are extracted from the writer's own footer metadata (never re-read
         from object storage) and shipped with the commit.
+
+        **Partitioned tables.** Each row's partition tuple is computed
+        client-side under the table's CURRENT spec (Iceberg-semantics
+        transforms — see :mod:`pyhoglake.transforms`); rows with a null
+        source value land in a null partition group, per Iceberg. Every
+        registered file carries its ``partition_values`` (transformed
+        values as wire strings, by key_index), which the returned
+        :class:`AppendResult` exposes per file. The spec used is the one
+        the pre-flight resolve returned; if the spec changes between that
+        resolve and the commit, the server refuses the commit itself
+        (409 -> :class:`CommitConflictError` for concurrent DDL, 422 ->
+        :class:`ValidationError` for an arity mismatch) — the client
+        never silently re-specs. A refused commit orphans the uploaded
+        parquet files (cleanup's problem, never the catalog's).
 
         **Incarnation guard — atomic at commit.** The commit payload is
         addressed by (namespace, table) NAME, so it lands on whatever
@@ -634,6 +689,11 @@ class Table:
         catalog = self._namespace._catalog
         client = catalog._client
 
+        # Reserved-prefix fast-fail before ANY request or upload: a user
+        # `_hog*` field could otherwise reach parquet on a pre-reservation
+        # table and waste the S3 write.
+        _check_reserved_columns(data.schema)
+
         if expected_table_uuid is UNGUARDED:
             expected = None
         elif expected_table_uuid is None:
@@ -647,48 +707,48 @@ class Table:
             info = self._check_incarnation(expected)  # current columns + spec
         else:
             info = self.info()  # UNGUARDED: name-only resolution
-        if info.partition_spec is not None and info.partition_spec.fields:
-            raise HoglakeError(
-                "pyhoglake 0.1 cannot append to partitioned tables "
-                "(client-side partition-value transformation not implemented)"
-            )
 
         target_schema = columns_to_arrow_schema(info.columns)
         data = _align_table(data, target_schema)
 
-        sink = io.BytesIO()
-        if row_group_size is not None:
-            pq.write_table(data, sink, row_group_size=row_group_size)
+        partitioned = info.partition_spec is not None and info.partition_spec.fields
+        if partitioned:
+            if data.num_rows == 0:
+                raise ValidationError(
+                    f"cannot append 0 rows to partitioned table "
+                    f"{self.namespace}.{self.name}: no partition tuple is "
+                    "derivable and a commit registers at least one file",
+                    status_code=None,
+                )
+            groups = _partition_groups(data, info)
         else:
-            pq.write_table(data, sink)
-        raw = sink.getvalue()
-        metadata = pq.read_metadata(io.BytesIO(raw))
+            groups = [(None, data)]
 
-        column_stats = None
-        if not deferred_stats:
-            column_stats = extract_column_stats(metadata, info.columns)
-
-        data_path = catalog.data_path
-        if not data_path.endswith("/"):
-            data_path += "/"
-        file_uri = (
-            f"{data_path}data/{self.namespace}/{self.name}/{_uuid.uuid4()}.parquet"
-        )
-        _upload(client._filesystem(), file_uri, raw)
-
-        file_reg: dict[str, Any] = {
-            "path": file_uri,
-            "record_count": metadata.num_rows,
-            "file_size_bytes": len(raw),
-            "footer_size": _footer_size(raw),
-        }
-        if column_stats is not None:
-            file_reg["column_stats"] = [s.to_wire() for s in column_stats]
+        file_regs: list[dict[str, Any]] = []
+        appended: list[AppendedFile] = []
+        for partition_values, part in groups:
+            reg = _write_one_file(
+                part,
+                info,
+                catalog,
+                client,
+                deferred_stats=deferred_stats,
+                row_group_size=row_group_size,
+                partition_values=partition_values,
+            )
+            file_regs.append(reg)
+            appended.append(
+                AppendedFile(
+                    path=reg["path"],
+                    record_count=reg["record_count"],
+                    partition_values=partition_values,
+                )
+            )
 
         append_entry: dict[str, Any] = {
             "namespace": self.namespace,
             "table": self.name,
-            "files": [file_reg],
+            "files": file_regs,
         }
         if expected is not None:
             # The atomic guard: the server 409s the whole commit (zero
@@ -707,7 +767,12 @@ class Table:
         # atomically at commit time (409, zero writes), superseding the
         # old post-upload check. A refusal orphans the uploaded parquet
         # (cleanup's problem, never the catalog's).
-        return catalog._commit(payload)
+        result = catalog._commit(payload)
+        return AppendResult(
+            snapshot_id=result.snapshot_id,
+            schema_version=result.schema_version,
+            files=tuple(appended),
+        )
 
     def _check_incarnation(self, expected_uuid: str) -> TableInfo:
         """Pre-flight fast-fail: re-resolve this table by name and raise
@@ -752,10 +817,126 @@ def _align_table(data: pa.Table, target: pa.Schema) -> pa.Table:
     return data.cast(target)
 
 
+def _write_one_file(
+    part: pa.Table,
+    info: TableInfo,
+    catalog: Catalog,
+    client: HoglakeClient,
+    *,
+    deferred_stats: bool,
+    row_group_size: int | None,
+    partition_values: tuple[str | None, ...] | None,
+) -> dict[str, Any]:
+    """THE single-file writer path: serialize ``part`` to parquet (field
+    ids already on the schema), upload it under the catalog's data path,
+    and build its FileRegistration wire dict — unchanged conventions
+    (footer stats from the writer's own metadata, exact ``footer_size``),
+    plus ``partition_values`` when the table is partitioned."""
+    sink = io.BytesIO()
+    if row_group_size is not None:
+        pq.write_table(part, sink, row_group_size=row_group_size)
+    else:
+        pq.write_table(part, sink)
+    raw = sink.getvalue()
+    metadata = pq.read_metadata(io.BytesIO(raw))
+
+    column_stats = None
+    if not deferred_stats:
+        column_stats = extract_column_stats(metadata, info.columns)
+
+    data_path = catalog.data_path
+    if not data_path.endswith("/"):
+        data_path += "/"
+    file_uri = f"{data_path}data/{info.namespace}/{info.name}/{_uuid.uuid4()}.parquet"
+    _upload(client._filesystem(), file_uri, raw)
+
+    file_reg: dict[str, Any] = {
+        "path": file_uri,
+        "record_count": metadata.num_rows,
+        "file_size_bytes": len(raw),
+        "footer_size": _footer_size(raw),
+    }
+    if column_stats is not None:
+        file_reg["column_stats"] = [s.to_wire() for s in column_stats]
+    if partition_values is not None:
+        file_reg["partition_values"] = list(partition_values)
+    return file_reg
+
+
+def _partition_groups(
+    data: pa.Table, info: TableInfo
+) -> list[tuple[tuple[str | None, ...], pa.Table]]:
+    """Split an aligned batch by partition tuple under the table's live
+    spec: one (wire-string tuple, sub-table) per distinct tuple, ordered
+    by first occurrence in the batch (so file registration — and the
+    server's rows-then-offset row-id assignment — follows input order).
+
+    Transforms run arrow-native where possible and per UNIQUE value in
+    Python otherwise (see :func:`pyhoglake.transforms.transform_strings`);
+    a null source value yields a null partition value forming its own
+    group, per Iceberg.
+    """
+    spec = info.partition_spec
+    by_field_id = {c.field_id: c for c in info.columns}
+    key_names = [f"__hog_pk_{i}" for i in range(len(spec.fields))]
+    key_arrays: list[pa.Array] = []
+    for pf in spec.fields:
+        col = by_field_id.get(pf.source_field_id)
+        if col is None:
+            raise ValidationError(
+                f"partition spec (spec_id={spec.spec_id}) references "
+                f"field_id {pf.source_field_id}, which is not a live column "
+                f"of {info.namespace}.{info.name}",
+                status_code=None,
+            )
+        key_arrays.append(
+            transform_strings(
+                pf.transform,
+                pf.transform_param,
+                data.column(col.name),
+                col.type,
+                col.type_params,
+            )
+        )
+    keyed = pa.table(
+        {
+            **dict(zip(key_names, key_arrays, strict=True)),
+            "__hog_row": pa.array(range(data.num_rows), pa.int64()),
+        }
+    )
+    combos = (
+        keyed.group_by(key_names)
+        .aggregate([("__hog_row", "min")])
+        .sort_by("__hog_row_min")
+    )
+    out: list[tuple[tuple[str | None, ...], pa.Table]] = []
+    for i in range(combos.num_rows):
+        values = tuple(combos.column(k)[i].as_py() for k in key_names)
+        mask = None
+        for name, value in zip(key_names, values, strict=True):
+            key_col = keyed.column(name)
+            if value is None:
+                field_mask = pc.is_null(key_col)
+            else:
+                field_mask = pc.fill_null(pc.equal(key_col, value), False)
+            mask = field_mask if mask is None else pc.and_(mask, field_mask)
+        out.append((values, data.filter(mask)))
+    return out
+
+
 def _footer_size(raw: bytes) -> int:
-    # trailing 8 bytes: 4-byte LE footer length + b"PAR1"
+    """Thrift footer-metadata length for the commit's ``footer_size``.
+
+    Wire convention (bugs.md #7): ``footer_size`` is EXACTLY the 4-byte
+    LE length stored in the parquet trailer — the serialized thrift
+    FileMetaData size, EXCLUDING the trailing 8-byte suffix (4-byte
+    length + ``PAR1`` magic). The server's hydrator tail-reads
+    ``[file_size - footer_size - 8, file_size)`` and compaction stores
+    the same value for its own outputs; shipping ``meta_len + 8`` here
+    (the old behavior) made every client-written file 8 bytes off.
+    """
     (meta_len,) = struct.unpack("<I", raw[-8:-4])
-    return meta_len + 8
+    return meta_len
 
 
 def _upload(fs, uri: str, raw: bytes) -> None:

@@ -1,6 +1,6 @@
 """pyhoglake — Python client for the hoglake control plane."""
 
-from . import ops
+from . import ops, transforms
 from .bounds import decode_bound, encode_bound
 from .client import (
     UNGUARDED,
@@ -17,12 +17,15 @@ from .errors import (
     ExpiredError,
     HoglakeError,
     IncarnationChangedError,
+    MalformedResponseError,
     NotFoundError,
     OffsetRegressionError,
     UnsupportedTypeError,
     ValidationError,
 )
 from .models import (
+    AppendedFile,
+    AppendResult,
     CatalogInfo,
     CatalogOptions,
     ChangesPlan,
@@ -52,6 +55,8 @@ __all__ = [
     "UNGUARDED",
     "AlreadyExistsError",
     "AlterOp",
+    "AppendResult",
+    "AppendedFile",
     "Catalog",
     "CatalogInfo",
     "CatalogOptions",
@@ -69,6 +74,7 @@ __all__ = [
     "HoglakeClient",
     "HoglakeError",
     "IncarnationChangedError",
+    "MalformedResponseError",
     "Namespace",
     "NotFoundError",
     "OffsetRegressionError",
@@ -91,4 +97,5 @@ __all__ = [
     "decode_bound",
     "encode_bound",
     "ops",
+    "transforms",
 ]

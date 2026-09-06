@@ -95,9 +95,33 @@ appends**); for deletes, additionally a per-file check that the
 deletion vector being superseded wasn't itself replaced after the read
 snapshot. A hit is HTTP 409 with the offending table named; the client
 refreshes and retries. Omitting `read_snapshot` is a blind append with
-no conflict window. Validation failures (unknown table, bad field id,
-malformed stats) are 422 and roll back the entire commit — a
-multi-table commit is atomic.
+no conflict window — but a *stated* `read_snapshot` below the expiry
+floor is **410 Gone** (the change rows that would prove the window
+clean were expired with their snapshots; the message names the floor
+and when it was reached), never a silently truncated conflict check.
+Validation failures (unknown table, bad field id, malformed stats) are
+422 and roll back the entire commit — a multi-table commit is atomic.
+
+Two more admission gates run under the lock. A commit may carry an
+`expected_table_uuid` per table — the incarnation guard: if the live
+table's uuid differs (drop+recreate raced the writer), the whole
+commit 409s with zero writes. And every registered path (data file or
+DV) is checked against **undrained `hog_file_removal` rows**: a path
+still scheduled for physical deletion is refused with 409 — otherwise
+cleanup's drain could delete an object a newer commit just made live
+(path reuse). Time itself is honest too: `snapshot_time` is stamped
+`clock_timestamp()` — statement time inside the serialized tail, after
+the lock — so recorded times order exactly like snapshot ids even when
+commits queue.
+
+Admission is backpressured, not implicit: the commit transaction sets
+a `lock_timeout` (`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`, default 30s), and
+a writer that can't get the tail in time receives **503
+`commit_queue_timeout` + Retry-After** — an explicit, retryable "the
+catalog is convoyed" signal instead of unbounded queueing. Lock waits
+are measured (`hoglake_commit_lock_wait_seconds`) on every commit, DDL,
+and maintenance tail, so a forming convoy is visible before it's an
+incident.
 
 ### File registration: footer-shipping and deferred stats
 
@@ -116,11 +140,33 @@ Stats may also be **deferred**: a file registers with only
 parquet-java) sweeps pending files in the background: a ranged S3 read
 fetches the parquet footer (never data pages), stats aggregate across
 row groups, columns map by embedded field id (name fallback with a
-warning), bounds encode by catalog type, and the file flips to
+warning — resolved against the schema **at the file's
+`begin_snapshot`**, never live-at-hydration, so a drop+add-same-name
+between commit and sweep can't write the old incarnation's stats under
+a new field id), bounds encode by catalog type, and the file flips to
 `provided` — or `failed`, loudly, if the footer contradicts the
 registration (a lying `record_count` is fraud, not a discrepancy). One
-bad file never wedges a sweep. Until hydrated, a pending file simply
-matches every scan: correctness holds, pruning quality lags.
+bad file never wedges a sweep, and a bound the codec can't represent
+safely (e.g. a timestamp whose unit conversion would overflow) stores
+as NULL — bounds are never guessed. Until hydrated, a pending file
+simply matches every scan: correctness holds, pruning quality lags.
+
+Hydration failure has a **two-class taxonomy**. Transient fetch errors
+(S3 5xx/SlowDown, timeouts, connection resets) leave the file
+`pending` — logged and counted
+(`hoglake_hydrator_transient_errors_total`), retried on the next sweep.
+Structural errors (object missing, unparseable footer, footer
+contradicting the registration) go to `failed` — terminal to the sweep
+but operator-recoverable: `POST /maintenance/rehydrate` flips
+`failed` → `pending` (catalog-wide or scoped to one namespace+table),
+for when the cause was fixed (object re-uploaded, cap raised). Two
+guard rails on the fetch itself: files without a usable `footer_size`
+fall back to a whole-object read **capped** at
+`HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES` (default 256 MiB — a larger
+file fails structurally with a fix-then-rehydrate message instead of
+becoming an OOM vector), and the sweep claims its batch
+`FOR UPDATE SKIP LOCKED`, so concurrent replicas hydrate disjoint sets
+instead of amplifying S3 GETs against the same head.
 
 The footer read doubles as the **field-id contract check**: any leaf
 without a `PARQUET:field_id` flags the row
@@ -129,8 +175,11 @@ without a `PARQUET:field_id` flags the row
 id on compacted files is fine). Id-less files bind columns by name, so
 while one is LIVE the table's `rename_column` fails with 409
 `idless_files_present` — renaming would silently NULL that column's
-history in readers. `rename_table` is unaffected, and the flag clears
-from relevance when the file is compacted away, dropped, or expired.
+history in readers. The guard blocks on live **`pending`** files too:
+their id state is unknown until the footer is read, so a rename can't
+slip through the commit-to-hydration window. `rename_table` is
+unaffected, and the flag clears from relevance when the file is
+compacted away, dropped, or expired.
 
 ### Row lineage
 
@@ -162,7 +211,11 @@ enforced in `CommitService` and by a unique partial index:
 
 Read planning pairs each data file with its DV *as of the requested
 snapshot* (`service/ScanService.kt`, `GET /scan`) — historical scans
-see historical vectors, so time travel is delete-correct.
+see historical vectors, so time travel is delete-correct. Lifecycle is
+airtight at the edges too: `DROP TABLE` end-snapshots live DVs along
+with the data files (so expiry reclaims both row and object — nothing
+`end_snapshot IS NULL` survives a drop), and compaction end-snapshots
+a group's DVs together with the inputs they mask.
 
 ### Partitioning
 
@@ -182,13 +235,16 @@ rewrites history — pruning just knows which vintage each file is.
 
 `service/AlterService.kt`, `POST /alter`: a list of typed operations —
 `add_column`, `drop_column`, `rename_column`, `promote_column`,
-`rename_table`, `set_partition_spec` — applied **in order, atomically,
-as one DDL commit** (one snapshot, one `table_altered` change row, one
-schema-version bump). Renames keep the `field_id` (end the old row,
-begin a new one with the same id), so files written before a rename
-still bind correctly. Type promotion is a strict widening lattice
-(`int→long`, `float→double`) chosen so existing files remain readable
-under the new schema. Validation runs against the state produced by
+`rename_table`, `set_partition_spec`, `set_sort_order` — applied **in
+order, atomically, as one DDL commit** (one snapshot, one
+`table_altered` change row, one schema-version bump). Renames keep the
+`field_id` (end the old row, begin a new one with the same id), so
+files written before a rename still bind correctly. Type promotion is
+a strict widening lattice (`int→long`, `float→double`) chosen so
+existing files remain readable under the new schema — and a promote
+**re-encodes the table's existing stats bounds** (4-byte → 8-byte
+Iceberg encoding) in the same transaction, so nothing downstream ever
+decodes old-width bounds under the new type. Validation runs against the state produced by
 earlier ops in the same request, so `[add tmp, rename tmp→final]` works
 and `[drop x, rename x→y]` fails precisely. You can't drop the last
 column, or a column the live partition spec depends on.
@@ -211,8 +267,10 @@ registered, in snapshot order, with row-id ranges. The client reads the
 parquet itself — the feed is planning, not data. Paired with it,
 **consumer offsets are catalog state**
 (`PUT /consumers/{id}/offsets/{table_uuid}`): monotonic (regression is
-a 409), keyed by `table_uuid` so incarnation changes are visible, and —
-critically — **respected by retention** (below). Together these are the
+a 409), never below the expiry floor (410 — an expired offset would
+otherwise wedge the consumer-floor sweep at zero work forever), keyed
+by `table_uuid` so incarnation changes are visible, and — critically —
+**respected by retention** (below). Together these are the
 log primitives: a replicator's entire state machine is
 "changes → apply → commit offset."
 
@@ -247,8 +305,15 @@ Physical deletion is decoupled and paranoid
 time every path is re-checked against live references — a
 still-referenced path is skipped and counted as an **invariant
 violation** (alertable), never deleted. Missing objects count as done.
-S3 deletes run in sub-batches whose ledger updates commit
-independently, so a mid-drain failure never rolls back completed work.
+S3 deletes run in sub-batches (25 paths) whose ledger updates commit
+independently, so a mid-drain failure never rolls back completed work
+— and each sub-batch's check-then-delete pair runs **under the
+per-catalog commit lock**, paired with commit's refusal to register a
+path that has an undrained removal row: the two sides together make
+delete-under-path-reuse structurally impossible (the liveness answer
+can't go stale between check and delete, and a new commit can't slip a
+live file under a queued path). The lock hold is bounded — sub-batch
+size × one S3 round-trip — which is why the sub-batch is kept small.
 
 Draining **soft-deletes**: a settled `hog_file_removal` row keeps its
 place with `drained_at` + `drained_outcome` (`'deleted'` for a
@@ -267,21 +332,53 @@ A table may carry a versioned **sort order** (`hog_sort_spec` /
 writers (the server never verifies file sortedness), binding for
 compaction. **Compaction** (`compaction/CompactionService.kt`,
 `POST /maintenance/compact` + an off-by-default loop) merges small live
-files: candidates are DV-free, share (spec_id, partition_values), and
-group greedily under a byte target — row-id adjacency is NOT required,
-which is why outputs materialize their row ids as an explicit
-`_hog_row_id` int64 column (reserved field id 2147483646, flagged by
+files: candidates share (spec_id, partition_values) and group greedily
+under a byte target — row-id adjacency is NOT required, which is why
+outputs materialize their row ids as an explicit `_hog_row_id` int64
+column (reserved field id 2147483646, flagged by
 `data_file.explicit_row_ids`) instead of relying on position. That
 makes sorting on rewrite safe — the predecessor's sorted-compaction
 rowid remap is structurally impossible. The rewrite (parquet-java —
 the project's one parquet library, shared with the hydrator's footer
-reads) happens
-entirely before the commit transaction; the commit re-verifies each
-input is still live and DV-free (plan-to-commit races skip the group),
-end-snapshots inputs (time travel keeps them; expiry reclaims them
-later), aggregates stats from typed decoded bounds, and the changefeed
-excludes compacted outputs so consumers never see merged rows re-appear
-as fresh appends.
+reads) happens entirely before the commit transaction; the commit
+re-verifies each input is still live under the exact planned identity
+(plan-to-commit races skip the group), end-snapshots inputs (time
+travel keeps them; expiry reclaims them later), aggregates stats from
+typed decoded bounds — treating an undecodable bound as absent, never
+wedging on it — and the changefeed excludes compacted outputs so
+consumers never see merged rows re-appear as fresh appends.
+
+Coverage is 100% of live layouts, not just the easy ones:
+
+- **DV-bearing inputs compact.** The rewrite reads each input's live
+  deletion vector (Iceberg-v3 puffin `deletion-vector-v1` blobs —
+  roaring bitmap, magic and CRC verified; `PuffinDeletionVector` is
+  the one server-side reader of DV content) and drops the deleted
+  positions: survivors keep their original ids in `_hog_row_id`,
+  deleted ids are gone forever, and the inputs AND their DVs
+  end-snapshot together. The commit re-verifies the exact DV identity
+  it planned against — a vector that grew or appeared since planning
+  skips the group (`dv_superseded` in the result), so a post-plan
+  delete is never dropped. Because the registered stats of a DV'd
+  input describe pre-delete data, outputs with DVs applied register as
+  `stats_state='pending'` and the hydrator re-derives honest stats.
+- **Heterogeneous-schema groups compact.** Inputs written under
+  different schema versions rewrite under the LIVE schema, mapped by
+  field id: a live column absent from an input null-fills, promoted
+  columns up-cast (int32→int64, float→double), dropped field ids drop
+  their data. Only a live column *unproducible* from an input's
+  physical type skips the group (`unconvertible_schema` — detected
+  before any bytes are staged); the unproducible set is narrowings,
+  physical mismatches, decimal-scale changes, non-micros time(stamp)
+  units, nested inputs, and INT96.
+- **Aborted uploads can't orphan objects.** Before uploading, the
+  output path pre-registers as an undrained `hog_file_removal` row
+  (reason `compaction_staging`) — a claim ticket. A successful group
+  commit settles it (`drained_outcome='registered'`) in the same
+  transaction that makes the path live; an aborted group leaves it for
+  the normal cleanup drain to reclaim. The commit re-claims the ticket
+  first, so a drain that won the race just aborts the group — cleanup
+  can reclaim aborted outputs and can never reclaim committed ones.
 
 ### Views
 
@@ -289,6 +386,41 @@ Versioned name + SQL text + dialect (`hog_view`), stored verbatim —
 the catalog never parses view SQL. Create/drop are DDL commits with
 their own change kinds, so views appear in snapshot history and time
 travel like everything else.
+
+### Self-knowledge: verify, partition debt, consumers, identity
+
+The catalog reports on itself instead of waiting for ops SQL:
+
+- **`POST /maintenance/verify`** (`service/VerifyService.kt`) — the QE
+  suite's global-invariant SQL as a read-only, metadata-only endpoint
+  (one REPEATABLE READ MVCC snapshot, no catalog lock). Six checks:
+  row-id tiling (positional overlap; `explicit_row_ids` compaction
+  outputs exempt by design), deletion vectors (one live per file,
+  monotone supersession chains, `delete_count <= record_count`),
+  orphaned live rows on dropped tables, still-referenced removal-queue
+  entries, true snapshot density (`count(*)` equals the dense
+  `[earliest, head]` range), and `next_row_id` allocator consistency.
+  The JSON report carries per-check status, true violation counts, and
+  samples capped at 20.
+- **`POST /maintenance/rehydrate`** — the operator requeue for the
+  hydrator's structural failures (above): flips `failed` → `pending`,
+  catalog-wide or scoped to one namespace+table.
+- **`GET /stats/partitions`** (`service/PartitionStatsService.kt`) —
+  leaf partitions ranked by compaction debt: `debt_score` is the
+  small-file count under exactly the threshold the compactor plans
+  with (so the ranking predicts what a sweep would do), plus
+  stale-spec-group counts. The webui's compaction-debt page renders
+  this.
+- **`GET /consumers`** — every consumer in the catalog with per-table
+  offsets, table names resolved, dropped tables flagged (offsets
+  outlive drops by design — an offset on a dropped table is data, not
+  garbage).
+- **`GET /v1/info`** — instance identity: the operator-configured
+  display name (`HOGLAKE_INSTANCE_NAME`, e.g. "GigaHog"), shown in the
+  webui topbar so nobody mistakes prod for dev.
+- **`GET /export`** — the DR manifest (snapshot range + live-file
+  manifest + consumer offsets, consistent at head) is fully specified
+  in the OpenAPI and answers **501** until built (gaps.md B5).
 
 ### Observability
 
@@ -298,12 +430,16 @@ transaction (`observability/`):
 - **`/metrics`** (Prometheus): per-catalog health gauges sampled by a
   background loop in one batched query pass — head snapshot and age,
   expiry floor, removal-queue depth (undrained entries only),
-  pending-stats count, live id-less-file count
+  pending-stats AND failed-stats counts
+  (`hoglake_stats_failed_files`), live id-less-file count
   (`hoglake_missing_field_id_files`), live table
   count, per-consumer lag (cardinality-capped) — plus source-side
   counters: commits by outcome, snapshots expired, files removed,
-  hydrations by result. HTTP server metrics come with the Ktor
-  Micrometer plugin.
+  hydrations by result (transient errors counted separately), and the
+  `hoglake_commit_lock_wait_seconds` histogram on every commit/DDL/
+  maintenance tail (the convoy early-warning). HTTP server metrics
+  come with the Ktor Micrometer plugin. The webui renders a `/metrics`
+  snapshot visually on its metrics page.
 - **Audit log**: every consequential action (DDL, commits with
   outcome, options changes, expiry/cleanup runs, offset commits) emits
   one structured JSON line on the `hoglake.audit` logger — actor,
@@ -316,12 +452,15 @@ transaction (`observability/`):
 ### Background assembly
 
 `App.kt` wires services into Ktor and `startBackground()` runs the
-loops — hydrator, expiry, cleanup, compaction (default off), metrics
-sampler — each an
-independent daemon with its own interval knob (`Config.kt`, all
-env-sourced, `<= 0` disables), per-catalog failure isolation, and a
-close handle. `Main.kt` = migrate (under an advisory lock, so replicas
-don't race DDL) → assemble → start loops → serve.
+loops — hydrator, expiry, cleanup, compaction (default off:
+`HOGLAKE_COMPACTION_INTERVAL_MS=0` — flipping it on is an ops
+decision), metrics sampler — as **coroutines under one supervisor
+scope** (`BackgroundLoops`), each with its own interval knob
+(`Config.kt`, all env-sourced, `<= 0` disables), per-catalog failure
+isolation (a failed iteration is logged + counted and the loop keeps
+running), and structured, bounded shutdown (cancel + join, 5s cap).
+`Main.kt` = migrate (under an advisory lock, so replicas don't race
+DDL) → assemble → start loops → serve.
 
 ### Specified, not yet implemented
 
@@ -333,7 +472,9 @@ unpublished ranges automatically). Fully specified in the OpenAPI
 
 ## Dev environment
 
-Toolchain via [flox](https://flox.dev) (JDK 21); Gradle from the host;
+Toolchain via [flox](https://flox.dev) (JDK 21); Gradle via the
+**checked-in wrapper** (`./gradlew`, version pinned in
+`gradle/wrapper/gradle-wrapper.properties` — never a system gradle);
 recipes via `just` (see `justfile`, composed into `../justfile`):
 
 ```sh
@@ -344,6 +485,7 @@ just one 'com.posthog.hoglake.commit.*'
 just schema-check
 just compose-up # Postgres 16 + MinIO (ports overridable via HOGLAKE_*_PORT)
 just run        # server on :8080
+just docs       # OpenAPI spec in Swagger UI on :8090 (HOGLAKE_SWAGGER_PORT)
 ```
 
 ## Layout

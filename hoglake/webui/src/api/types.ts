@@ -158,6 +158,50 @@ export interface ConsumerOffset {
   updated_at: string;
 }
 
+export interface ConsumerTableOffset {
+  table_uuid: string;
+  committed_snapshot: Int64;
+  updated_at: string;
+  namespace?: string;
+  table_name?: string;
+  table_dropped: boolean;
+}
+
+export interface ConsumerSummary {
+  consumer_id: string;
+  offsets: ConsumerTableOffset[];
+}
+
+export interface ConsumerList {
+  consumers: ConsumerSummary[];
+}
+
+export interface PartitionValueEntry {
+  field: string;
+  value: string;
+}
+
+/** One leaf partition's compaction-debt stats, ranked by debt_score. */
+export interface PartitionStats {
+  namespace: string;
+  table: string;
+  table_uuid: string;
+  partition_values: PartitionValueEntry[];
+  spec_id: Int64;
+  file_count: Int64;
+  small_file_count: Int64;
+  total_bytes: Int64;
+  small_file_bytes: Int64;
+  avg_file_bytes: Int64;
+  dv_count: Int64;
+  debt_score: Int64;
+}
+
+export interface PartitionStatsResponse {
+  partitions: PartitionStats[];
+  truncated: boolean;
+}
+
 export interface CommitResult {
   snapshot_id: Int64;
   schema_version?: Int64;

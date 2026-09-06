@@ -9,6 +9,7 @@ import com.posthog.hoglake.api.installAlterRoutes
 import com.posthog.hoglake.api.installApiRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
+import com.posthog.hoglake.api.installPartitionStatsRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.api.installViewRoutes
@@ -27,6 +28,7 @@ import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.OptionsService
+import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.VerifyService
@@ -66,12 +68,19 @@ class App private constructor(
     private val optionsService = OptionsService(jdbi)
     private val expiryService = ExpiryService(jdbi)
     private val verifyService = VerifyService(jdbi)
+
+    /** Same threshold CompactionService plans with: debt == sweepable files. */
+    private val partitionStatsService =
+        PartitionStatsService(jdbi, smallFileThresholdBytes = cfg.compactionTargetBytes)
     private val removalStore = RemovalStore(cfg)
     private val cleanupService =
         CleanupService(jdbi, removalStore, ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds)
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
     private val objectStore = ObjectStore(cfg)
+
+    /** One hydrator: the background sweep loop AND the rehydrate route. */
+    private val hydrator = Hydrator(jdbi, objectStore, maxWholeObjectBytes = cfg.hydratorMaxWholeObjectBytes)
     private val compactionService =
         CompactionService(
             jdbi,
@@ -172,11 +181,19 @@ class App private constructor(
                 call.respondText(spec, ContentType.parse("application/yaml"))
             }
         }
-        app.installApiRoutes(catalogService, commitService)
+        app.installApiRoutes(catalogService, commitService, cfg.instanceName)
         app.installAlterRoutes(alterService)
         app.installScanRoutes(scanService)
         app.installViewRoutes(viewService)
-        app.installMaintenanceRoutes(optionsService, expiryService, cleanupService, compactionService, verifyService)
+        app.installMaintenanceRoutes(
+            optionsService,
+            expiryService,
+            cleanupService,
+            compactionService,
+            verifyService,
+            hydrator,
+        )
+        app.installPartitionStatsRoutes(partitionStatsService)
         app.installPublicationRoutes()
     }
 
@@ -188,7 +205,6 @@ class App private constructor(
      */
     fun startBackground(): AutoCloseable {
         val loops = BackgroundLoops()
-        val hydrator = Hydrator(jdbi, objectStore)
         loops.register("hydrator", cfg.hydratorIntervalMs) { hydrator.runOnce() }
         loops.register("expiry", cfg.expiryIntervalMs) {
             expiryService.runOnceAllCatalogs(cfg.expiryBatchSize)

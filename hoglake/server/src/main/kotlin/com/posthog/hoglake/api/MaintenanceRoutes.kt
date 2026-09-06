@@ -2,6 +2,7 @@ package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.compaction.CompactionService
+import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.OptionsService
@@ -35,6 +36,7 @@ fun Application.installMaintenanceRoutes(
     cleanup: CleanupService,
     compaction: CompactionService,
     verify: VerifyService,
+    hydrator: Hydrator,
 ) {
     routing {
         route("/v1/catalogs/{catalog}") {
@@ -83,6 +85,19 @@ fun Application.installMaintenanceRoutes(
             // density assertion). Read-only, MVCC snapshot, no locks.
             post("/maintenance/verify") {
                 call.respond(verify.runOnce(call.maintenanceCatalog()).toDto())
+            }
+            // Operator requeue for structurally-failed hydrations: flips
+            // 'failed' files back to 'pending' (whole catalog, or one
+            // table via ?namespace=..&table=.. — both together or
+            // neither).
+            post("/maintenance/rehydrate") {
+                call.respond(
+                    hydrator.rehydrateFailed(
+                        call.maintenanceCatalog(),
+                        call.request.queryParameters["namespace"],
+                        call.request.queryParameters["table"],
+                    ).toDto(),
+                )
             }
             // DR/export surface (gaps.md B5): specified in
             // openapi/hoglake.yaml, 501 until built — the publications

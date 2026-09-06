@@ -2,7 +2,8 @@
 
 _uv := "flox activate -- uv"
 
-default: test
+default:
+    @just --list
 
 sync:
     {{_uv}} sync
@@ -17,6 +18,13 @@ unit:
 
 integration:
     {{_uv}} run pytest -m integration
+
+lint:
+    {{_uv}} run ruff check .
+    {{_uv}} run ruff format --check .
+
+fmt:
+    {{_uv}} run ruff format .
 
 lock:
     {{_uv}} lock

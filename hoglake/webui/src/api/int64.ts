@@ -39,6 +39,13 @@ const INT64_FIELDS = new Set([
   "null_count",
   "nan_count",
   "size_bytes",
+  // partition compaction-debt stats (GET /v1/catalogs/{c}/stats/partitions)
+  "small_file_count",
+  "total_bytes",
+  "small_file_bytes",
+  "avg_file_bytes",
+  "dv_count",
+  "debt_score",
 ]);
 
 const DECIMAL_INT_RE = /^-?\d+$/;

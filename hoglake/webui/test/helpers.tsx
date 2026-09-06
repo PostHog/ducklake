@@ -33,6 +33,8 @@ export function mockFetch(handler: FetchHandler) {
     const res = handler(url, init);
     if (res) return res;
     if (url === "/healthz") return new Response("ok", { status: 200 });
+    // Topbar instance badge; unnamed by default so page tests are unaffected.
+    if (url === "/v1/info") return jsonResponse({});
     throw new Error(`Unhandled fetch: ${init?.method ?? "GET"} ${url}`);
   });
   vi.stubGlobal("fetch", fn);

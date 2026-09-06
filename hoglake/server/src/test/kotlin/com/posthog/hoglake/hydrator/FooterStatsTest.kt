@@ -379,6 +379,44 @@ class FooterStatsTest {
     }
 
     @Test
+    fun `timestamp millis near Long MAX overflows to null bounds, never an exception`() {
+        // Pinned regression (bug hunt #10): millis -> micros uses
+        // multiplyExact; a bound near Long.MAX_VALUE (hostile-writer
+        // craftable) used to throw ArithmeticException out of decode and
+        // fail the WHOLE file. The "bounds NULL, never guessed" contract
+        // demands a null bound and an otherwise-honest stats row.
+        val ts =
+            leaf(
+                "ts",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.timestampType(true, LogicalTypeAnnotation.TimeUnit.MILLIS),
+            )
+        val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(Long.MAX_VALUE - 1), le(Long.MAX_VALUE)))))
+        val out = agg(m, CatalogColumn(1, "ts", ColType.TIMESTAMPTZ, null))
+        assertThat(out).containsOnlyKeys(1L) // the row survives
+        assertThat(out[1L]!!.valueCount).isEqualTo(10)
+        assertThat(out[1L]!!.lowerBound).isNull()
+        assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    @Test
+    fun `timestamp nanos near Long MAX overflows the upper-bound ceil to null bounds`() {
+        // The NANOS upper bound ceils via addExact(v, 999): craftable
+        // overflow on the upper side specifically.
+        val ts =
+            leaf(
+                "ts",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.timestampType(true, LogicalTypeAnnotation.TimeUnit.NANOS),
+            )
+        val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(0L), le(Long.MAX_VALUE)))))
+        val out = agg(m, CatalogColumn(1, "ts", ColType.TIMESTAMPTZ, null))
+        assertThat(out).containsOnlyKeys(1L)
+        assertThat(out[1L]!!.lowerBound).isNull()
+        assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    @Test
     fun `timestamp with no logical annotation drops bounds`() {
         val ts = leaf("ts", PrimitiveType.PrimitiveTypeName.INT64)
         val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(1L), le(2L)))))

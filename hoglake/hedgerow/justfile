@@ -19,6 +19,13 @@ unit:
 integration:
     {{_uv}} run pytest -m integration
 
+lint:
+    {{_uv}} run ruff check .
+    {{_uv}} run ruff format --check .
+
+fmt:
+    {{_uv}} run ruff format .
+
 # One replication cycle against a config, then exit
 once config:
     {{_uv}} run hedgerow --config {{config}} --once

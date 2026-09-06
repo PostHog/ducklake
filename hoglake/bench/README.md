@@ -29,7 +29,9 @@ worse than none, so an invariant failure aborts with exit code 4.
 Toolchain: [flox](https://flox.dev) (python312 + uv). Dependencies:
 pyhoglake (editable, from `../pyhoglake`), pyarrow, httpx — no locust,
 no k6; latency capture is hand-rolled (`time.perf_counter_ns`, sorted
-lists for percentiles).
+lists for percentiles). numpy + Faker come along for the `seed` task
+only (vocabularies and vectorized row fabrication); no scenario's
+measurement path touches them.
 
 ```sh
 flox activate -- uv sync
@@ -78,6 +80,62 @@ excluded from stats).
 | `ddl-churn` | create/append/drop cycles (the report-table pattern), with an identical small-commit probe before and after | tables/s and the **before/after commit-p50 ratio** (>1.5x flags — the dropped-table stats tax) |
 | `end-to-end-writer` | The realistic path: pyarrow tables through `Table.append` — real parquet encode, MinIO upload, footer stats, commit (`--rows 100000 --batch-rows 10000`) | rows/s end to end, per-append latency |
 | `all` | every scenario; `--quick` = smoke profile (~2-3 min, the default), `--full` = real sizes | CI-ish gate |
+
+## Seeding a dev warehouse
+
+Not every use of this harness is a measurement: `seed` fills a catalog
+with a **realistic fake data warehouse**, sized by total bytes, so the
+console, compaction planning and the changefeed have something with real
+shape to look at.
+
+```sh
+just bench seed --gb 2.5                      # or: --catalog my-catalog
+flox activate -- uv run hoglake-bench seed --gb 0.3 --server http://localhost:8080
+```
+
+What you get (`--gb` is fractional; the target is rounded to the nearest
+100 MB and echoed before a byte is written — `target 2.5 GB -> plan:
+2.5 GB (25 x 100MB units)`; anything under 0.1 GB is refused):
+
+| Table | Share | Shape |
+|---|---|---|
+| `events.pageviews` | 65% | the event stream: uuid, team_id, distinct_id, session, path, referrer, ts over ~6 months, device/utm/properties-ish columns. **Partitioned `identity(team_id) x month(ts)`** and written through pyhoglake's partitioned-append fanout — one parquet file per (team, month) cell, all cells of a commit registered atomically |
+| `warehouse.fact_orders` | 18% | FK-shaped ids into the dims, quantities, amounts, order/ship timestamps |
+| `warehouse.fact_sessions` | 12% | sessions per user/team, durations, pageview counts, referrers |
+| `warehouse.dim_users` / `dim_products` / `dim_teams` | ~5% | names, emails, countries, cities, SKUs, prices, plans, regions — one small file each |
+
+- **Many files, not a few giants**: facts/events aim for `--file-mb`
+  (default 32, clamped to 20-80), so compaction planning has real
+  candidates to rank. Small budgets over the 6-team x 6-month grid
+  produce smaller partition files by construction.
+- **Realism without the cost**: [Faker](https://faker.readthedocs.io)
+  mints a few thousand distinct values ONCE per run (names, emails,
+  domains, cities, countries, products, campaigns); rows are then
+  fabricated with numpy/pyarrow by sampling those vocabularies. Nothing
+  is per-row Python, so millions of rows cost tens of milliseconds and
+  ~100 MB lands in a few seconds.
+- **Size control is server-sourced**: after every commit the writer reads
+  the table's own `/tables` info and re-divides the remaining budget over
+  the remaining work, so a bad bytes-per-row estimate corrects itself.
+  Compression makes an exact target impossible — runs land within ~10%
+  and the summary says by how much.
+- **`--seed` is fixed by default**, so two runs produce the same shape.
+- **`--catalog` reuse appends**, it never fails: an existing catalog
+  grows (dims get new id ranges; the fixed team dimension is left alone).
+
+The run ends with the catalog's own numbers, read back from the server:
+
+```
+seeded warehouse (per-table figures from the server's /tables info):
+  table                        files           rows       bytes    this run
+  -------------------------------------------------------------------------
+  events.pageviews                36        715,123     66.0 MB     66.0 MB
+  ...
+wrote 101.0 MB in 43 files across 6 tables in 4.6s (target 100.0 MB, +1.0% — on plan)
+```
+
+`seed` is deliberately **not** a scenario: `all` never runs it, it
+journals no metrics, and it flags no regressions.
 
 ## Reading the output
 
@@ -158,6 +216,15 @@ abort, the hotfile retry loop must respect its bounds, and exit-code
 severity resolution must never demote a regression. The
 `-m integration` smoke runs `all --quick` against `HOGLAKE_URL` and
 skips cleanly when it's down.
+
+The `seed` task has its own unit tests (budget rounding and the
+proportional split, the sub-0.1 GB refusal, vocabulary determinism under
+`--seed`, every fabricator against its declared schema, and the
+month-window grid checked against pyhoglake's Iceberg `month` transform)
+plus a live `-m integration` smoke that seeds 0.1 GB and verifies the
+result from the server's `/tables` info — tables exist with plausible
+row/byte counts, events carry two partition values per file, dims are
+single files, and row-id ranges tile every table.
 
 Caveat on correlations: a 2-stage `--stages` list (the quick profile)
 makes `catalog_latency_corr` a two-point Pearson, which is ±1 by

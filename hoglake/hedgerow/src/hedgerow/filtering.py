@@ -8,6 +8,7 @@ column's Arrow type) at startup — fail-fast, lesson #6.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -43,6 +44,18 @@ def build_filter(
         raise ConfigError(
             "filter.equals filter value must be non-null; a null filter "
             "matches nothing (NULLs never match an equality filter)"
+        )
+    if isinstance(cfg.equals, float) and not math.isfinite(cfg.equals):
+        # Same class as the null trap (bugs.md #4): pc.equal(col, nan) is
+        # False for EVERY row (IEEE 754: NaN never equals anything, itself
+        # included), so a NaN filter silently drops 100% of rows while the
+        # offset still advances — permanent, unrecoverable skips at the
+        # destination. FilterConfig.parse refuses YAML/env configs the
+        # same way; this covers direct construction.
+        raise ConfigError(
+            f"filter.equals filter value must be finite, got {cfg.equals!r}; "
+            "a NaN filter matches no row (NaN never equals anything), so it "
+            "would drop 100% of rows while the offset advances"
         )
     col = next((c for c in source_columns if c.name == cfg.column), None)
     if col is None:

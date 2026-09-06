@@ -10,6 +10,7 @@ export default defineConfig({
     proxy: {
       "/v1": { target: apiTarget, changeOrigin: true },
       "/healthz": { target: apiTarget, changeOrigin: true },
+      "/metrics": { target: apiTarget, changeOrigin: true },
       "/openapi.yaml": { target: apiTarget, changeOrigin: true },
     },
   },

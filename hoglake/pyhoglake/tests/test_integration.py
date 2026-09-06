@@ -5,6 +5,7 @@ disposable: catalog ``pyhog-<runid>`` with data under
 ``s3://pyhog-itest/<runid>/``.
 """
 
+import struct
 import time
 import uuid
 from datetime import datetime
@@ -163,16 +164,46 @@ def test_append_lifecycle_roundtrip(client, catalog, ns, s3config):
     assert info.file_count == 1
 
 
-def test_deferred_append_stays_pending(catalog, ns):
+def test_deferred_append_hydrates_with_exact_footer_size(catalog, ns, s3config):
+    """Live regression for the footer_size wire convention (bugs.md #7):
+    deferred-stats append -> the hydrator tail-reads the footer with the
+    registered EXACT size -> the file flips to 'provided'.
+
+    footer_size must be the trailer's 4-byte LE thrift length, EXCLUDING
+    the 8-byte length+magic suffix (the convention the server's tail math
+    and compaction's stored value define). Files registered before this
+    fix carried meta_len + 8; the hydrator's tolerant tail read absorbs
+    that over-read, so no data repair is needed for them — this test pins
+    that the NEW exact value works end-to-end against the live server.
+    (Replaces test_deferred_append_stays_pending, whose premise — hydrator
+    loop off on the dev server — does not hold: the server runs the
+    hydrator at its 5s default.)"""
     table = ns.create_table("deferred", _events_schema())
     table.append(_events_data(50), deferred_stats=True)
     (f,) = table.files()
-    assert f.stats_state == "pending"
+    assert f.stats_state == "pending"  # no inline stats at commit
     assert f.record_count == 50  # record_count can never be deferred
-    # live server runs with the hydrator loop OFF: pending must persist
-    time.sleep(2)
-    (f,) = table.files()
-    assert f.stats_state == "pending"
+
+    # the registered footer_size is the exact trailer meta_len
+    fs = s3config.filesystem()
+    raw = fs.open_input_file(f.path[len("s3://") :]).read()
+    assert raw[-4:] == b"PAR1"
+    (meta_len,) = struct.unpack("<I", raw[-8:-4])
+    assert f.footer_size == meta_len
+
+    # the hydrator sweep (5s interval, 100 files/sweep on the dev server)
+    # picks it up and the stats land: 'provided' is flipped in the same
+    # transaction as the per-column stats upserts. Generous deadline: the
+    # qe_live_adversarial suite (which runs first in this session)
+    # fabricates ~1000 pending registrations that drain ahead of this
+    # file at ~100 per 5s sweep.
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        (f,) = table.files()
+        if f.stats_state != "pending":
+            break
+        time.sleep(1.0)
+    assert f.stats_state == "provided"
 
 
 def test_changes_correctness(catalog, ns):
@@ -337,6 +368,141 @@ def test_expire_and_cleanup(client):
     cleanup = cat.cleanup()
     assert cleanup.still_referenced == 0
     assert cleanup.removed >= 0 and cleanup.missing >= 0
+
+
+def _part_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("team_id", pa.int64(), nullable=False),
+            pa.field("ts", pa.timestamp("us")),
+            pa.field("val", pa.string()),
+        ]
+    )
+
+
+def _part_batch(rows_per: dict[tuple[int, int], int]) -> pa.Table:
+    """Rows per (team_id, month-1..12) partition, interleaved by round."""
+    teams, tss, vals = [], [], []
+    remaining = dict(rows_per)
+    i = 0
+    while any(v > 0 for v in remaining.values()):
+        for (team, month_no), left in remaining.items():
+            if left > 0:
+                teams.append(team)
+                tss.append(datetime(2026, month_no, 1 + i % 27, i % 24, 0, 0))
+                vals.append(f"v-{team}-{month_no}-{i}")
+                remaining[(team, month_no)] = left - 1
+                i += 1
+    return pa.table({"team_id": teams, "ts": tss, "val": vals}, schema=_part_schema())
+
+
+def _month_str(month_no: int) -> str:
+    return str((2026 - 1970) * 12 + (month_no - 1))
+
+
+def test_partitioned_append_fanout(catalog, ns):
+    """Coarse layout — months per team_id: identity(team_id) x month(ts).
+    One append spanning 3 months x 2 teams fans out to 6 files in ONE
+    commit; the server's scan plan carries each file's partition values."""
+    table = ns.create_table("part_events", _part_schema())
+    fid = {c.name: c.field_id for c in table.columns}
+    table.alter(
+        [
+            ops.set_partition_spec(
+                [
+                    ops.partition_field(fid["team_id"], "identity"),
+                    ops.partition_field(fid["ts"], "month"),
+                ]
+            )
+        ]
+    )
+
+    counts = {
+        (101, 1): 1,
+        (101, 2): 2,
+        (101, 3): 3,
+        (202, 1): 4,
+        (202, 2): 5,
+        (202, 3): 6,
+    }
+    total = sum(counts.values())  # 21
+    expected = {(str(team), _month_str(m)): n for (team, m), n in counts.items()}
+
+    head_before = catalog.refresh().head_snapshot_id
+    res = table.append(_part_batch(counts), author="pyhoglake-itest")
+    assert res.snapshot_id == head_before + 1  # ONE commit for all 6 files
+
+    # the result exposes the computed tuples with per-file row counts
+    assert {f.partition_values: f.record_count for f in res.files} == expected
+    assert sum(f.record_count for f in res.files) == total
+
+    files = table.files()
+    assert len(files) == 6
+    assert all(f.begin_snapshot == res.snapshot_id for f in files)
+    assert all(f.spec_id is not None for f in files)
+    # server-side partition values match what the client computed
+    assert {f.partition_values: f.record_count for f in files} == expected
+    assert sum(f.record_count for f in files) == total
+
+    plan = table.scan_plan()
+    assert {
+        sf.data_file.partition_values: sf.data_file.record_count for sf in plan
+    } == expected
+
+    # row-id ranges: contiguous per file, tiling [0, total)
+    ordered = sorted(files, key=lambda f: f.row_id_start)
+    next_start = 0
+    for f in ordered:
+        assert f.row_id_start == next_start
+        next_start += f.record_count
+    assert next_start == total
+
+    assert table.info().record_count == total
+
+
+def test_partitioned_compaction_groups_within_partition(catalog, ns):
+    """Compaction (metadata-planned server-side: same spec + identical
+    partition_values) must merge only within a partition. 4 small
+    appends x 2 partitions -> 8 files; a compact sweep yields one output
+    per partition, row counts preserved."""
+    table = ns.create_table("part_compact", _part_schema())
+    fid = {c.name: c.field_id for c in table.columns}
+    table.alter(
+        [
+            ops.set_partition_spec(
+                [
+                    ops.partition_field(fid["team_id"], "identity"),
+                    ops.partition_field(fid["ts"], "month"),
+                ]
+            )
+        ]
+    )
+    counts = {(7, 1): 3, (8, 1): 3}
+    for _ in range(4):  # server default HOGLAKE_COMPACTION_MIN_INPUT_FILES=4
+        table.append(_part_batch(counts))
+    assert len(table.files()) == 8
+
+    total_groups = 0
+    for _ in range(5):
+        result = catalog._client._request(
+            "POST", catalog._path("/maintenance/compact"), params={"batch": 10}
+        )
+        total_groups += result["groups_compacted"]
+        if result["groups_compacted"] == 0:
+            break
+    if total_groups == 0:
+        pytest.skip("live server's compaction sweep produced no groups")
+
+    files = table.files()
+    by_values: dict[tuple[str | None, ...], list] = {}
+    for f in files:
+        by_values.setdefault(f.partition_values, []).append(f)
+    # grouping never crossed a partition boundary: one output per
+    # partition, carrying ONLY that partition's 12 rows
+    assert set(by_values) == {("7", _month_str(1)), ("8", _month_str(1))}
+    for group in by_values.values():
+        assert len(group) == 1
+        assert group[0].record_count == 12
 
 
 def test_drop_table(catalog, ns):

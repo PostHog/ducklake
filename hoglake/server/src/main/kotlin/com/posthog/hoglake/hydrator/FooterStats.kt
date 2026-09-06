@@ -73,6 +73,15 @@ object FooterStats {
      */
     fun missingFieldIds(schema: MessageType): Boolean = anyLeafWithoutId(schema.fields)
 
+    /**
+     * Whether [aggregate] will map columns by field id for this schema:
+     * true when any top-level primitive leaf carries a `PARQUET:field_id`
+     * (the same signal aggregate keys off). False = the name-fallback
+     * path, whose column set the hydrator must resolve at the FILE's
+     * begin_snapshot, not live-at-hydration.
+     */
+    fun usesFieldIds(schema: MessageType): Boolean = topLevelLeaves(schema).any { it.fieldId != null }
+
     private fun anyLeafWithoutId(fields: List<Type>): Boolean =
         fields.any { field ->
             if (field.isPrimitive) {
@@ -295,13 +304,21 @@ object FooterStats {
             (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.TimestampLogicalTypeAnnotation)
                 ?.unit ?: return null
         val v = readLongLE(raw) ?: return null
-        return when (unit) {
-            LogicalTypeAnnotation.TimeUnit.MICROS -> v
-            LogicalTypeAnnotation.TimeUnit.MILLIS -> Math.multiplyExact(v, 1_000L)
-            // Nanos truncate: floor for the lower bound, ceil for the upper,
-            // so the bound stays valid for the true values.
-            LogicalTypeAnnotation.TimeUnit.NANOS ->
-                if (upper) Math.floorDiv(Math.addExact(v, 999L), 1_000L) else Math.floorDiv(v, 1_000L)
+        return try {
+            when (unit) {
+                LogicalTypeAnnotation.TimeUnit.MICROS -> v
+                LogicalTypeAnnotation.TimeUnit.MILLIS -> Math.multiplyExact(v, 1_000L)
+                // Nanos truncate: floor for the lower bound, ceil for the upper,
+                // so the bound stays valid for the true values.
+                LogicalTypeAnnotation.TimeUnit.NANOS ->
+                    if (upper) Math.floorDiv(Math.addExact(v, 999L), 1_000L) else Math.floorDiv(v, 1_000L)
+            }
+        } catch (_: ArithmeticException) {
+            // The unit conversion overflows int64 micros (a millis bound
+            // near Long.MAX_VALUE — hostile-writer craftable). The decode
+            // contract is "bounds NULL, never guessed" — an overflow must
+            // degrade to a null bound, never escape and fail the file.
+            null
         }
     }
 

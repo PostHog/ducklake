@@ -117,7 +117,7 @@ class CompactionPlanningIntegrationTest {
     }
 
     @Test
-    fun `a file with a live deletion vector is never a candidate`() {
+    fun `a file with a live deletion vector is a candidate carrying its planned vector`() {
         val cat = fixture()
         val snap = append(cat, file("a", 100), file("b", 100), file("c", 100)).snapshotId
         val fileIds =
@@ -154,10 +154,19 @@ class CompactionPlanningIntegrationTest {
             ),
         )
         val plan = svc.planTable(cat, "ns", "t", cfg)
-        // b is DV-bearing -> excluded; a and c still form a (non-adjacent!) group.
+        // DV-bearing files compact too: the plan captures the live vector's
+        // identity so execution applies it and commit detects supersession.
         assertThat(plan.groups).hasSize(1)
-        assertThat(plan.groups.single().files.map { it.path })
-            .containsExactly("s3://bucket/x/a.parquet", "s3://bucket/x/c.parquet")
+        val group = plan.groups.single()
+        assertThat(group.files.map { it.path })
+            .containsExactly("s3://bucket/x/a.parquet", "s3://bucket/x/b.parquet", "s3://bucket/x/c.parquet")
+        assertThat(group.files.map { it.dv?.path })
+            .containsExactly(null, "s3://bucket/x/b.dv", null)
+        val plannedDv = group.files[1].dv!!
+        assertThat(plannedDv.deleteCount).isEqualTo(1)
+        // Survivors = gross minus the planned deletes.
+        assertThat(group.totalRecords).isEqualTo(30)
+        assertThat(group.survivingRecords).isEqualTo(29)
     }
 
     @Test

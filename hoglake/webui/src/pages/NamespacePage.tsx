@@ -5,7 +5,7 @@ import { createTable, listTables } from "../api/client";
 import { COLUMN_TYPES, type ColumnType } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
-import { identifierError } from "../lib/names";
+import { columnNameError, identifierError } from "../lib/names";
 
 interface ColumnRow {
   name: string;
@@ -54,9 +54,10 @@ function CreateTableForm({
       cols.map((c, idx) => (idx === i ? { ...c, ...patch } : c)),
     );
 
-  // Mirror the server's identifier pattern (422 on violation) client-side.
+  // Mirror the server's identifier pattern (422 on violation) client-side;
+  // columns additionally refuse the reserved `_hog` prefix.
   const nameError = identifierError(name);
-  const columnErrors = columns.map((c) => identifierError(c.name));
+  const columnErrors = columns.map((c) => columnNameError(c.name));
   const hasErrors = nameError !== null || columnErrors.some((e) => e !== null);
 
   return (

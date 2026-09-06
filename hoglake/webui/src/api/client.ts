@@ -4,12 +4,14 @@
 import type {
   ApiErrorBody,
   Catalog,
+  ConsumerList,
   ConsumerOffset,
   CreateCatalogRequest,
   CreateTableRequest,
   DataFile,
   Int64,
   Namespace,
+  PartitionStatsResponse,
   ScanFile,
   SnapshotPage,
   Table,
@@ -202,6 +204,21 @@ export function listSnapshots(
   );
 }
 
+// -- partition stats ----------------------------------------------------------
+
+export function listPartitionStats(
+  catalog: string,
+  opts?: { namespace?: string; table?: string; limit?: number },
+): Promise<PartitionStatsResponse> {
+  return request(
+    buildUrl(`/catalogs/${seg(catalog)}/stats/partitions`, {
+      namespace: opts?.namespace || undefined,
+      table: opts?.table || undefined,
+      limit: opts?.limit,
+    }),
+  );
+}
+
 // -- consumers --------------------------------------------------------------
 
 export function listConsumerOffsets(
@@ -211,6 +228,29 @@ export function listConsumerOffsets(
   return request(
     buildUrl(`/catalogs/${seg(catalog)}/consumers/${seg(consumer)}/offsets`),
   );
+}
+
+export function listConsumers(catalog: string): Promise<ConsumerList> {
+  return request(buildUrl(`/catalogs/${seg(catalog)}/consumers`));
+}
+
+export function getInstanceInfo(): Promise<{ name?: string }> {
+  return request(buildUrl("/info"));
+}
+
+// -- metrics ------------------------------------------------------------------
+
+/**
+ * Raw Prometheus text exposition from the server's /metrics endpoint (the
+ * Vite dev server proxies it alongside /v1). Not JSON — parsed by
+ * src/lib/prometheus.ts.
+ */
+export async function fetchMetricsText(): Promise<string> {
+  const res = await fetch("/metrics", { headers: { Accept: "text/plain" } });
+  if (!res.ok) {
+    throw new Error(`GET /metrics failed: HTTP ${res.status}`);
+  }
+  return res.text();
 }
 
 // -- health -----------------------------------------------------------------

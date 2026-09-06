@@ -17,8 +17,9 @@ Pinned policies (verified here, and load-bearing for the JVM port):
   timestamp/timestamptz=8, uuid=16 bytes — always.
 * Decimal: minimal-length big-endian two's-complement unscaled value.
   Encoding is exact and canonical (no redundant sign-extension byte).
-  DECODE of unscaled values wider than the default decimal-context
-  precision (28 digits) silently rounds — BUG, see the xfail below.
+  Decode of unscaled values wider than the default decimal-context
+  precision (28 digits) once silently rounded; encode and decode now
+  both run under a widened localcontext, pinned by regressions below.
 * Out-of-range ints (int/long) raise struct.error at encode.
 """
 

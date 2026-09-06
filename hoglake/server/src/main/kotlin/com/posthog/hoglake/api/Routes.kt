@@ -28,8 +28,12 @@ import java.util.UUID
 fun Application.installApiRoutes(
     catalogs: CatalogService,
     commits: CommitService,
+    instanceName: String = "",
 ) {
     routing {
+        get("/v1/info") {
+            call.respond(InstanceInfoDto(name = instanceName.ifBlank { null }))
+        }
         route("/v1/catalogs") {
             get {
                 call.respond(catalogs.listCatalogs().map { it.toDto() })
@@ -148,6 +152,12 @@ fun Application.installApiRoutes(
                 post("/commit") {
                     val req = call.receive<CommitRequestDto>()
                     call.respond(commits.commit(call.catalog(), req.toModel()).toDto())
+                }
+
+                get("/consumers") {
+                    call.respond(
+                        catalogs.listConsumers(call.catalog()).toConsumerListDto(),
+                    )
                 }
 
                 route("/consumers/{consumer}/offsets") {

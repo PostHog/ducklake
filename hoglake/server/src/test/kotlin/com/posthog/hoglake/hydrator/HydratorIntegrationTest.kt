@@ -34,6 +34,12 @@ class HydratorIntegrationTest {
     private val jdbi get() = db.jdbi
     private val hydrator by lazy { Hydrator(jdbi, store) }
 
+    // Per-method lifecycle mints a fresh database (and pool) per test;
+    // closing it is what keeps the shared PG container under
+    // max_connections across the whole suite.
+    @org.junit.jupiter.api.AfterEach
+    fun tearDown() = db.close()
+
     // ---- known file content ------------------------------------------------
     //
     // 25 rows:
@@ -379,6 +385,209 @@ class HydratorIntegrationTest {
         assertThat(statsRows(catalogId, 1)).isEmpty()
         assertThat(statsState(catalogId, 2)).isEqualTo("provided")
         assertThat(statsRows(catalogId, 2)).containsOnlyKeys(1L, 2L, 3L, 4L)
+    }
+
+    private fun catalogName(catalogId: Long): String =
+        jdbi.withHandle<String, Exception> { h ->
+            h.createQuery("SELECT name FROM hog_catalog WHERE catalog_id = ?")
+                .bind(0, catalogId).mapTo(String::class.java).one()
+        }
+
+    @Test
+    fun `a transient store failure leaves the file pending and the next sweep hydrates it`() {
+        // Pinned regression (bug hunt #8): S3 throttle/connection failures
+        // used to flip files to terminal 'failed'. They must stay pending.
+        val catalogId = seedCatalogAndTable()
+        val path = "s3://$BUCKET/t1/transient.parquet"
+        store.put(path, parquetBytes)
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
+
+        // A store pointing at a closed port: every fetch fails with a
+        // connection error — transient by classification.
+        ObjectStore(
+            endpoint = "http://127.0.0.1:9",
+            region = "us-east-1",
+            accessKey = "unused",
+            secretKey = "unused",
+            pathStyle = true,
+        ).use { broken ->
+            assertThat(Hydrator(jdbi, broken).runOnce()).isEqualTo(1)
+        }
+        assertThat(statsState(catalogId, 1)).isEqualTo("pending")
+        assertThat(statsRows(catalogId, 1)).isEmpty()
+
+        // The condition "clears" (the real store): same row hydrates.
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        assertSampleStats(catalogId, 1)
+    }
+
+    @Test
+    fun `rehydrate flips failed back to pending and the sweep retries them`() {
+        val catalogId = seedCatalogAndTable()
+        val path = "s3://$BUCKET/t1/rehydrate.parquet"
+        store.put(path, parquetBytes)
+        // Structural failure: the registration lies about record_count.
+        seedDataFile(catalogId, 1, path, ROWS + 1L, parquetBytes.size.toLong(), null)
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("failed")
+
+        // Operator fixes the registration, then requeues the catalog.
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                "UPDATE hog_data_file SET record_count = ? WHERE catalog_id = ? AND data_file_id = 1",
+                ROWS.toLong(),
+                catalogId,
+            )
+        }
+        val result = hydrator.rehydrateFailed(catalogName(catalogId))
+        assertThat(result.requeued).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("pending")
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+    }
+
+    @Test
+    fun `rehydrate table scope hits only that table and half a scope is a validation`() {
+        val catalogId = seedCatalogAndTable()
+        // A second table with its own failed file, plus a live version row
+        // so the name resolves.
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (?, 2, 1)",
+                catalogId,
+            )
+            h.execute(
+                """
+                INSERT INTO hog_table_version (catalog_id, table_id, begin_snapshot, namespace_id, name)
+                VALUES (?, 1, 1, 1, 't_one'), (?, 2, 1, 1, 't_two')
+                """,
+                catalogId,
+                catalogId,
+            )
+            for ((fileId, tableId) in listOf(1L to 1L, 2L to 2L)) {
+                h.execute(
+                    """
+                    INSERT INTO hog_data_file
+                        (catalog_id, data_file_id, table_id, begin_snapshot, path,
+                         record_count, file_size_bytes, row_id_start, stats_state)
+                    VALUES (?, ?, ?, 1, 's3://$BUCKET/t$tableId/failed.parquet', 10, 100, 0, 'failed')
+                    """,
+                    catalogId,
+                    fileId,
+                    tableId,
+                )
+            }
+        }
+        val cat = catalogName(catalogId)
+        val scoped = hydrator.rehydrateFailed(cat, "ns", "t_two")
+        assertThat(scoped.requeued).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("failed") // other table untouched
+        assertThat(statsState(catalogId, 2)).isEqualTo("pending")
+
+        org.assertj.core.api.Assertions.assertThatThrownBy { hydrator.rehydrateFailed(cat, "ns", null) }
+            .isInstanceOf(com.posthog.hoglake.model.HoglakeException.Validation::class.java)
+        org.assertj.core.api.Assertions.assertThatThrownBy { hydrator.rehydrateFailed(cat, "ns", "nope") }
+            .isInstanceOf(com.posthog.hoglake.model.HoglakeException.NotFound::class.java)
+    }
+
+    @Test
+    fun `name fallback binds at the file's begin snapshot, not live-at-hydration`() {
+        // Pinned regression (bug hunt #9): drop+add same-name between the
+        // commit and the sweep. The id-less file's stats must land under
+        // the ORIGINAL field id (the incarnation the file was written
+        // against), never the new one.
+        val catalogId = seedCatalogAndTable()
+        val idless = writeSampleParquet(sampleSchema(withIds = false))
+        val path = "s3://$BUCKET/t1/idless-rebind.parquet"
+        store.put(path, idless)
+        // The file lands at snapshot 2 (columns began at snapshot 1).
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                """
+                INSERT INTO hog_data_file
+                    (catalog_id, data_file_id, table_id, begin_snapshot, path,
+                     record_count, file_size_bytes, footer_size, row_id_start, stats_state)
+                VALUES (?, 1, 1, 2, ?, ?, ?, ?, 0, 'pending')
+                """,
+                catalogId,
+                path,
+                ROWS.toLong(),
+                idless.size.toLong(),
+                footerSizeOf(idless),
+            )
+            // Snapshot 3: drop 'score' (field 2), add a NEW 'score' (field 5).
+            h.execute(
+                "UPDATE hog_column SET end_snapshot = 3 WHERE catalog_id = ? AND field_id = 2",
+                catalogId,
+            )
+            h.execute(
+                """
+                INSERT INTO hog_column
+                    (catalog_id, table_id, field_id, begin_snapshot, name, col_type, ordinal)
+                VALUES (?, 1, 5, 3, 'score', 'double', 4)
+                """,
+                catalogId,
+            )
+        }
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        val stats = statsRows(catalogId, 1)
+        // Everything under the ORIGINAL ids — 'score' under field 2, and
+        // NOTHING under the new incarnation's field 5.
+        assertThat(stats).containsOnlyKeys(1L, 2L, 3L, 4L)
+        assertSampleStats(catalogId, 1)
+    }
+
+    @Test
+    fun `whole-object fallback is capped - at the cap hydrates, over it fails structurally`() {
+        // Pinned regression (bug hunt #11): the whole-object fallback used
+        // to buffer arbitrarily large objects on the heap. file_size_bytes
+        // is fabricated around the cap; footer_size is absent so both rows
+        // take the fallback path.
+        val catalogId = seedCatalogAndTable()
+        val cap = parquetBytes.size.toLong()
+        val atCap = "s3://$BUCKET/t1/at-cap.parquet"
+        val overCap = "s3://$BUCKET/t1/over-cap.parquet"
+        store.put(atCap, parquetBytes)
+        store.put(overCap, parquetBytes)
+        seedDataFile(catalogId, 1, atCap, ROWS.toLong(), cap, null)
+        seedDataFile(catalogId, 2, overCap, ROWS.toLong(), cap + 1, null)
+
+        val capped = Hydrator(jdbi, store, maxWholeObjectBytes = cap)
+        assertThat(capped.runOnce()).isEqualTo(2)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided") // boundary: == cap is allowed
+        assertThat(statsState(catalogId, 2)).isEqualTo("failed") // cap + 1: structural
+        assertThat(statsRows(catalogId, 2)).isEmpty()
+    }
+
+    @Test
+    fun `concurrent claims are disjoint - FOR UPDATE SKIP LOCKED`() {
+        // Pinned regression (bug hunt #12): N replicas used to select the
+        // same pending head and burn N x the S3 GETs on identical files.
+        val catalogId = seedCatalogAndTable()
+        seedDataFile(catalogId, 1, "s3://$BUCKET/t1/claim-a.parquet", ROWS.toLong(), 100, null)
+        seedDataFile(catalogId, 2, "s3://$BUCKET/t1/claim-b.parquet", ROWS.toLong(), 100, null)
+
+        val h1 = jdbi.open()
+        val h2 = jdbi.open()
+        try {
+            h1.begin()
+            h2.begin()
+            val first = hydrator.claimPending(h1, 1)
+            assertThat(first).hasSize(1)
+            val second = hydrator.claimPending(h2, 10)
+            // Disjoint sets: the second replica skips the first's locked row.
+            assertThat(second.map { it.dataFileId }).doesNotContainAnyElementsOf(first.map { it.dataFileId })
+            assertThat(first.map { it.dataFileId } + second.map { it.dataFileId })
+                .containsExactlyInAnyOrder(1L, 2L)
+        } finally {
+            h1.rollback()
+            h2.rollback()
+            h1.close()
+            h2.close()
+        }
     }
 
     @Test

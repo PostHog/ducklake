@@ -63,6 +63,12 @@ Permanent client errors (validation, not-found, already-exists) skip the
 replay budget entirely and halt immediately — a retry would fail
 identically while still re-appending rows.
 
+Retryable **commit conflicts** on a destination append (409, concurrent
+DDL) never reach the replay path directly: the single append is retried
+in place, duplicate-free, up to `replication.max_append_retries` times
+with a short backoff. Only an exhausted (or non-retryable) conflict
+escalates to the window replay above.
+
 ## Config reference
 
 ```yaml
@@ -89,16 +95,24 @@ destination:                        # may be the same server
 filter:                             # optional client-side row filter
   column: team_id                   # may be a column the destination drops
   equals: 42                        # NULLs never match; null is REFUSED
-                                    # (a null filter matches nothing)
+                                    # (a null filter matches nothing);
+                                    # NaN/Inf are REFUSED too (IEEE
+                                    # NaN != NaN would silently drop
+                                    # every row while the offset advances)
 
 replication:
   poll_interval_s: 5                # sleep when caught up (or after an error);
-                                    # minimum 0.1 (0 would busy-spin the loop)
+                                    # minimum 0.1 (0 would busy-spin the
+                                    # loop); NaN/Inf refused at startup
   max_snapshot_window: 1000         # snapshots per cycle, max
   max_rows_per_append: 100000       # rows per destination append, max
   max_window_replays: 3             # transient-failure retries per window;
                                     # each replay may duplicate the window's
                                     # rows; exhausting it HALTS (exit 9)
+  max_append_retries: 3             # retryable commit conflicts per append:
+                                    # duplicate-free single-append retries
+                                    # (short backoff) BEFORE escalating to
+                                    # the window-replay path above
 
 metrics:
   port: 0                           # 0 = disabled; >0 serves /metrics

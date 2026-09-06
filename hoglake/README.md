@@ -12,20 +12,40 @@ control plane. Companion docs in this directory:
 - [trino-integration.md](trino-integration.md) — Trino as the facade's
   first consumer, and the commit-shape choices that keep append-only
   Trino writes a translation away.
-- [metadata-schema.md](metadata-schema.md) — the current `ducklake_*` metadata schema, its
-  invariants, and the migration story (current: none).
+- [metadata-schema.md](metadata-schema.md) — the predecessor `ducklake_*` metadata schema, its
+  invariants, and its (non-)migration story — plus the as-built `hog_*`
+  schema inventory (§6), mirroring [server/schema.sql](server/schema.sql).
 - [fuzzing.md](fuzzing.md) — the property-testing/fuzzing strategy
   (hypothesis + kotest-property + cross-language codec vectors).
+- [operational-notes.md](operational-notes.md) — what hoglake changes,
+  and what it honestly doesn't, against the predecessor's observed
+  numbers at 2PB / ~1T rows; the catalog's own sizing and the ceilings
+  to watch.
+- [sql-suggestions.md](sql-suggestions.md) /
+  [suggestions.md](suggestions.md) — schema review and the
+  language/stack retrospective, both written against the as-built tree.
+- [paimon-compare.md](paimon-compare.md) — hoglake against Apache
+  Paimon, the closest comparable.
+- [split-validation-commit.md](split-validation-commit.md) — a designed
+  (unscheduled) refinement moving validation in front of the
+  serialization point, should one catalog ever outgrow the commit tail.
+- [duckdb-read-extension.md](duckdb-read-extension.md) — a sketch for
+  DuckDB's return as a client, never as the engine the catalog lives
+  inside.
 
 Implementation lives alongside the docs (`justfile` composes the
 per-component recipes; `just test-all`):
 
 - [server/](server/README.md) — the control plane (Kotlin/Ktor/PG).
+- [server/trino/](server/trino/README.md) — the native read-only Trino
+  connector (interim, until the Iceberg facade lands).
 - [pyhoglake/](pyhoglake/README.md) — the Python client (the thin-API
   successor to pyducklake; owns the parquet writer path).
 - [webui/](webui/README.md) — the management console.
-- [hedgerow/](hedgerow/) — the hoglake-native replication daemon
-  (viaduck's successor; append-only, single-destination v1).
+- [hedgerow/](hedgerow/README.md) — the hoglake-native replication
+  daemon (viaduck's successor; append-only, single-destination v1).
+- [bench/](bench/README.md) — the stress/benchmark harness behind the
+  measured numbers below.
 
 ## What hoglake is
 
@@ -63,21 +83,21 @@ backends, keeping the DuckDB extension alive.
 | **Commit serialization** | Per-catalog advisory-lock tail (ms); dense snapshot ids | Snapshot-id PK collision as the conflict signal; retry re-pays the full commit |
 | **File registration** | Footer-shipping (writer sends stats; server never opens data files); deferred-stats mode with async hydration | Engine writes files and stats in-process |
 | **Row lineage** | Server-assigned contiguous ranges, never reused; `table_uuid` incarnation contract | Rowids reused on upsert-recreate; sorted compaction silently remaps them |
-| **Row-level deletes** | Deletion vectors: one live DV per file, growth-monotonic, stale-DV = typed 409 | Positional delete files (+ experimental DVs); delete-vs-delete races surface as generic conflicts |
+| **Row-level deletes** | Deletion vectors: one live DV per file, growth-monotonic, stale-DV = typed 409; compaction applies DVs on rewrite (survivors keep their row ids, a post-plan delete is never dropped) | Positional delete files (+ experimental DVs); delete-vs-delete races surface as generic conflicts |
 | **Time travel** | Snapshot id or timestamp; aggregates snapshot-scoped; 410 below the retention floor | Snapshot version or timestamp via ATTACH/AT |
 | **CDC / changefeed** | First-class plan API (files + DVs per range); expired ranges refuse loudly | `table_changes()` SQL macro (executor-stall wedge at scale; silent gaps possible) |
 | **Consumer offsets** | Catalog state: monotonic, `table_uuid`-keyed, retention-aware | Not a concept; every consumer builds its own cursor store |
 | **Retention/expiry** | Catalog property, continuous incremental sweeps, consumer-offset floor, range deletes | Client-invoked global procedure (~14ms/snapshot; ~50h at 15M snapshots); blind to consumers |
 | **Physical file deletion** | Queued + liveness-checked at drain; sub-batch commits; still-referenced = alert, never delete | Queue trusted absolutely (age filter only); one S3 5xx rolls back the catalog delete (phantom queues) |
-| **Maintenance ownership** | Service background jobs (expiry, cleanup live; compaction landing) | Client procedures, no advisory locks — concurrent runs corrupt shared state |
+| **Maintenance ownership** | Service background jobs — expiry, cleanup, and compaction all live (compaction handles DV-bearing files and mixed-schema groups; its loop ships opt-in as an ops decision) | Client procedures, no advisory locks — concurrent runs corrupt shared state |
 | **Inlined data** | None (dropped by design; Arrow-blob design reserved if ever needed) | Dynamic per-schema-version tables in the catalog (unreachable-GC class) |
 | **Schema evolution** | Typed ops, atomic multi-op DDL commits, field-id-stable renames, strict promotion lattice | ALTER via engine; broader type lattice; struct field ops |
 | **Partition transforms** | identity, bucket(n) (Murmur3, Iceberg-bit-compatible), year/month/day/hour; files remember their spec vintage | identity, bucket(n) (murmur3; nested types hash a string repr), calendar + epoch date variants |
-| **Sort orders** | Landing with compaction (M4): versioned sort spec, applied on rewrite **with row ids preserved** | `SET SORTED BY` applied at insert/flush/compaction — but sorted compaction silently remaps rowids |
+| **Sort orders** | Versioned sort spec (`set_sort_order`), advisory for writers, binding for compaction — applied on rewrite **with row ids preserved** (explicit `_hog_row_id` column) | `SET SORTED BY` applied at insert/flush/compaction — but sorted compaction silently remaps rowids |
 | **Views** | SQL text + dialect, versioned | Yes, incl. macros |
 | **Encryption** | Not yet | Per-file parquet encryption |
 | **Readers** | REST + native Trino connector (read-only) + web console; Iceberg REST facade designed | DuckDB (only) |
-| **Observability** | `/metrics` (per-catalog health, outcome counters) + structured audit log, built in | External scripts/daemons querying the catalog |
+| **Observability** | `/metrics` (per-catalog health, outcome counters, commit-lock-wait histogram) + structured audit log + on-demand invariant scan (`POST /maintenance/verify`) + instance identity (`GET /v1/info`), built in | External scripts/daemons querying the catalog |
 | **Migration story** | Flyway + canonical schema.sql with CI equivalence check | Imperative C++ string migrations; no ledger; partial migration representable |
 | **Integrity** | PKs, FKs+CASCADE, NOT NULL, CHECK vocabularies, partial unique indexes | 5 PKs total; zero FKs/indexes/constraints beyond them |
 
@@ -236,7 +256,12 @@ versioning + delayed permanent delete) and always liveness-checked
 against live references first. The service exports its own health —
 snapshot count/age, deletion-queue depth, stats-pending, commit
 latency per tenant, and orphan counts as *invariant violations* —
-retiring the metrics-cron layer. The changefeed carries `table_uuid`
+retiring the metrics-cron layer; and the invariants themselves are
+checkable on demand (`POST /maintenance/verify`: a six-check
+metadata-only scan — row-id tiling, DV monotonicity, orphans,
+still-referenced queue entries, snapshot density, allocator
+consistency). The removal queue doubles as a queryable forensics
+ledger (attempts, outcomes, settle times) instead of dying row by row. The changefeed carries `table_uuid`
 so consumers see incarnation changes instead of deducing them. DR is
 specified up front: PITR on the catalog Postgres + a consistent export
 (catalog dump + file manifest), cheap because the catalog stays small
@@ -309,7 +334,11 @@ Key moves:
 - **Commit admission**: the service arbitrates catalog access —
   maintenance yields to foreground commits, per-tenant fair queuing,
   explicit backpressure responses. Observability data never rides the
-  commit path.
+  commit path. The v1 server ships the minimal real form: a
+  `lock_timeout` on the serialized commit tail that surfaces as HTTP
+  503 `commit_queue_timeout` + Retry-After (explicit, retryable
+  backpressure — never latency inference), with lock-wait time
+  measured on every tail; per-tenant fairness remains future work.
 - **Commit-serialization refinements (possible direction, not a
   promise).** The catalog-global snapshot chain stays — re-engineering
   it is a bridge too far. But within that model, server-side ownership
@@ -537,9 +566,11 @@ history in readers.
   endpoint sizes the file's row-id range at registration — writers
   always know their row count, and imports get it from the manifest
   or accept a footer-count-only read (still far cheaper than full
-  stats assembly). Hydration failure is loud (state + metric), and
-  the hydrator doubles as the trust-but-verify pass for
-  writer-shipped stats.
+  stats assembly). Hydration failure is loud (state + metric) and
+  two-class — transient object-store errors stay `pending` and retry,
+  structural ones go `failed` with an operator requeue
+  (`POST /maintenance/rehydrate`) — and the hydrator doubles as the
+  trust-but-verify pass for writer-shipped stats.
 - **Tenancy: one service, many catalogs** — with the explicit note
   that this is an area to explore. The operational leverage (one
   deploy, one upgrade, fleet-wide fixes land once) is the point of the

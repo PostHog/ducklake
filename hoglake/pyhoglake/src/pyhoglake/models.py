@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
+
+from .errors import MalformedResponseError
+
+T = TypeVar("T")
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -15,9 +20,34 @@ def _parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
-def _pick(cls: type, d: dict[str, Any]) -> dict[str, Any]:
+def _pick(cls: type, d: Mapping[str, Any]) -> dict[str, Any]:
     names = {f.name for f in fields(cls)}
     return {k: v for k, v in d.items() if k in names}
+
+
+def _wire(model: str, d: Any, build: Callable[[Mapping[str, Any]], T]) -> T:
+    """Shared ``from_wire`` guard (bugs.md #24): every structural defect
+    in a response body — missing required field, wrong-typed value,
+    non-object where an object was expected — surfaces as ONE typed
+    client-side error, :class:`MalformedResponseError`, naming the model
+    and the offending field. Without it the hand-rolled parsers leaked
+    ``KeyError`` (direct indexing), ``AttributeError`` (non-dict nesteds
+    hitting ``_pick``), and ``TypeError`` (``_pick`` models missing a
+    required constructor argument)."""
+    if not isinstance(d, Mapping):
+        raise MalformedResponseError(
+            f"{model}: expected a JSON object, got {type(d).__name__}"
+        )
+    try:
+        return build(d)
+    except MalformedResponseError:
+        raise  # a nested model already produced the precise error
+    except KeyError as e:
+        raise MalformedResponseError(
+            f"{model}: missing required field {e.args[0]!r}"
+        ) from e
+    except (TypeError, ValueError, AttributeError) as e:
+        raise MalformedResponseError(f"{model}: malformed response: {e}") from e
 
 
 @dataclass(frozen=True)
@@ -29,7 +59,7 @@ class CatalogInfo:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> CatalogInfo:
-        return cls(**_pick(cls, d))
+        return _wire("CatalogInfo", d, lambda d: cls(**_pick(cls, d)))
 
 
 @dataclass(frozen=True)
@@ -40,7 +70,7 @@ class CatalogOptions:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> CatalogOptions:
-        return cls(**_pick(cls, d))
+        return _wire("CatalogOptions", d, lambda d: cls(**_pick(cls, d)))
 
 
 @dataclass(frozen=True)
@@ -53,7 +83,7 @@ class ExpiryResult:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> ExpiryResult:
-        return cls(**_pick(cls, d))
+        return _wire("ExpiryResult", d, lambda d: cls(**_pick(cls, d)))
 
 
 @dataclass(frozen=True)
@@ -64,7 +94,7 @@ class CleanupResult:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> CleanupResult:
-        return cls(**_pick(cls, d))
+        return _wire("CleanupResult", d, lambda d: cls(**_pick(cls, d)))
 
 
 @dataclass(frozen=True)
@@ -74,7 +104,7 @@ class SnapshotChange:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> SnapshotChange:
-        return cls(**_pick(cls, d))
+        return _wire("SnapshotChange", d, lambda d: cls(**_pick(cls, d)))
 
 
 @dataclass(frozen=True)
@@ -88,14 +118,18 @@ class Snapshot:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> Snapshot:
-        return cls(
-            snapshot_id=d["snapshot_id"],
-            snapshot_time=_parse_dt(d["snapshot_time"]),
-            schema_version=d["schema_version"],
-            author=d.get("author"),
-            message=d.get("message"),
-            changes=tuple(
-                SnapshotChange.from_wire(c) for c in (d.get("changes") or ())
+        return _wire(
+            "Snapshot",
+            d,
+            lambda d: cls(
+                snapshot_id=d["snapshot_id"],
+                snapshot_time=_parse_dt(d["snapshot_time"]),
+                schema_version=d["schema_version"],
+                author=d.get("author"),
+                message=d.get("message"),
+                changes=tuple(
+                    SnapshotChange.from_wire(c) for c in (d.get("changes") or ())
+                ),
             ),
         )
 
@@ -109,9 +143,12 @@ class ConsumerOffset:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> ConsumerOffset:
-        d = dict(_pick(cls, d))
-        d["updated_at"] = _parse_dt(d["updated_at"])
-        return cls(**d)
+        def build(d: Mapping[str, Any]) -> ConsumerOffset:
+            kw = dict(_pick(cls, d))
+            kw["updated_at"] = _parse_dt(d["updated_at"])
+            return cls(**kw)
+
+        return _wire("ConsumerOffset", d, build)
 
 
 @dataclass(frozen=True)
@@ -121,7 +158,7 @@ class TableSummary:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableSummary:
-        return cls(**_pick(cls, d))
+        return _wire("TableSummary", d, lambda d: cls(**_pick(cls, d)))
 
 
 @dataclass(frozen=True)
@@ -135,7 +172,7 @@ class Column:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> Column:
-        return cls(**_pick(cls, d))
+        return _wire("Column", d, lambda d: cls(**_pick(cls, d)))
 
 
 @dataclass(frozen=True)
@@ -146,7 +183,7 @@ class PartitionField:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> PartitionField:
-        return cls(**_pick(cls, d))
+        return _wire("PartitionField", d, lambda d: cls(**_pick(cls, d)))
 
     def to_wire(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -165,9 +202,15 @@ class PartitionSpec:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> PartitionSpec:
-        return cls(
-            spec_id=d["spec_id"],
-            fields=tuple(PartitionField.from_wire(f) for f in (d.get("fields") or ())),
+        return _wire(
+            "PartitionSpec",
+            d,
+            lambda d: cls(
+                spec_id=d["spec_id"],
+                fields=tuple(
+                    PartitionField.from_wire(f) for f in (d.get("fields") or ())
+                ),
+            ),
         )
 
 
@@ -184,17 +227,20 @@ class TableInfo:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableInfo:
-        spec = d.get("partition_spec")
-        return cls(
-            name=d["name"],
-            namespace=d["namespace"],
-            table_uuid=d["table_uuid"],
-            columns=tuple(Column.from_wire(c) for c in (d.get("columns") or ())),
-            record_count=d["record_count"],
-            file_count=d["file_count"],
-            file_size_bytes=d["file_size_bytes"],
-            partition_spec=PartitionSpec.from_wire(spec) if spec else None,
-        )
+        def build(d: Mapping[str, Any]) -> TableInfo:
+            spec = d.get("partition_spec")
+            return cls(
+                name=d["name"],
+                namespace=d["namespace"],
+                table_uuid=d["table_uuid"],
+                columns=tuple(Column.from_wire(c) for c in (d.get("columns") or ())),
+                record_count=d["record_count"],
+                file_count=d["file_count"],
+                file_size_bytes=d["file_size_bytes"],
+                partition_spec=PartitionSpec.from_wire(spec) if spec else None,
+            )
+
+        return _wire("TableInfo", d, build)
 
 
 @dataclass(frozen=True)
@@ -240,16 +286,32 @@ class DataFile:
     row_id_start: int
     stats_state: str
     begin_snapshot: int
+    #: Serialized thrift FileMetaData length: the 4-byte LE value stored
+    #: in the parquet trailer, EXCLUDING the trailing 8-byte suffix
+    #: (length + "PAR1"). The server tail-reads the footer as
+    #: [file_size - footer_size - 8, file_size).
     footer_size: int | None = None
     spec_id: int | None = None
     partition_values: tuple[str | None, ...] | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> DataFile:
-        d = dict(_pick(cls, d))
-        if d.get("partition_values") is not None:
-            d["partition_values"] = tuple(d["partition_values"])
-        return cls(**d)
+        def build(d: Mapping[str, Any]) -> DataFile:
+            kw = dict(_pick(cls, d))
+            pv = kw.get("partition_values")
+            if pv is not None:
+                # bugs.md #18: tuple("abc") would silently char-split a
+                # wrong-typed string into ('a', 'b', 'c'); only an array
+                # (or null) is a legal wire shape here.
+                if not isinstance(pv, (list, tuple)):
+                    raise MalformedResponseError(
+                        "DataFile: partition_values must be an array or "
+                        f"null, got {type(pv).__name__}"
+                    )
+                kw["partition_values"] = tuple(pv)
+            return cls(**kw)
+
+        return _wire("DataFile", d, build)
 
 
 @dataclass(frozen=True)
@@ -264,7 +326,7 @@ class DeleteFile:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> DeleteFile:
-        return cls(**_pick(cls, d))
+        return _wire("DeleteFile", d, lambda d: cls(**_pick(cls, d)))
 
 
 @dataclass(frozen=True)
@@ -274,11 +336,14 @@ class ScanFile:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> ScanFile:
-        df = d.get("delete_file")
-        return cls(
-            data_file=DataFile.from_wire(d["data_file"]),
-            delete_file=DeleteFile.from_wire(df) if df else None,
-        )
+        def build(d: Mapping[str, Any]) -> ScanFile:
+            df = d.get("delete_file")
+            return cls(
+                data_file=DataFile.from_wire(d["data_file"]),
+                delete_file=DeleteFile.from_wire(df) if df else None,
+            )
+
+        return _wire("ScanFile", d, build)
 
 
 @dataclass(frozen=True)
@@ -291,13 +356,17 @@ class ChangesPlan:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> ChangesPlan:
-        return cls(
-            table_uuid=d["table_uuid"],
-            from_snapshot=d["from_snapshot"],
-            to_snapshot=d["to_snapshot"],
-            files=tuple(DataFile.from_wire(f) for f in (d.get("files") or ())),
-            delete_files=tuple(
-                DeleteFile.from_wire(f) for f in (d.get("delete_files") or ())
+        return _wire(
+            "ChangesPlan",
+            d,
+            lambda d: cls(
+                table_uuid=d["table_uuid"],
+                from_snapshot=d["from_snapshot"],
+                to_snapshot=d["to_snapshot"],
+                files=tuple(DataFile.from_wire(f) for f in (d.get("files") or ())),
+                delete_files=tuple(
+                    DeleteFile.from_wire(f) for f in (d.get("delete_files") or ())
+                ),
             ),
         )
 
@@ -312,7 +381,7 @@ class ViewInfo:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> ViewInfo:
-        return cls(**_pick(cls, d))
+        return _wire("ViewInfo", d, lambda d: cls(**_pick(cls, d)))
 
 
 @dataclass(frozen=True)
@@ -322,4 +391,27 @@ class CommitResult:
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> CommitResult:
-        return cls(**_pick(cls, d))
+        return _wire("CommitResult", d, lambda d: cls(**_pick(cls, d)))
+
+
+@dataclass(frozen=True)
+class AppendedFile:
+    """One parquet file :meth:`pyhoglake.Table.append` wrote and registered.
+
+    ``partition_values`` is the transformed partition tuple shipped on
+    the wire for this file (by key_index of the table's live spec), or
+    None for an unpartitioned table.
+    """
+
+    path: str
+    record_count: int
+    partition_values: tuple[str | None, ...] | None = None
+
+
+@dataclass(frozen=True)
+class AppendResult(CommitResult):
+    """:class:`CommitResult` plus the files the CLIENT wrote for this
+    append (client-side knowledge, not parsed from the wire): one per
+    partition tuple for partitioned tables, exactly one otherwise."""
+
+    files: tuple[AppendedFile, ...] = ()

@@ -162,7 +162,9 @@ CREATE TABLE hog_table_stats (
     catalog_id      bigint NOT NULL,
     table_id        bigint NOT NULL,
     record_count    bigint NOT NULL DEFAULT 0,
-    file_size_bytes bigint NOT NULL DEFAULT 0,
+    -- CHECK backstops the commit tail's overflow-checked byte rollup: a
+    -- wrapped (negative) sum must fail loudly, never land as drift.
+    file_size_bytes bigint NOT NULL DEFAULT 0 CHECK (file_size_bytes >= 0),
     -- CHECK is the DB backstop against row-id allocator overflow: a
     -- wrapped (negative) allocator would silently break the lineage
     -- guarantee. CommitService rejects overflowing sums before this.
@@ -325,8 +327,10 @@ CREATE TABLE hog_sort_field (
 -- ---- Row-level deletes: deletion vectors ----
 -- One DV file per data file per range; a new DV supersedes the old
 -- (end_snapshot) and must cover it (delete_count monotonic — DVs only
--- grow). The server never opens DV files: registration is metadata-only
--- (footer-shipping philosophy), verification is a background job later.
+-- grow). Registration is metadata-only (footer-shipping philosophy);
+-- the ONE server-side reader of DV content is the compaction rewrite,
+-- which applies a group's live DVs (iceberg puffin `deletion-vector-v1`
+-- blobs) and end-snapshots them with their data files.
 CREATE TABLE hog_delete_file (
     catalog_id      bigint NOT NULL,
     delete_file_id  bigint NOT NULL,
@@ -384,7 +388,13 @@ CREATE TABLE hog_file_removal (
     catalog_id   bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
     path         text   NOT NULL,
     file_kind    text   NOT NULL CHECK (file_kind IN ('data', 'delete')),
-    reason       text   NOT NULL CHECK (reason IN ('snapshot_expiry', 'table_drop_gc')),
+    -- 'compaction_staging': a claim ticket the compactor inserts for its
+    -- OUTPUT path before uploading — if the group's commit never lands
+    -- (crash, plan-to-commit race), the normal cleanup drain reclaims the
+    -- orphaned object; a successful group commit settles the row as
+    -- 'registered' in the same transaction that makes the path live.
+    reason       text   NOT NULL CHECK (reason IN ('snapshot_expiry', 'table_drop_gc',
+                                                   'compaction_staging')),
     scheduled_at timestamptz NOT NULL DEFAULT now(),
     -- Drain bookkeeping: attempts counts every touch that did NOT drain
     -- the row (still-referenced skips, transient S3 failures).
@@ -392,9 +402,11 @@ CREATE TABLE hog_file_removal (
     last_attempt_at timestamptz,
     -- Soft-delete: non-null once the entry is settled. 'deleted' = the
     -- object was physically removed; 'absent' = it was verified already
-    -- gone. Outcome and timestamp travel together.
+    -- gone; 'registered' = a compaction_staging claim whose group commit
+    -- landed (the path became a live catalog file instead of garbage).
+    -- Outcome and timestamp travel together.
     drained_at      timestamptz,
-    drained_outcome text CHECK (drained_outcome IN ('deleted', 'absent')),
+    drained_outcome text CHECK (drained_outcome IN ('deleted', 'absent', 'registered')),
     CHECK ((drained_at IS NULL) = (drained_outcome IS NULL))
 );
 CREATE INDEX hog_file_removal_drain

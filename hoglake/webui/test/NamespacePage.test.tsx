@@ -123,6 +123,40 @@ describe("NamespacePage", () => {
     ).toBeEnabled();
   });
 
+  it("refuses reserved _hog column names but not _hog table names", async () => {
+    const fetchMock = mockFetch((url) =>
+      url === tablesUrl ? jsonResponse([]) : undefined,
+    );
+    renderApp("/catalogs/analytics/namespaces/events");
+    const user = userEvent.setup();
+
+    await screen.findByText("No tables in this namespace.");
+    // A _hog-prefixed TABLE name is fine — the reservation is columns-only.
+    await user.type(screen.getByLabelText("name"), "_hog_shadow");
+    expect(screen.queryByText(/table name:/)).not.toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("column 1 name"), "_hog_row_id");
+    expect(await screen.findByText(/column 1:.*reserved prefix/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create table" })).toBeDisabled();
+
+    // _hogx is refused too (prefix match, not just the exact carrier name).
+    await user.clear(screen.getByLabelText("column 1 name"));
+    await user.type(screen.getByLabelText("column 1 name"), "_hogx");
+    expect(await screen.findByText(/column 1:.*reserved prefix/)).toBeInTheDocument();
+
+    // No POST ever left the form.
+    const posts = fetchMock.mock.calls.filter(
+      (c) => (c[1] as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posts).toHaveLength(0);
+
+    // A plain leading underscore is still a valid column name.
+    await user.clear(screen.getByLabelText("column 1 name"));
+    await user.type(screen.getByLabelText("column 1 name"), "_leading");
+    expect(screen.queryByText(/column 1:/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create table" })).toBeEnabled();
+  });
+
   it("surfaces a 404 when the namespace does not exist", async () => {
     mockFetch((url) =>
       url === tablesUrl ? jsonResponse(notFoundError, 404) : undefined,

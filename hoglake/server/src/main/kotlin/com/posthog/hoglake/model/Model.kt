@@ -400,10 +400,27 @@ data class CompactionResult(
     val bytesOut: Long,
     /**
      * Groups planned but aborted at commit time because an input file
-     * was no longer live or had gained a DV since planning — resolved
-     * by re-planning on the next run, never by blocking foreground.
+     * was no longer live (or the compactor's staged output claim was
+     * reclaimed by a concurrent cleanup drain) — resolved by re-planning
+     * on the next run, never by blocking foreground.
      */
     val skippedConflicts: Long,
+    /**
+     * Groups aborted at commit time because an input's deletion-vector
+     * state changed since planning (a DV appeared, or the planned DV was
+     * superseded by a grown one). The rewrite applied the PLANNED
+     * vectors, so committing would resurrect rows deleted after the
+     * plan's read — the group skips and re-plans instead. Never a lost
+     * delete.
+     */
+    val dvSuperseded: Long = 0,
+    /**
+     * Groups skipped because some live column's type cannot be produced
+     * from an input file's parquet type (anything outside identity or
+     * the int->long / float->double promotions). Deterministic until the
+     * schema or the file set changes; skip-with-reason, not a failure.
+     */
+    val unconvertibleSchema: Long = 0,
 )
 
 /**
@@ -425,6 +442,15 @@ data class VerifyReport(
     /** "pass" iff every check passed. */
     val status: String,
     val checks: List<VerifyCheck>,
+)
+
+/**
+ * One rehydrate request's outcome (POST /maintenance/rehydrate):
+ * how many 'failed' files were flipped back to 'pending' for the
+ * hydrator to retry.
+ */
+data class RehydrateResult(
+    val requeued: Long,
 )
 
 /** One cleanup drain's outcome. */

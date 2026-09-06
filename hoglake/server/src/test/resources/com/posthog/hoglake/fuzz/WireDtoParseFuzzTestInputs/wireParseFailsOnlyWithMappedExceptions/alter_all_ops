@@ -1,0 +1,10 @@
+{"ops":[
+                       {"op":"add_column","column":{"name":"c1","type":"long"}},
+                       {"op":"drop_column","name":"c2"},
+                       {"op":"rename_column","from":"a","to":"b"},
+                       {"op":"promote_column","name":"c3","to":"double"},
+                       {"op":"rename_table","new_name":"t2"},
+                       {"op":"set_partition_spec","fields":[
+                          {"source_field_id":1,"transform":"day"}]},
+                       {"op":"set_sort_order","sort_fields":[
+                          {"source_field_id":1,"direction":"asc","null_order":"nulls_last"}]}]}

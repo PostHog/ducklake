@@ -1,0 +1,3 @@
+{"deletes":[{"namespace":"ns","table":"t","files":[
+                       {"data_file_id":5,"path":"s3://b/dv.puffin","delete_count":3,
+                        "file_size_bytes":99}]}]}

@@ -10,11 +10,15 @@ directory and does not touch the fork's `src/`.
 
 ```bash
 cd server && flox activate -- ./gradlew :test         # server suite via the wrapper (Docker required)
-cd server && flox activate -- ./gradlew :ktlintCheck  # ktlint check (server Kotlin style gate)
+just lint-all        # ktlint + ruff (check & format) across both Python trees
 just pyhoglake test  # pyhoglake suite
 just webui test      # vitest (no server needed)
 just hedgerow test   # unit; integration needs a live server
 ```
+
+`ruff` is **pinned** in both Python trees' dev groups and run through
+`uv run` — never `uvx ruff`, which resolves a different rule set per
+machine and silently ignores the projects' `per-file-ignores`.
 
 The server builds through the **checked-in Gradle wrapper**
 (`server/gradlew`, pinned in
@@ -52,7 +56,7 @@ React console, Python replication daemon:
 |---|---|---|---|
 | `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, verify, metrics, audit | Kotlin 2.2 / JDK 21 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit5 + Testcontainers (PG16, MinIO) + kotest-property |
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
-| `webui/` | Lakekeeper-style management console | Vite / React / TS | vitest (mocked fetch) |
+| `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
 
 The REST contract is `server/src/main/resources/openapi/hoglake.yaml`
@@ -88,7 +92,12 @@ spec and the implementations together.
    deleted. Draining soft-deletes: settled `hog_file_removal` rows keep
    `drained_at`/`drained_outcome` (the queryable forensics ledger,
    purged past `HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS`, default 30d);
-   undrained rows accumulate `attempts`/`last_attempt_at`.
+   undrained rows accumulate `attempts`/`last_attempt_at`. The ledger
+   is also commit-integrated both ways: commits 409 any registered path
+   with an undrained row (path-reuse guard), drain sub-batches run
+   under the per-catalog commit lock, and compaction pre-registers its
+   output path as a `compaction_staging` claim settled
+   `'registered'` on group commit.
 5. **Expiry never passes head or (when `consumer_floor`) the min
    consumer offset**, and names the pinning consumer. Ranges below
    `earliest_snapshot_id` are 410 Gone — consumers reconcile, never
@@ -151,27 +160,48 @@ spec and the implementations together.
 
 ## Known deferrals / open items
 
-- **Compaction (M4) — LANDED**: `server/compaction/` — planning is
-  metadata-only (live, DV-free, same spec + partition values, under
+- **Compaction (M4) — 100% implemented**: `server/compaction/` —
+  planning is metadata-only (live, same spec + partition values, under
   target bytes; adjacency NOT required), rewrite via **parquet-java**
   (the project's one parquet library — decision 2026-09-05: Hardwood is
   out entirely; parquet-java handles footer reads in the hydrator AND
   the compaction writer), commit under the catalog lock with input
-  re-verification. Deferred: DV-bearing files are never compacted
-  (rewriting deleted rows away would change row-id semantics),
-  heterogeneous-schema groups stay uncompacted, background loop
-  defaults OFF (`HOGLAKE_COMPACTION_INTERVAL_MS=0`), aborted-group
-  uploads orphan in the bucket (lifecycle rules are the backstop).
+  re-verification. **DV-bearing files compact — LANDED**: the rewrite
+  APPLIES each input's live DV (puffin `deletion-vector-v1`, read via
+  `PuffinDeletionVector`) — survivors keep their ids in `_hog_row_id`,
+  deleted ids are gone forever, the DV rows end-snapshot with their
+  files, and the commit re-verifies the exact planned DV identity (a
+  vector that grew/appeared since planning skips the group:
+  `dv_superseded` — a post-plan delete is never dropped).
+  **Heterogeneous-schema groups — LANDED**: inputs map to the LIVE
+  schema by field id (missing columns null-fill, int→long/float→double
+  up-cast, dropped field ids drop their data); only a live column
+  unproducible from an input's physical type skips the group
+  (`unconvertible_schema`). **Aborted-upload orphans — LANDED**: the
+  output path pre-registers as an undrained `hog_file_removal` row
+  (reason `compaction_staging`) before upload; a successful group
+  commit settles it (`drained_outcome='registered'`) in the same
+  transaction, an aborted group leaves it for the normal cleanup drain
+  to reclaim, and the commit re-claims the ticket first so a drain that
+  won the race just aborts the group. Still deliberate: the background
+  loop defaults OFF (`HOGLAKE_COMPACTION_INTERVAL_MS=0`) — flipping it
+  on is an ops decision, not a code gap. Remaining rewrite deferrals
+  (all surface as `unconvertible_schema` skips, never wrong bytes):
+  nested schemas, INT96, decimal-scale changes, non-micros time(stamp)
+  units.
 - **Field ids are a contract**: the hydrator's footer read flags files
   whose parquet schema has any leaf without `PARQUET:field_id`
   (`hog_data_file.missing_field_ids`; gauge
   `hoglake_missing_field_id_files{catalog}`; the reserved `_hog_row_id`
-  id 2147483646 is fine). While a flagged file is LIVE, `rename_column`
-  is refused with 409 `idless_files_present` (id-less files bind
-  columns by name; renaming would silently NULL their history in
-  readers). `rename_table` is unaffected. Files registered with inline
-  stats never pass through the hydrator, so only deferred-stats files
-  get checked — a known gap until a verify endpoint exists.
+  id 2147483646 is fine). While a flagged file — or a still-`pending`
+  file, whose id state is unknown until the footer is read — is LIVE,
+  `rename_column` is refused with 409 `idless_files_present` (id-less
+  files bind columns by name; renaming would silently NULL their
+  history in readers). `rename_table` is unaffected. Files registered
+  with inline stats never pass through the hydrator, so only
+  deferred-stats files get checked — still a known gap: the verify
+  endpoint is metadata-only by design and can't do the S3 footer reads
+  this check needs.
 - **Maintenance verify — LANDED**: `POST
   /v1/catalogs/{c}/maintenance/verify` (gaps.md B3, absorbing B4) — the
   QE suite's global-invariant SQL as a metadata-only, read-only
@@ -190,18 +220,43 @@ spec and the implementations together.
   conforms (typed bounds, Iceberg transforms, DV-only deletes).
 - **Auth**: out of scope for v1; audit actor is `anonymous` until it
   lands. Decision space in README §AuthN/Z.
-- pyhoglake wants: `expected_table_uuid` guard on append (closes a
-  name-rebind race hedgerow flagged), single-table offset GET,
-  partition-value transforms (partitioned appends currently raise).
+- pyhoglake implements `truncate[W]` partition transforms; the server's
+  Transform vocabulary doesn't include truncate yet (client-ready,
+  server gap).
 - No catalog delete API (QE/integration runs leave disposable
   `qe-*`/`pyhog-*`/`hedgerow-*` catalogs behind on dev stacks).
+- `bench/` is outside `just lint-all`: it passes `ruff check` but 12
+  files fail `ruff format --check`. Format it and wire it in (pin ruff
+  in its dev group, add the `lint` recipe) as its own change, so the
+  reformat lands as a reviewable diff rather than noise inside another.
 
 ## Doc index
 
-[README.md](README.md) (design + decisions) ·
+**Design and decisions** — [README.md](README.md) (the design doc) ·
+[metadata-schema.md](metadata-schema.md) (the schema, table by table) ·
+[iceberg-federation.md](iceberg-federation.md) /
+[trino-integration.md](trino-integration.md) (engine surfaces) ·
+[split-validation-commit.md](split-validation-commit.md) (the commit
+tail's escape hatch — designed, not scheduled) ·
+[duckdb-read-extension.md](duckdb-read-extension.md) (DuckDB back as a
+client, sketch).
+
+**Assessments** — [operational-notes.md](operational-notes.md) (what
+changes, and what honestly doesn't, at 2PB/1T) ·
+[sql-suggestions.md](sql-suggestions.md) (schema review) ·
+[suggestions.md](suggestions.md) (language/stack retrospective) ·
+[paimon-compare.md](paimon-compare.md) (the closest comparable).
+
+**Predecessor and process** —
 [ducklake-defect-ledger.md](ducklake-defect-ledger.md) (the bugs this
-architecture answers) · [metadata-schema.md](metadata-schema.md) ·
-[ducklake-api-map.md](ducklake-api-map.md) /
+architecture answers) · [ducklake-api-map.md](ducklake-api-map.md) /
 [pyducklake-api-map.md](pyducklake-api-map.md) (predecessor surfaces) ·
-[fuzzing.md](fuzzing.md) · [source-inventory.md](source-inventory.md) ·
-per-component READMEs.
+[fuzzing.md](fuzzing.md) · [source-inventory.md](source-inventory.md).
+
+**Per-component** — [server](server/README.md) ·
+[trino connector](server/trino/README.md) ·
+[pyhoglake](pyhoglake/README.md) · [webui](webui/README.md) ·
+[hedgerow](hedgerow/README.md) · [bench](bench/README.md).
+
+Bug-hunt writeups and in-flight worklists stay local-only (they are
+snapshots of a moving tree, not documentation).

@@ -213,6 +213,35 @@ def test_create_table_body_shape(client, httpx_mock):
     assert t.columns[0].field_id == 1
 
 
+def test_create_table_reserved_hog_column_fast_fails(client, httpx_mock):
+    """`_hog*` column names are server-reserved (_hog_row_id is
+    compaction's row-id carrier; 422 at create). The client fast-fails
+    them BEFORE the POST leaves the building."""
+    cat = _catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("_hog_row_id", pa.int64()),
+        ]
+    )
+    with pytest.raises(ValidationError, match=r"_hog.*reserved|reserved.*_hog"):
+        Namespace(cat, "ns1").create_table("events", schema)
+    # Only the fixture's catalog GET happened — no create POST.
+    assert [r.method for r in httpx_mock.get_requests()] == ["GET"]
+
+    # Prefix match, not just the exact carrier name; plain leading
+    # underscores stay valid (checked via the same helper).
+    with pytest.raises(ValidationError, match="reserved"):
+        Namespace(cat, "ns1").create_table(
+            "events", pa.schema([pa.field("_hogx", pa.string())])
+        )
+    from pyhoglake.client import _check_reserved_columns
+
+    _check_reserved_columns(pa.schema([pa.field("_leading", pa.string())]))
+
+
 def test_get_table_time_travel_params(client, httpx_mock):
     t = _table(client, httpx_mock)
     httpx_mock.add_response(
@@ -605,6 +634,46 @@ def test_single_offset_get(client, httpx_mock):
     assert off.table_uuid == uuid
 
 
+def test_offset_routes_percent_encode_table_uuid(client, httpx_mock):
+    # bugs.md #23 regression: table_uuid was the ONE path segment not
+    # routed through _seg. A hostile/corrupt uuid-shaped value must stay
+    # inside its segment (the server will 4xx it, but the URL itself has
+    # to be well-formed) — assert the exact encoded request target.
+    cat = _catalog(client, httpx_mock)
+    evil = "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012?x=1"
+    encoded = "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012%3Fx%3D1"
+
+    httpx_mock.add_response(
+        method="PUT",
+        url=f"{BASE}/v1/catalogs/cat/consumers/cdc-1/offsets/{encoded}",
+        json={
+            "consumer_id": "cdc-1",
+            "table_uuid": evil,
+            "committed_snapshot": 7,
+            "updated_at": "2026-09-04T12:00:00Z",
+        },
+    )
+    cat.commit_offset("cdc-1", evil, 7)
+    req = httpx_mock.get_requests()[-1]
+    assert dict(req.url.params) == {}  # nothing leaked into the query
+    assert req.url.raw_path == (
+        f"/v1/catalogs/cat/consumers/cdc-1/offsets/{encoded}".encode()
+    )
+
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/consumers/cdc-1/offsets/{encoded}",
+        json={"error": "no such table"},
+        status_code=404,
+    )
+    assert cat.offset("cdc-1", evil) is None
+    req = httpx_mock.get_requests()[-1]
+    assert dict(req.url.params) == {}
+    assert req.url.raw_path == (
+        f"/v1/catalogs/cat/consumers/cdc-1/offsets/{encoded}".encode()
+    )
+
+
 def test_single_offset_get_absent_returns_none(client, httpx_mock):
     # absence is a routine consumer state: None, not NotFoundError (a
     # deliberate divergence from the raise-on-404 idiom)
@@ -674,3 +743,26 @@ def test_non_json_error_body(client, httpx_mock):
     with pytest.raises(HoglakeError) as ei:
         client.catalog("cat")
     assert ei.value.status_code == 502
+
+
+def test_3xx_is_a_typed_error_never_success(client, httpx_mock):
+    # bugs.md #19 regression: redirects are not followed (httpx default)
+    # and a 3xx used to fall into the success branch, leaking a raw
+    # JSONDecodeError from resp.json() outside the error taxonomy. It
+    # must surface as a typed HoglakeError naming the unexpected status.
+    from pyhoglake import HoglakeError
+
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat",
+        status_code=302,
+        headers={"Location": "http://elsewhere.test/v1/catalogs/cat"},
+        content=b"",
+    )
+    with pytest.raises(HoglakeError) as ei:
+        client.catalog("cat")
+    assert type(ei.value) is HoglakeError  # base type: not a 4xx mapping
+    assert ei.value.status_code == 302
+    assert "302" in str(ei.value)
+    assert "redirect" in ei.value.message
+    assert "elsewhere.test" in (ei.value.detail or "")

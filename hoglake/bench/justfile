@@ -40,6 +40,11 @@ ddl-churn *args:
 end-to-end-writer *args:
     {{_uv}} run hoglake-bench end-to-end-writer {{args}}
 
+# Populate a catalog with a realistic fake warehouse, sized in GB, e.g.
+#   just bench seed --gb 2.5 --catalog seed-warehouse
+seed *args:
+    {{_uv}} run hoglake-bench seed {{args}}
+
 # Entire suite; the integration smoke hits HOGLAKE_URL and skips when down
 test:
     {{_uv}} run pytest

@@ -3,6 +3,10 @@
 Survey of the catalog schema as defined in the fork source, for the
 hoglake design. Companion to [ducklake-api-map.md](ducklake-api-map.md),
 [pyducklake-api-map.md](pyducklake-api-map.md), [README.md](README.md).
+Sections 1–5 describe the *predecessor* (`ducklake_*`) schema; §6 is
+the inventory of the hoglake schema as built (`hog_*`), kept in sync
+with [`server/schema.sql`](server/schema.sql) — which, not this doc, is
+the authoritative artifact.
 
 Source of truth: [`src/storage/ducklake_metadata_manager.cpp`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp)
 (`GetCreateTableStatements`, lines 237–310) plus the v1.1 overlay in
@@ -288,3 +292,43 @@ drains the deletion queue (`:5017`, `:5158`).
   inlining is dropped from hoglake entirely; migration flushes any
   residual inlined rows to parquet at cutover (see [README.md](README.md)
   Decisions).
+
+---
+
+## 6. The hoglake schema as built (`hog_*`)
+
+The rebuild the notes above argue for exists. Canonical DDL:
+[`server/schema.sql`](server/schema.sql) (complete desired state; a CI
+gate asserts fold(migrations) == that file, and a mapper-coverage gate
+keeps the Kotlin row mappers in lockstep with the live column set).
+Inventory as of 2026-09-06 — every versioned table carries the
+`[begin_snapshot, end_snapshot)` pattern with a
+`CHECK (end_snapshot > begin_snapshot)`, and every child rides an FK
+with `ON DELETE CASCADE`:
+
+| Table | Columns | Integrity highlights | Role |
+|---|---|---|---|
+| `hog_catalog` | `catalog_id` (identity PK), `name`, `data_path`, allocators (`last_snapshot_id`, `next_table_id`, `next_file_id`, `next_namespace_id`, `next_view_id`, `schema_version`), `snapshot_retention_seconds`, `consumer_floor`, `earliest_snapshot_id`, `earliest_snapshot_time`, `created_at` | `name` UNIQUE + CHECK (lower-case, ≤63); retention CHECK (> 0 or NULL) | Catalog root + id allocators (advanced only inside the commit tail). `earliest_snapshot_time` = when the expiry floor was reached — survives the deleted snapshot rows, cited in 410s |
+| `hog_snapshot` | `catalog_id`, `snapshot_id`, `snapshot_time`, `schema_version`, `author`, `commit_message` | PK (catalog_id, snapshot_id); FK→catalog CASCADE | The commit log; ids dense per catalog; `snapshot_time` stamped `clock_timestamp()` inside the serialized tail |
+| `hog_snapshot_change` | `catalog_id`, `snapshot_id`, `kind`, `object_id` | `kind` CHECK (closed 10-kind vocabulary); `object_id` NOT NULL (a NULL would be an invisible OCC bypass); conflict index (catalog_id, object_id, kind, snapshot_id) | Typed OCC vocabulary — conflict detection is one indexed anti-join |
+| `hog_namespace` | `catalog_id`, `namespace_id`, `name`, `dropped`, `created_at` | PK; identifier CHECK on `name`; live-name partial unique | Namespaces (not snapshot-versioned in v1: rename disallowed, drop requires emptiness) |
+| `hog_table` | `catalog_id`, `table_id`, `table_uuid`, `created_snapshot`, `dropped_snapshot`, `next_field_id` | PK (catalog_id, table_id); UNIQUE (catalog_id, table_uuid) | Immutable identity; `table_uuid` survives rename, changes on drop+recreate — the consumer-cursor contract |
+| `hog_table_version` | `catalog_id`, `table_id`, `begin_snapshot`, `end_snapshot`, `namespace_id`, `name` | PK (…, begin_snapshot); FKs CASCADE; identifier CHECK; live-name partial unique per namespace | Versioned mutable bits (name, namespace) |
+| `hog_column` | `catalog_id`, `table_id`, `field_id`, `begin_snapshot`, `end_snapshot`, `name`, `col_type`, `type_params` (jsonb), `nullable`, `ordinal` | `col_type` CHECK (closed 13-type set, every member Iceberg-mappable); identifier CHECK; `ordinal >= 0` CHECK + live-ordinal partial unique (duplicate live ordinal = parquet-writer corruption vector, refused by the DB) | Versioned columns; `field_id` is the stable parquet binding (`PARQUET:field_id`) |
+| `hog_table_stats` | `catalog_id`, `table_id`, `record_count`, `file_size_bytes`, `next_row_id` | CHECKs `>= 0` on both counters (DB backstop against overflow-wrapped rollups/allocators; the commit tail rejects overflow first via `addExact`) | Head-scoped rollup + the row-id allocator |
+| `hog_data_file` | `catalog_id`, `data_file_id`, `table_id`, `begin/end_snapshot`, `path`, `file_format`, `record_count`, `file_size_bytes`, `footer_size`, `row_id_start`, `stats_state`, `spec_id`, `explicit_row_ids`, `missing_field_ids` | PK; `stats_state` CHECK (`provided\|pending\|failed`); count/size CHECKs; live + pending partial indexes | The manifest. `row_id_start` NOT NULL (lineage guarantee); `explicit_row_ids` marks compaction outputs carrying `_hog_row_id`; `missing_field_ids` flags id-less files (rename guard) |
+| `hog_file_column_stats` | `catalog_id`, `data_file_id`, `field_id`, `value_count`, `null_count`, `nan_count`, `size_bytes`, `lower_bound`, `upper_bound` | PK; count CHECKs; FK→data_file CASCADE | Zone maps; bounds in Iceberg single-value binary (bytea, typed — never text) |
+| `hog_consumer_offset` | `catalog_id`, `consumer_id`, `table_uuid`, `committed_snapshot`, `updated_at` | PK (catalog, consumer, table_uuid); consumer_id length CHECK; retention-floor index | Log primitives: offsets keyed by `table_uuid`, respected by expiry's consumer floor; rows outlive table drops by design |
+| `hog_partition_spec` / `hog_partition_field` | spec header (`spec_id`, begin/end) + ordered fields (`key_index`, `source_field_id`, `transform`, `transform_param`) | `transform` CHECK (`identity\|bucket\|year\|month\|day\|hour`); bucket-param pairing CHECK; FKs CASCADE | Versioned partition specs; files remember their spec vintage |
+| `hog_file_partition_value` | `catalog_id`, `data_file_id`, `key_index`, `value` | PK; FK→data_file CASCADE (the 50M-orphan class from §Notes, made impossible) | Transformed per-file partition values (NULL = null value) |
+| `hog_sort_spec` / `hog_sort_field` | header (`sort_id`, begin/end) + ordered fields (`source_field_id`, `direction`, `null_order`) | direction/null_order CHECKs; FKs CASCADE | Versioned sort orders — advisory for writers, binding for compaction rewrites |
+| `hog_delete_file` | `catalog_id`, `delete_file_id`, `table_id`, `data_file_id`, `begin/end_snapshot`, `path`, `file_format`, `delete_count`, `file_size_bytes` | one-live-DV-per-data-file partial unique; `delete_count > 0` CHECK; FKs CASCADE | Deletion vectors (puffin `deletion-vector-v1`); supersession end-snapshots, growth-monotone |
+| `hog_view` | `catalog_id`, `view_id`, `view_uuid`, `namespace_id`, `name`, `dialect`, `sql`, `begin/end_snapshot` | PK; identifier CHECK; live-name partial unique | Versioned views, SQL stored verbatim |
+| `hog_file_removal` | `removal_id` (identity PK), `catalog_id`, `path`, `file_kind`, `reason`, `scheduled_at`, `attempts`, `last_attempt_at`, `drained_at`, `drained_outcome` | `reason` CHECK (`snapshot_expiry\|table_drop_gc\|compaction_staging`); `drained_outcome` CHECK (`deleted\|absent\|registered`) paired-null with `drained_at`; undrained partial drain index | Physical-deletion queue AND forensics ledger: drains soft-delete (outcome + timestamp survive), skips/transients bump `attempts`; `compaction_staging` rows are the compactor's output-path claim tickets, settled `'registered'` on group commit |
+
+What the predecessor survey flagged, answered: every hot lookup is a
+partial index on `end_snapshot IS NULL`; every orphan class from §3's
+hand-rolled cascades is an FK CASCADE; the stats tables are IN the
+cascade; identifiers are CHECK-constrained at the DB; and there are no
+dynamic tables of any kind — inlining is gone, so the schema is closed
+and enumerable, exactly what this table proves.

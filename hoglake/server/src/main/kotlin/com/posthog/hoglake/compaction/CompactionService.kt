@@ -3,6 +3,7 @@ package com.posthog.hoglake.compaction
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CompactionResult
 import com.posthog.hoglake.model.HoglakeException
@@ -39,6 +40,13 @@ data class CompactionConfig(
     val maxGroupsPerRun: Int,
 )
 
+/** A candidate's live deletion vector, captured at planning time. */
+data class LiveDv(
+    val deleteFileId: Long,
+    val path: String,
+    val deleteCount: Long,
+)
+
 /** One live small file eligible for merging. */
 data class CompactionCandidate(
     val dataFileId: Long,
@@ -47,6 +55,8 @@ data class CompactionCandidate(
     val fileSizeBytes: Long,
     val rowIdStart: Long,
     val statsProvided: Boolean,
+    /** The file's live DV as planned; the rewrite APPLIES it. Null = none. */
+    val dv: LiveDv? = null,
 )
 
 /** A greedy run of candidates sharing (spec_id, partition_values). */
@@ -56,7 +66,12 @@ data class CompactionGroup(
     val partitionValues: List<String?>?,
 ) {
     val totalBytes: Long get() = files.sumOf { it.fileSizeBytes }
+
+    /** Gross input rows, before DV application. */
     val totalRecords: Long get() = files.sumOf { it.recordCount }
+
+    /** Rows the output will hold: gross minus the planned DVs' deletes. */
+    val survivingRecords: Long get() = files.sumOf { it.recordCount - (it.dv?.deleteCount ?: 0) }
 }
 
 /** The metadata-only plan for one table. */
@@ -73,51 +88,72 @@ data class CompactionPlan(
  * commit-storm history is the design constraint here).
  *
  * PLANNING is metadata-only, per table: candidates are LIVE data files
- * under the target size with NO live deletion vector (v1 never rewrites
- * DV-bearing files — rewriting deleted rows away would change row-id
- * semantics; DV-aware compaction is future work), bucketed by
- * (spec_id, identical partition_values), ordered by row_id_start, then
- * grouped greedily into runs whose summed bytes stay <= target and
- * whose file count reaches min_input_files. UNLIKE the predecessor's
+ * under the target size — DV-bearing ones included, each carrying its
+ * live DV's identity ([LiveDv]) so execution can apply it and commit
+ * can detect supersession — bucketed by (spec_id, identical
+ * partition_values), ordered by row_id_start, then grouped greedily
+ * into runs whose summed bytes stay <= target and whose file count
+ * reaches min_input_files. UNLIKE the predecessor's
  * merge_adjacent_files, row-id ADJACENCY IS NOT REQUIRED — which is
  * exactly why outputs must materialize ids explicitly (ParquetRewriter).
  *
  * EXECUTION happens entirely OUTSIDE any catalog transaction: inputs
- * are fetched from the object store, merged/sorted/rewritten locally,
- * and the output uploaded — only then does the group COMMIT open a
- * transaction. The commit is small metadata under the per-catalog
- * commit lock, following CommitService's tail shape (allocate under
- * lock via UPDATE..RETURNING, snapshot + typed change row, no
- * schema_version bump): foreground writers wait milliseconds, never on
- * S3 IO. Rate-awareness is by construction: max_groups_per_run
+ * (and their DV puffin files) are fetched from the object store,
+ * DV-applied/merged/re-shaped under the live schema/sorted locally, and
+ * the output uploaded — only then does the group COMMIT open a
+ * transaction. Applying a DV drops the deleted rows FOREVER (they were
+ * deleted; every survivor keeps its original row id in `_hog_row_id`),
+ * and the input's DV rows are end-snapshotted with the inputs — the DV
+ * dies with its file. Changefeed semantics are untouched: compaction
+ * outputs never appear in the feed. The commit is small metadata under
+ * the per-catalog commit lock, following CommitService's tail shape
+ * (allocate under lock via UPDATE..RETURNING, snapshot + typed change
+ * row, no schema_version bump): foreground writers wait milliseconds,
+ * never on S3 IO. Rate-awareness is by construction: max_groups_per_run
  * (default 1) per catalog per sweep — tiny bites, never the 60-180s
  * commit convoys of the 2026-09-04 incident.
  *
  * Plan-to-commit races: appenders never conflict with compaction (its
  * change kind, 'table_compacted', is invisible to the append conflict
- * check), but a DV registered against an input after planning would be
- * silently orphaned by the rewrite. The unique live-DV index cannot
- * catch that (the inputs are being end-snapshotted, not DV'd), so the
- * commit transaction RE-VERIFIES every input is still live and still
- * DV-free; any miss aborts just that group (skipped, logged, counted in
- * skipped_conflicts) and the next run re-plans. The uploaded output of
- * an aborted group is an orphaned object (never referenced by the
- * catalog, so cleanup's liveness check would pass it; v1 leaves it and
- * logs — bucket lifecycle rules are the backstop).
+ * check), but the DELETE state of an input can move under the plan: a
+ * DV registered against a DV-free input, or a planned DV superseded by
+ * a grown one, means the rewrite (which applied the PLANNED vectors)
+ * would resurrect rows deleted after the plan's read. The commit
+ * transaction therefore RE-VERIFIES, under the lock, that every input
+ * is still live AND still carries exactly its planned DV (by
+ * delete_file_id — supersession always mints a new row); any miss
+ * aborts just that group (skipped, logged, counted as
+ * skipped_conflicts or dv_superseded) and the next run re-plans. A
+ * delete that happened after planning is NEVER dropped.
+ *
+ * Aborted-upload orphans: before uploading, the output path is
+ * PRE-REGISTERED as an undrained hog_file_removal row (reason
+ * 'compaction_staging') — a claim ticket. If the group commits, the
+ * same transaction settles the ticket (drained_outcome 'registered')
+ * before end of transaction, so cleanup's guard and the commit path
+ * guard both see a settled row for a live path. If the group aborts —
+ * skip, crash, failed upload — the ticket stays undrained and the
+ * NORMAL cleanup drain reclaims the object (its liveness check passes:
+ * the path was never registered). Because cleanup may legally drain the
+ * ticket while the group is still in flight (it holds no lock between
+ * upload and commit), the commit transaction first re-claims the ticket
+ * (still undrained?) and aborts the group if cleanup got there first —
+ * the object is already gone; re-plan next sweep.
  *
  * Inputs are END-SNAPSHOTTED, never deleted: they remain visible to
  * time travel below the compaction snapshot, and expiry queues their
- * paths for physical removal once end_snapshot falls under the
- * retention floor — exactly the superseded-DV lifecycle. Nothing is
- * queued here.
+ * paths (and their dead DVs' paths) for physical removal once
+ * end_snapshot falls under the retention floor — exactly the
+ * superseded-DV lifecycle. Nothing else enters hog_file_removal here.
  *
  * Stats for the output are aggregated server-side from the inputs'
  * hog_file_column_stats: counts sum; bounds are recomputed from the
  * TYPED decoded bounds (IcebergSingleValue.decode + compareValues +
  * re-encode) — a raw binary min/max of the encodings would be wrong for
- * signed little-endian types. If any input lacks provided stats the
- * output registers as 'pending' and the hydrator fills it from the
- * footer.
+ * signed little-endian types. If any input lacks provided stats — or
+ * any input has a DV, which makes the inputs' counts wrong for the
+ * survivor set — the output registers as 'pending' and the hydrator
+ * fills it from the footer.
  */
 class CompactionService(
     private val jdbi: Jdbi,
@@ -133,15 +169,27 @@ class CompactionService(
         val namespace: String,
         val table: String,
         val tableId: Long,
-        /** Live column types by field id (stats aggregation). */
-        val columnTypes: Map<Long, ColType>,
-        /** Live column field ids by name (rewriter id fallback). */
-        val fieldIdsByName: Map<String, Long>,
+        /** Live columns at the planning head — BINDING for the rewrite shape. */
+        val columns: List<Column>,
         /** Live sort order — BINDING for the rewrite. Empty = row-id order. */
         val sortFields: List<SortFieldDef>,
-    )
+    ) {
+        /** Live column types by field id (stats aggregation). */
+        val columnTypes: Map<Long, ColType> get() = columns.associate { it.fieldId to it.def.type }
+    }
 
     private data class PlanWithContext(val ctx: TableContext, val plan: CompactionPlan)
+
+    /** How one group's execution+commit resolved (the sweep's accounting unit). */
+    internal sealed class GroupOutcome {
+        data class Committed(val snapshotId: Long, val bytesOut: Long) : GroupOutcome()
+
+        /** An input vanished/died, or cleanup reclaimed the staged output. */
+        object SkippedConflict : GroupOutcome()
+
+        /** An input's DV state moved since planning (grew/appeared/superseded). */
+        object SkippedDvSuperseded : GroupOutcome()
+    }
 
     // ---- planning --------------------------------------------------------
 
@@ -169,7 +217,6 @@ class CompactionService(
         val t =
             TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
                 ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
-        val columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
         val ctx =
             TableContext(
                 catalogId = cat.catalogId,
@@ -177,8 +224,7 @@ class CompactionService(
                 namespace = ns.name,
                 table = t.name,
                 tableId = t.tableId,
-                columnTypes = columns.associate { it.fieldId to it.def.type },
-                fieldIdsByName = columns.associate { it.def.name to it.fieldId },
+                columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, cat.headSnapshotId),
                 sortFields =
                     SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
                         ?.fields ?: emptyList(),
@@ -200,19 +246,19 @@ class CompactionService(
                 """
             SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes,
                    f.row_id_start, f.spec_id, f.stats_state,
+                   dv.delete_file_id AS dv_id, dv.path AS dv_path, dv.delete_count AS dv_count,
                    (SELECT array_agg(pv.value ORDER BY pv.key_index)
                     FROM hog_file_partition_value pv
                     WHERE pv.catalog_id = f.catalog_id
                       AND pv.data_file_id = f.data_file_id) AS partition_values
             FROM hog_data_file f
+            LEFT JOIN hog_delete_file dv
+              ON dv.catalog_id = f.catalog_id
+             AND dv.data_file_id = f.data_file_id
+             AND dv.end_snapshot IS NULL
             WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
               AND f.end_snapshot IS NULL
               AND f.file_size_bytes < :targetBytes
-              AND NOT EXISTS (
-                    SELECT 1 FROM hog_delete_file dv
-                    WHERE dv.catalog_id = f.catalog_id
-                      AND dv.data_file_id = f.data_file_id
-                      AND dv.end_snapshot IS NULL)
             ORDER BY f.row_id_start, f.data_file_id
             """,
             )
@@ -228,6 +274,14 @@ class CompactionService(
                             fileSizeBytes = rs.getLong("file_size_bytes"),
                             rowIdStart = rs.getLong("row_id_start"),
                             statsProvided = rs.getString("stats_state") == "provided",
+                            dv =
+                                rs.getObject("dv_id")?.let {
+                                    LiveDv(
+                                        deleteFileId = (it as Number).toLong(),
+                                        path = rs.getString("dv_path"),
+                                        deleteCount = rs.getLong("dv_count"),
+                                    )
+                                },
                         ),
                         Bucket(
                             specId = rs.getObject("spec_id")?.let { (it as Number).toLong() },
@@ -271,8 +325,10 @@ class CompactionService(
 
     /**
      * One compaction sweep over [catalog]: plan tables in name order and
-     * rewrite at most cfg.maxGroupsPerRun groups. Metrics and the audit
-     * event are emitted here, after all group transactions resolved.
+     * rewrite at most cfg.maxGroupsPerRun groups (every skip flavor
+     * consumes budget too — a skipped group already spent the IO).
+     * Metrics and the audit event are emitted here, after all group
+     * transactions resolved.
      */
     fun runOnce(
         catalog: String,
@@ -284,7 +340,8 @@ class CompactionService(
             null,
             detail = { r ->
                 "groups_compacted=${r.groupsCompacted} files_in=${r.filesIn} files_out=${r.filesOut} " +
-                    "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts}"
+                    "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
+                    "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -308,25 +365,39 @@ class CompactionService(
         var bytesIn = 0L
         var bytesOut = 0L
         var skipped = 0L
+        var dvSuperseded = 0L
+        var unconvertible = 0L
+
+        fun budgetSpent() = groupsCompacted + skipped + dvSuperseded + unconvertible >= cfg.maxGroupsPerRun
         outer@ for ((namespace, table) in tables) {
-            if (groupsCompacted + skipped >= cfg.maxGroupsPerRun) break
+            if (budgetSpent()) break
             val (ctx, plan) =
                 jdbi.withHandleUnchecked { h -> planWithContext(h, catalog, namespace, table, cfg) }
             for (group in plan.groups) {
-                if (groupsCompacted + skipped >= cfg.maxGroupsPerRun) break@outer
+                if (budgetSpent()) break@outer
                 try {
-                    val committed = compactGroup(ctx, group)
-                    if (committed == null) {
-                        skipped++
-                    } else {
-                        groupsCompacted++
-                        filesIn += group.files.size
-                        bytesIn += group.totalBytes
-                        bytesOut += committed
+                    when (val outcome = compactGroup(ctx, group)) {
+                        is GroupOutcome.Committed -> {
+                            groupsCompacted++
+                            filesIn += group.files.size
+                            bytesIn += group.totalBytes
+                            bytesOut += outcome.bytesOut
+                        }
+                        GroupOutcome.SkippedConflict -> skipped++
+                        GroupOutcome.SkippedDvSuperseded -> dvSuperseded++
                     }
+                } catch (e: UnconvertibleSchemaException) {
+                    // Skip-with-reason, not a failure: the group stays
+                    // uncompacted until the schema or the file set moves.
+                    log.warn {
+                        "compaction group of ${group.files.size} files for " +
+                            "$catalog/$namespace.$table is not convertible to the live " +
+                            "schema (${e.message}); skipping"
+                    }
+                    unconvertible++
                 } catch (e: Exception) {
-                    // One bad group (unreadable input, mixed schema
-                    // vintages, S3 hiccup) never wedges the sweep.
+                    // One bad group (unreadable input, corrupt DV, S3
+                    // hiccup) never wedges the sweep.
                     log.error(e) {
                         "compaction group of ${group.files.size} files failed for " +
                             "$catalog/$namespace.$table; continuing"
@@ -341,6 +412,8 @@ class CompactionService(
             bytesIn = bytesIn,
             bytesOut = bytesOut,
             skippedConflicts = skipped,
+            dvSuperseded = dvSuperseded,
+            unconvertibleSchema = unconvertible,
         )
     }
 
@@ -373,16 +446,17 @@ class CompactionService(
 
     /**
      * Execute + commit one ALREADY-PLANNED group, without re-planning.
-     * Test surface for the plan-to-commit race (a DV registered between
-     * planning and here must abort the commit); production traffic goes
-     * through [runOnce], which plans and executes in one sweep.
+     * Test surface for the plan-to-commit races (an input dying, a DV
+     * appearing or growing between planning and here must abort the
+     * commit); production traffic goes through [runOnce], which plans
+     * and executes in one sweep.
      */
     internal fun compactPlannedGroup(
         catalog: String,
         namespace: String,
         table: String,
         group: CompactionGroup,
-    ): Long? {
+    ): GroupOutcome {
         val ctx =
             jdbi.withHandleUnchecked { h ->
                 planWithContext(h, catalog, namespace, table, defaults).ctx
@@ -392,14 +466,11 @@ class CompactionService(
 
     /**
      * Rewrite one group (all IO outside any transaction) and commit it.
-     * Returns output bytes, or null when the commit-time re-verification
-     * found an input no longer live / no longer DV-free (skip; re-plan
-     * next run).
      */
     private fun compactGroup(
         ctx: TableContext,
         group: CompactionGroup,
-    ): Long? {
+    ): GroupOutcome {
         val tmpDir = Files.createTempDirectory("hoglake-compaction")
         val tmpFiles = mutableListOf<Path>()
         try {
@@ -408,50 +479,94 @@ class CompactionService(
                     val local = tmpDir.resolve("in-${f.dataFileId}.parquet")
                     Files.write(local, store.get(f.path))
                     tmpFiles.add(local)
-                    ParquetRewriter.Input(local, f.rowIdStart)
+                    val dv =
+                        f.dv?.let { planned ->
+                            val decoded = PuffinDeletionVector.read(store.get(planned.path))
+                            check(decoded.cardinality == planned.deleteCount) {
+                                "DV ${planned.path} decodes to ${decoded.cardinality} positions " +
+                                    "but is registered with delete_count ${planned.deleteCount} — " +
+                                    "refusing to compact on inconsistent metadata"
+                            }
+                            decoded
+                        }
+                    ParquetRewriter.Input(local, f.rowIdStart, dv)
                 }
             val outLocal = tmpDir.resolve("out.parquet")
             tmpFiles.add(outLocal)
-            val rowsWritten =
-                ParquetRewriter.rewrite(inputs, ctx.fieldIdsByName, ctx.sortFields, outLocal)
-            check(rowsWritten == group.totalRecords) {
-                "rewrite produced $rowsWritten rows but inputs registered ${group.totalRecords} — " +
-                    "refusing to commit a lossy compaction"
+            val rewritten =
+                ParquetRewriter.rewrite(inputs, ctx.columns, ctx.sortFields, outLocal)
+            check(rewritten.rowsWritten == group.survivingRecords) {
+                "rewrite produced ${rewritten.rowsWritten} rows but inputs registered " +
+                    "${group.survivingRecords} survivors — refusing to commit a lossy compaction"
             }
             val outputBytes = outLocal.fileSize()
             val footerSize = footerSize(outLocal)
             val outputPath =
                 "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
                     "compacted-${UUID.randomUUID()}.parquet"
+
+            // Claim ticket BEFORE the upload (its own committed
+            // transaction): if this group never commits — skip, crash,
+            // failed upload — the undrained row hands the object to the
+            // normal cleanup drain. The group commit settles it.
+            val stagingId = stageOutputPath(ctx.catalogId, outputPath)
             store.put(outputPath, Files.readAllBytes(outLocal))
 
             val stats =
-                if (group.files.all { it.statsProvided }) {
+                if (group.files.all { it.statsProvided && it.dv == null }) {
                     aggregateStats(group.files.map { it.dataFileId }, ctx)
                 } else {
+                    // A DV'd input's registered counts describe pre-delete
+                    // rows; honest 'pending' beats wrong 'provided'.
                     null
                 }
-            val snapshotId =
-                commitGroup(ctx, group, outputPath, outputBytes, footerSize, stats)
-            if (snapshotId == null) {
-                log.warn {
-                    "compaction group for ${ctx.namespace}.${ctx.table} lost a plan-to-commit " +
-                        "race (input dropped or gained a DV); skipping — uploaded output " +
-                        "$outputPath is orphaned and left to bucket lifecycle"
-                }
-                return null
+            val outcome =
+                commitGroup(
+                    ctx, group, outputPath, outputBytes, footerSize, stats,
+                    survivors = rewritten.rowsWritten,
+                    rowIdStart = rewritten.minRowId ?: group.files.minOf { it.rowIdStart },
+                    stagingId = stagingId,
+                )
+            when (outcome) {
+                is GroupOutcome.Committed ->
+                    log.info {
+                        "compacted ${group.files.size} files (${group.totalBytes} B, " +
+                            "${group.totalRecords} rows, ${rewritten.rowsWritten} survivors) of " +
+                            "${ctx.namespace}.${ctx.table} into $outputPath ($outputBytes B) " +
+                            "at snapshot ${outcome.snapshotId}"
+                    }
+                GroupOutcome.SkippedConflict, GroupOutcome.SkippedDvSuperseded ->
+                    log.warn {
+                        "compaction group for ${ctx.namespace}.${ctx.table} lost a " +
+                            "plan-to-commit race ($outcome); skipping — staged output " +
+                            "$outputPath stays queued for the cleanup drain to reclaim"
+                    }
             }
-            log.info {
-                "compacted ${group.files.size} files (${group.totalBytes} B) of " +
-                    "${ctx.namespace}.${ctx.table} into $outputPath ($outputBytes B) " +
-                    "at snapshot $snapshotId"
-            }
-            return outputBytes
+            return outcome
         } finally {
             tmpFiles.forEach { it.deleteIfExists() }
             tmpDir.deleteIfExists()
         }
     }
+
+    /** Insert the output path's compaction_staging claim ticket; returns removal_id. */
+    private fun stageOutputPath(
+        catalogId: Long,
+        outputPath: String,
+    ): Long =
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+                VALUES (:catalogId, :path, 'data', 'compaction_staging')
+                RETURNING removal_id
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("path", outputPath)
+                .mapTo(Long::class.javaObjectType)
+                .one()
+        }
 
     /** Thrift footer length from the 4 LE bytes before the trailing "PAR1". */
     private fun footerSize(file: Path): Long {
@@ -464,8 +579,7 @@ class CompactionService(
      * The metadata commit for one group: one transaction under the
      * per-catalog commit lock, CommitService's tail shape (parallel
      * code by design — its helpers are private and shaped around
-     * appends; the comments here mark each mirrored step). Returns the
-     * minted snapshot id, or null when re-verification failed.
+     * appends; the comments here mark each mirrored step).
      */
     private fun commitGroup(
         ctx: TableContext,
@@ -474,34 +588,76 @@ class CompactionService(
         outputBytes: Long,
         footerSize: Long,
         stats: List<ColumnStats>?,
-    ): Long? =
+        survivors: Long,
+        rowIdStart: Long,
+        stagingId: Long,
+    ): GroupOutcome =
         jdbi.inTransactionUnchecked { h ->
             Locks.acquireCatalogCommitLock(h, ctx.catalogId)
 
-            // Re-verify under the lock: every input must still be live and
-            // still DV-free. A miss = plan-to-commit race; abort the group.
-            val ids = group.files.map { it.dataFileId }
-            val stillCompactable =
+            // Re-claim the staging ticket under the lock: cleanup drains
+            // under the SAME lock, so "still undrained" here means the
+            // uploaded object still exists and is ours to register. If
+            // cleanup got there first the object is gone — abort.
+            val ticketLive =
                 h.createQuery(
                     """
-                SELECT count(*) FROM hog_data_file f
+                SELECT (drained_at IS NULL) FROM hog_file_removal
+                WHERE catalog_id = :catalogId AND removal_id = :removalId
+                """,
+                )
+                    .bind("catalogId", ctx.catalogId)
+                    .bind("removalId", stagingId)
+                    .mapTo(Boolean::class.javaObjectType)
+                    .findOne()
+                    .orElse(false)
+            if (!ticketLive) {
+                log.warn {
+                    "compaction staging ticket $stagingId for $outputPath was drained by " +
+                        "cleanup before the group committed; aborting the group"
+                }
+                return@inTransactionUnchecked GroupOutcome.SkippedConflict
+            }
+
+            // Re-verify under the lock: every input must still be live and
+            // must still carry EXACTLY its planned DV (supersession mints a
+            // new delete_file_id; growth without supersession is impossible).
+            data class LiveRow(val live: Boolean, val liveDvId: Long?)
+
+            val ids = group.files.map { it.dataFileId }
+            val liveState =
+                h.createQuery(
+                    """
+                SELECT f.data_file_id, (f.end_snapshot IS NULL) AS live,
+                       dv.delete_file_id AS dv_id
+                FROM hog_data_file f
+                LEFT JOIN hog_delete_file dv
+                  ON dv.catalog_id = f.catalog_id
+                 AND dv.data_file_id = f.data_file_id
+                 AND dv.end_snapshot IS NULL
                 WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
                   AND f.data_file_id IN (<ids>)
-                  AND f.end_snapshot IS NULL
-                  AND NOT EXISTS (
-                        SELECT 1 FROM hog_delete_file dv
-                        WHERE dv.catalog_id = f.catalog_id
-                          AND dv.data_file_id = f.data_file_id
-                          AND dv.end_snapshot IS NULL)
                 """,
                 )
                     .bind("catalogId", ctx.catalogId)
                     .bind("tableId", ctx.tableId)
                     .bindList("ids", ids)
-                    .mapTo(Long::class.javaObjectType)
-                    .one()
-            if (stillCompactable != ids.size.toLong()) {
-                return@inTransactionUnchecked null
+                    .map { rs, _ ->
+                        rs.getLong("data_file_id") to
+                            LiveRow(
+                                live = rs.getBoolean("live"),
+                                liveDvId = rs.getObject("dv_id")?.let { (it as Number).toLong() },
+                            )
+                    }
+                    .list()
+                    .toMap()
+            if (group.files.any { liveState[it.dataFileId]?.live != true }) {
+                return@inTransactionUnchecked GroupOutcome.SkippedConflict
+            }
+            if (group.files.any { liveState.getValue(it.dataFileId).liveDvId != it.dv?.deleteFileId }) {
+                // A DV appeared or grew after planning: committing the
+                // rewrite would resurrect those deletes. Never drop them.
+                return@inTransactionUnchecked GroupOutcome.SkippedDvSuperseded
             }
 
             // Allocate snapshot + file id under the lock (CommitService
@@ -530,10 +686,11 @@ class CompactionService(
             )
             SnapshotRepo.insertChange(h, ctx.catalogId, snapshotId, ChangeKind.TABLE_COMPACTED, ctx.tableId)
 
-            // The output row. record_count = sum of inputs; row_id_start =
-            // MIN of the inputs' — with explicit_row_ids its positional
-            // meaning is void (the ids live in the _hog_row_id column);
-            // it survives as the range-min for ordering and diagnostics.
+            // The output row. record_count = SURVIVORS (post-DV);
+            // row_id_start = min surviving id — with explicit_row_ids its
+            // positional meaning is void (the ids live in the _hog_row_id
+            // column); it survives as the range-min for ordering and
+            // diagnostics.
             h.createUpdate(
                 """
                 INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
@@ -549,10 +706,10 @@ class CompactionService(
                 .bind("tableId", ctx.tableId)
                 .bind("beginSnapshot", snapshotId)
                 .bind("path", outputPath)
-                .bind("recordCount", group.totalRecords)
+                .bind("recordCount", survivors)
                 .bind("fileSizeBytes", outputBytes)
                 .bind("footerSize", footerSize)
-                .bind("rowIdStart", group.files.minOf { it.rowIdStart })
+                .bind("rowIdStart", rowIdStart)
                 .bind("statsState", if (stats != null) "provided" else "pending")
                 .bind("specId", group.specId)
                 .execute()
@@ -610,7 +767,8 @@ class CompactionService(
             // once end_snapshot sinks under the retention floor (the
             // superseded-DV lifecycle). Nothing enters hog_file_removal
             // here. hog_table_stats is untouched (gross append counters;
-            // visible-file aggregates are unchanged by construction).
+            // visible-file aggregates shrink only by the rows the DVs
+            // already masked).
             h.createUpdate(
                 """
                 UPDATE hog_data_file SET end_snapshot = :snapshotId
@@ -622,7 +780,43 @@ class CompactionService(
                 .bindList("ids", ids)
                 .execute()
 
-            snapshotId
+            // The applied DVs die with their files: end-snapshot them so
+            // scans at older snapshots still mask, and expiry queues the
+            // puffin paths alongside the input parquets.
+            val dvIds = group.files.mapNotNull { it.dv?.deleteFileId }
+            if (dvIds.isNotEmpty()) {
+                h.createUpdate(
+                    """
+                    UPDATE hog_delete_file SET end_snapshot = :snapshotId
+                    WHERE catalog_id = :catalogId AND delete_file_id IN (<ids>)
+                    """,
+                )
+                    .bind("snapshotId", snapshotId)
+                    .bind("catalogId", ctx.catalogId)
+                    .bindList("ids", dvIds)
+                    .execute()
+            }
+
+            // Settle the staging ticket in the SAME transaction that makes
+            // the path live: cleanup's drain and the commit path guard only
+            // act on UNDRAINED rows, so the registered output can never be
+            // reclaimed or refused.
+            val settled =
+                h.createUpdate(
+                    """
+                    UPDATE hog_file_removal
+                       SET drained_at = now(), drained_outcome = 'registered',
+                           last_attempt_at = now()
+                     WHERE catalog_id = :catalogId AND removal_id = :removalId
+                       AND drained_at IS NULL
+                    """,
+                )
+                    .bind("catalogId", ctx.catalogId)
+                    .bind("removalId", stagingId)
+                    .execute()
+            check(settled == 1) { "compaction staging ticket $stagingId vanished mid-commit" }
+
+            GroupOutcome.Committed(snapshotId, outputBytes)
         }
 
     // ---- stats aggregation -----------------------------------------------
@@ -632,8 +826,9 @@ class CompactionService(
      * bounds are recomputed by DECODING each input bound to its typed
      * value, comparing typed, and re-encoding the winner — never a raw
      * binary compare of the encodings (wrong for signed little-endian
-     * types). A field only gets a stats row when EVERY input has one;
-     * within a field, nan/size/bounds go null if any input's is null.
+     * types). A field only gets a stats row when EVERY input has one
+     * (heterogeneous groups: an added column simply has no row); within
+     * a field, nan/size/bounds go null if any input's is null.
      */
     private fun aggregateStats(
         inputIds: List<Long>,
@@ -675,10 +870,11 @@ class CompactionService(
                     .list()
             }
 
+        val columnTypes = ctx.columnTypes
         val out = mutableListOf<ColumnStats>()
         for ((fieldId, fieldRows) in rows.groupBy { it.fieldId }) {
             if (fieldRows.size != inputIds.size) continue // not every input covered the field
-            val type = ctx.columnTypes[fieldId] ?: continue // column dropped since the inputs landed
+            val type = columnTypes[fieldId] ?: continue // column dropped since the inputs landed
             out +=
                 ColumnStats(
                     fieldId = fieldId,
@@ -701,7 +897,24 @@ class CompactionService(
         takeUpper: Boolean,
     ): ByteArray? {
         if (bounds.any { it == null }) return null
-        val decoded = bounds.map { IcebergSingleValue.decode(type, it!!) }
+        // A bound that does not decode under the LIVE type (wrong width —
+        // e.g. a 4-byte int bound left behind by a pre-fix promote, or one
+        // a racing hydrator wrote under the pre-promote type) is treated
+        // as ABSENT, nulling this column's merged bound: honest missing
+        // metadata over a poison group that would throw here every sweep
+        // until the inputs expire. The sweep must never wedge on stats.
+        val decoded =
+            bounds.map { bound ->
+                try {
+                    IcebergSingleValue.decode(type, bound!!)
+                } catch (e: IllegalArgumentException) {
+                    log.warn {
+                        "compaction bound-merge: input bound (${bound!!.size} bytes) does not " +
+                            "decode as ${type.wire} (${e.message}); treating as absent"
+                    }
+                    return null
+                }
+            }
         val winner =
             decoded.reduce { a, b ->
                 val cmp = IcebergSingleValue.compareValues(type, a, b)

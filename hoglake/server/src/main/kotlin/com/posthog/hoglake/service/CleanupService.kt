@@ -7,9 +7,11 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.Locks
 import io.github.oshai.kotlinlogging.KotlinLogging
+import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
-import org.jdbi.v3.core.kotlin.useHandleUnchecked
+import org.jdbi.v3.core.kotlin.useTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
@@ -112,13 +114,35 @@ class RemovalStore(
  * [ledgerRetentionSeconds] — the ledger must not itself become the
  * unbounded-accumulation problem it documents.
  *
- * Deletes run in sub-batches of [subBatchSize] (500 in production;
- * constructor-tunable for tests). Each sub-batch deletes its objects
- * and then settles their ledger rows in one transaction of its own, so
- * a later sub-batch failure never rolls back completed ones. A missing
- * object (404) is success ("already gone") and drains its row as
- * 'absent'; a per-object delete failure bumps attempts and leaves the
- * row queued for the next run without wedging the rest of the batch.
+ * Deletes run in sub-batches of [subBatchSize] (25 in production;
+ * constructor-tunable for tests). Each sub-batch is ONE transaction
+ * that (1) takes the per-catalog advisory commit lock (Locks.kt — the
+ * SAME key as every commit/DDL tail), (2) re-checks references, (3)
+ * physically deletes, (4) settles the ledger rows — so a later
+ * sub-batch failure never rolls back completed ones. A missing object
+ * (404) is success ("already gone") and drains its row as 'absent'; a
+ * per-object delete failure bumps attempts and leaves the row queued
+ * for the next run without wedging the rest of the batch.
+ *
+ * WHY the lock (the check-then-delete TOCTOU): without it, a commit
+ * transaction could pass ITS removal-queue check, insert a hog_data_file
+ * row for a queued path, and be mid-flight (uncommitted, invisible to
+ * READ COMMITTED) exactly when this drain computes referencedPaths —
+ * the drain would see the path unreferenced, delete the object, and the
+ * commit would then land a live row pointing at a deleted object.
+ * Holding the catalog commit lock across the check+delete pair
+ * serializes the two: either the commit finished first (its rows are
+ * visible to the check, path skipped as still-referenced... and its own
+ * queue-collision check would have 409'd anyway while the entry was
+ * undrained), or the drain finishes first and the commit's collision
+ * check runs after the entry settles. No interleaving remains.
+ *
+ * LOCK-HOLD BOUND: one sub-batch = one reference-check query + at most
+ * [subBatchSize] × (HEAD + DELETE) S3 calls + two ledger UPDATEs. At
+ * the production sub-batch of 25 and ~50 ms per S3 round trip that is
+ * ≈ 2.5 s worst case per sub-batch — well under the 30 s commit
+ * admission timeout; commits queue behind a sub-batch, never a full
+ * batch. Keep [subBatchSize] small; the lock hold scales linearly in it.
  */
 class CleanupService(
     private val jdbi: Jdbi,
@@ -207,93 +231,107 @@ class CleanupService(
         var removed = 0L
         var missing = 0L
         var stillReferenced = 0L
+
+        // Per-path audit events are collected inside the sub-batch
+        // transaction and emitted AFTER it commits (invariant 8: audit
+        // never rides a transaction — and never rides the catalog lock).
+        data class PathEvent(val action: String, val path: String, val outcome: String, val detail: String?)
         for (sub in batch.chunked(subBatchSize)) {
-            // Liveness is checked per sub-batch at drain time, not when
-            // the batch was selected: the freshest answer we can get
-            // before touching the object.
-            val referenced = referencedPaths(catalogId, sub.map { it.path })
-            // Ledger outcomes for this sub-batch: settled entries by
-            // outcome, plus the ones that stay queued (attempts bump).
-            val drainedByOutcome = mapOf("deleted" to mutableListOf<Long>(), "absent" to mutableListOf())
-            val attempted = mutableListOf<Long>()
-            for (entry in sub) {
-                if (entry.path in referenced) {
-                    log.error {
-                        "cleanup: path '${entry.path}' (removal_id ${entry.removalId}) is " +
-                            "still referenced by the catalog — invariant violation; skipping"
+            val events = mutableListOf<PathEvent>()
+            jdbi.useTransactionUnchecked { h ->
+                // The check+delete pair is serialized against the commit
+                // tail by the SAME per-catalog advisory lock every commit
+                // takes (see class KDoc for the race and the hold bound):
+                // the reference check below can never go stale against an
+                // in-flight commit registering one of these paths.
+                Locks.acquireCatalogCommitLock(h, catalogId)
+                // Liveness is checked per sub-batch at drain time, under
+                // the lock: the freshest answer possible before touching
+                // the object.
+                val referenced = referencedPaths(h, catalogId, sub.map { it.path })
+                // Ledger outcomes for this sub-batch: settled entries by
+                // outcome, plus the ones that stay queued (attempts bump).
+                val drainedByOutcome = mapOf("deleted" to mutableListOf<Long>(), "absent" to mutableListOf())
+                val attempted = mutableListOf<Long>()
+                for (entry in sub) {
+                    if (entry.path in referenced) {
+                        log.error {
+                            "cleanup: path '${entry.path}' (removal_id ${entry.removalId}) is " +
+                                "still referenced by the catalog — invariant violation; skipping"
+                        }
+                        // Per-path audit trail for the alert-worthy case: WHICH
+                        // path the queue wrongly suggested. Bounded by batch size.
+                        events +=
+                            PathEvent(
+                                "cleanup_violation",
+                                entry.path,
+                                "invariant_violation",
+                                "removal_id=${entry.removalId} still referenced; not deleted",
+                            )
+                        stillReferenced++
+                        attempted += entry.removalId
+                        continue
                     }
-                    // Per-path audit trail for the alert-worthy case: WHICH
-                    // path the queue wrongly suggested. Bounded by batch size.
-                    Audit.event(
-                        "cleanup_violation",
-                        catalog,
-                        entry.path,
-                        outcome = "invariant_violation",
-                        detail = "removal_id=${entry.removalId} still referenced; not deleted",
-                    )
-                    stillReferenced++
-                    attempted += entry.removalId
-                    continue
+                    try {
+                        when (store.deleteIfExists(entry.path)) {
+                            RemovalStore.Outcome.REMOVED -> {
+                                // Physical deletions are the audit log's whole
+                                // point: one event per object actually removed.
+                                events += PathEvent("file_deleted", entry.path, "ok", null)
+                                removed++
+                                drainedByOutcome.getValue("deleted") += entry.removalId
+                            }
+                            RemovalStore.Outcome.MISSING -> {
+                                log.info { "cleanup: '${entry.path}' already gone; draining queue row" }
+                                missing++
+                                drainedByOutcome.getValue("absent") += entry.removalId
+                            }
+                        }
+                    } catch (e: Exception) {
+                        // Leave the row queued (attempts bumped); the next run
+                        // retries it.
+                        log.error(e) {
+                            "cleanup: delete failed for '${entry.path}' " +
+                                "(removal_id ${entry.removalId}); leaving queued"
+                        }
+                        attempted += entry.removalId
+                    }
                 }
-                try {
-                    when (store.deleteIfExists(entry.path)) {
-                        RemovalStore.Outcome.REMOVED -> {
-                            // Physical deletions are the audit log's whole
-                            // point: one event per object actually removed.
-                            Audit.event("file_deleted", catalog, entry.path, outcome = "ok")
-                            removed++
-                            drainedByOutcome.getValue("deleted") += entry.removalId
-                        }
-                        RemovalStore.Outcome.MISSING -> {
-                            log.info { "cleanup: '${entry.path}' already gone; draining queue row" }
-                            missing++
-                            drainedByOutcome.getValue("absent") += entry.removalId
-                        }
-                    }
-                } catch (e: Exception) {
-                    // Leave the row queued (attempts bumped); the next run
-                    // retries it.
-                    log.error(e) {
-                        "cleanup: delete failed for '${entry.path}' " +
-                            "(removal_id ${entry.removalId}); leaving queued"
-                    }
-                    attempted += entry.removalId
+                // Soft-delete the settled entries: the row survives as
+                // the queryable ledger of what cleanup did and when.
+                for ((outcome, ids) in drainedByOutcome) {
+                    if (ids.isEmpty()) continue
+                    h.createUpdate(
+                        """
+                        UPDATE hog_file_removal
+                           SET drained_at = now(), drained_outcome = :outcome,
+                               last_attempt_at = now()
+                         WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
+                        """,
+                    )
+                        .bind("outcome", outcome)
+                        .bind("catalogId", catalogId)
+                        .bindArray("ids", Long::class.javaObjectType, ids)
+                        .execute()
+                }
+                // Undrained entries (still-referenced, transient S3
+                // failure) record the attempt and stay queued.
+                if (attempted.isNotEmpty()) {
+                    h.createUpdate(
+                        """
+                        UPDATE hog_file_removal
+                           SET attempts = attempts + 1, last_attempt_at = now()
+                         WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
+                        """,
+                    )
+                        .bind("catalogId", catalogId)
+                        .bindArray("ids", Long::class.javaObjectType, attempted)
+                        .execute()
                 }
             }
-            if (drainedByOutcome.values.any { it.isNotEmpty() } || attempted.isNotEmpty()) {
-                jdbi.useHandleUnchecked { h ->
-                    // Soft-delete the settled entries: the row survives as
-                    // the queryable ledger of what cleanup did and when.
-                    for ((outcome, ids) in drainedByOutcome) {
-                        if (ids.isEmpty()) continue
-                        h.createUpdate(
-                            """
-                            UPDATE hog_file_removal
-                               SET drained_at = now(), drained_outcome = :outcome,
-                                   last_attempt_at = now()
-                             WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
-                            """,
-                        )
-                            .bind("outcome", outcome)
-                            .bind("catalogId", catalogId)
-                            .bindArray("ids", Long::class.javaObjectType, ids)
-                            .execute()
-                    }
-                    // Undrained entries (still-referenced, transient S3
-                    // failure) record the attempt and stay queued.
-                    if (attempted.isNotEmpty()) {
-                        h.createUpdate(
-                            """
-                            UPDATE hog_file_removal
-                               SET attempts = attempts + 1, last_attempt_at = now()
-                             WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
-                            """,
-                        )
-                            .bind("catalogId", catalogId)
-                            .bindArray("ids", Long::class.javaObjectType, attempted)
-                            .execute()
-                    }
-                }
+            // Sub-batch committed (lock released): emit its audit events.
+            for (e in events) {
+                Audit.event(e.action, catalog, e.path, outcome = e.outcome, detail = e.detail)
             }
         }
         purgeDrainedLedger(catalog, catalogId)
@@ -328,27 +366,30 @@ class CleanupService(
         }
     }
 
-    /** Paths from [paths] that any file row (live or not) still claims. */
+    /**
+     * Paths from [paths] that any file row (live or not) still claims.
+     * Runs on the sub-batch transaction's handle, under the catalog
+     * commit lock, so the answer cannot go stale against a commit.
+     */
     private fun referencedPaths(
+        h: Handle,
         catalogId: Long,
         paths: List<String>,
     ): Set<String> =
-        jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                """
-                SELECT path FROM hog_data_file
-                WHERE catalog_id = :catalogId AND path = ANY(:paths)
-                UNION
-                SELECT path FROM hog_delete_file
-                WHERE catalog_id = :catalogId AND path = ANY(:paths)
-                """,
-            )
-                .bind("catalogId", catalogId)
-                .bindArray("paths", String::class.java, paths)
-                .mapTo(String::class.java)
-                .list()
-                .toSet()
-        }
+        h.createQuery(
+            """
+            SELECT path FROM hog_data_file
+            WHERE catalog_id = :catalogId AND path = ANY(:paths)
+            UNION
+            SELECT path FROM hog_delete_file
+            WHERE catalog_id = :catalogId AND path = ANY(:paths)
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bindArray("paths", String::class.java, paths)
+            .mapTo(String::class.java)
+            .list()
+            .toSet()
 
     /**
      * One drain across every catalog, for the background loop
@@ -369,8 +410,16 @@ class CleanupService(
     }
 
     private companion object {
-        /** Production sub-batch size for physical deletes. */
-        const val SUB_BATCH = 500
+        /**
+         * Production sub-batch size for physical deletes. Deliberately
+         * small: each sub-batch holds the per-catalog commit lock across
+         * its S3 calls (the check-then-delete serialization), so the
+         * worst-case foreground commit stall is subBatchSize × one S3
+         * HEAD+DELETE round trip (≈ 2.5 s at 25 × ~50 ms/op — see the
+         * class KDoc's bound), not the 500-entry convoy the old size
+         * would have produced.
+         */
+        const val SUB_BATCH = 25
 
         /** Default drained-ledger retention: 30 days (HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS). */
         const val LEDGER_RETENTION_SECONDS = 30L * 24 * 60 * 60

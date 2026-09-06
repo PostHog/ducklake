@@ -430,6 +430,43 @@ paths:
               schema: { $ref: "#/components/schemas/VerifyReport" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /catalogs/{catalog}/maintenance/rehydrate:
+    post:
+      operationId: runRehydrate
+      summary: >
+        Requeue structurally-failed stats hydrations: flips
+        stats_state 'failed' back to 'pending' so the hydrator sweep
+        retries them — the operator recovery path after the cause is
+        fixed (object re-uploaded, registration corrected, whole-object
+        cap raised). Whole catalog by default; scope to one table by
+        supplying BOTH namespace and table (supplying only one is a
+        422). Transient object-store failures never need this: they
+        leave files 'pending' and retry on their own.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: namespace
+          in: query
+          required: false
+          description: Table scope, with `table`. Both or neither.
+          schema: { type: string }
+        - name: table
+          in: query
+          required: false
+          description: Table scope, with `namespace`. Both or neither.
+          schema: { type: string }
+      responses:
+        "200":
+          description: How many failed files were requeued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RehydrateResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: namespace/table supplied without the other
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
   /catalogs/{catalog}/maintenance/cleanup:
     post:
       operationId: runCleanup
@@ -448,6 +485,60 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/stats/partitions:
+    get:
+      operationId: getPartitionStats
+      summary: >
+        Leaf partitions ranked by compaction debt — the operator answer
+        to "how un-compacted is each partition" under the coarse
+        (months x team) partitioning model. Aggregates LIVE
+        (visible-at-head) data files grouped by (table, spec_id,
+        partition value tuple); an unpartitioned table (or the pre-spec
+        vintage of a later-partitioned one) is one row with empty
+        partition_values and no spec_id, and files written under an
+        older spec than the table's current one group under THEIR
+        spec_id. "Small" means under the compaction target size
+        (HOGLAKE_COMPACTION_TARGET_BYTES, strict less-than — the same
+        threshold the compaction planner applies to candidate inputs),
+        so debt_score (= small_file_count) is exactly the files a sweep
+        would try to merge. Ordered by debt_score desc, ties by
+        small_file_bytes desc. Read-only metadata aggregation (one
+        REPEATABLE READ MVCC snapshot, no locks) — never blocks
+        writers.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: namespace
+          in: query
+          required: false
+          description: Restrict to one namespace's tables.
+          schema: { type: string }
+        - name: table
+          in: query
+          required: false
+          description: >
+            Restrict to one table; requires `namespace` (422 without
+            it).
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: >
+            Max partitions returned (default 50, capped at 500);
+            truncated reports whether more groups existed.
+          schema: { type: integer, default: 50, maximum: 500 }
+      responses:
+        "200":
+          description: Partitions ranked by compaction debt.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartitionStatsReport" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: table supplied without namespace, or limit < 1
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}/namespaces/{namespace}/views:
     get:
@@ -696,6 +787,42 @@ paths:
               schema: { $ref: "#/components/schemas/ExportManifest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /info:
+    get:
+      operationId: getInstanceInfo
+      summary: >
+        Identity of this hoglake instance: the operator-configured
+        display name (HOGLAKE_INSTANCE_NAME, e.g. "GigaHog") the webui
+        shows so deployments are tellable apart. Name omitted when
+        unset.
+      responses:
+        "200":
+          description: Instance info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+
+  /catalogs/{catalog}/consumers:
+    get:
+      operationId: listConsumers
+      summary: >
+        Every consumer in the catalog with its per-table offsets, table
+        names resolved (a dropped table keeps its last name and is
+        flagged — offsets outlive drops so consumers see incarnation
+        changes). Ordered by consumer id, then namespace.table.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+      responses:
+        "200":
+          description: Consumers and their offsets
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsumerList" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /catalogs/{catalog}/consumers/{consumer}/offsets:
     get:
@@ -1239,6 +1366,15 @@ components:
         missing: { type: integer, format: int64 }
         still_referenced: { type: integer, format: int64 }
 
+    RehydrateResult:
+      type: object
+      required: [requeued]
+      properties:
+        requeued:
+          type: integer
+          format: int64
+          description: Failed files flipped back to pending.
+
     VerifyCheck:
       type: object
       required: [check, status, violations, samples]
@@ -1323,7 +1459,8 @@ components:
     CompactionResult:
       type: object
       required: [groups_compacted, files_in, files_out, bytes_in,
-                 bytes_out, skipped_conflicts]
+                 bytes_out, skipped_conflicts, dv_superseded,
+                 unconvertible_schema]
       properties:
         groups_compacted: { type: integer, format: int64 }
         files_in: { type: integer, format: int64 }
@@ -1335,8 +1472,103 @@ components:
           format: int64
           description: >
             Groups aborted at commit time because an input file was no
-            longer live or had gained a deletion vector since planning;
-            re-planned on the next run.
+            longer live, or because the compactor's staged output claim
+            was reclaimed by a concurrent cleanup drain; re-planned on
+            the next run.
+        dv_superseded:
+          type: integer
+          format: int64
+          description: >
+            Groups aborted at commit time because an input's deletion
+            vector changed since planning (one appeared, or the planned
+            one was superseded by a grown vector). The rewrite applied
+            the planned vectors, so committing would resurrect rows
+            deleted after the plan's read; the group re-plans instead.
+        unconvertible_schema:
+          type: integer
+          format: int64
+          description: >
+            Groups skipped because a live column's type cannot be
+            produced from an input file's parquet type (outside identity
+            and the int->long / float->double promotions).
+
+    PartitionValue:
+      type: object
+      required: [field, value]
+      properties:
+        field:
+          type: string
+          description: >
+            Partition field display name: the source column's name for
+            identity transforms, "<column>_<transform>" otherwise
+            (e.g. ts_month).
+        value:
+          type: string
+          nullable: true
+          description: >
+            Transformed partition value; explicit null for a null
+            partition value.
+
+    PartitionDebt:
+      type: object
+      required: [namespace, table, table_uuid, partition_values,
+                 file_count, small_file_count, total_bytes,
+                 small_file_bytes, avg_file_bytes, dv_count, debt_score]
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        table_uuid: { type: string, format: uuid }
+        partition_values:
+          type: array
+          description: Empty for an unpartitioned vintage.
+          items: { $ref: "#/components/schemas/PartitionValue" }
+        spec_id:
+          type: integer
+          format: int64
+          description: >
+            Spec the group's files were written under (not necessarily
+            the table's current one). Omitted for an unpartitioned
+            vintage.
+        file_count: { type: integer, format: int64 }
+        small_file_count:
+          type: integer
+          format: int64
+          description: Files under the compaction target size (strict <).
+        total_bytes: { type: integer, format: int64 }
+        small_file_bytes: { type: integer, format: int64 }
+        avg_file_bytes:
+          type: integer
+          format: int64
+          description: total_bytes / file_count, floored.
+        dv_count:
+          type: integer
+          format: int64
+          description: Live deletion vectors over the partition's files.
+        debt_score:
+          type: integer
+          format: int64
+          description: >
+            = small_file_count — the files a compaction sweep would try
+            to merge. The ranking key (desc, ties by small_file_bytes
+            desc).
+
+    PartitionStatsReport:
+      type: object
+      required: [partitions, truncated, stale_spec_groups]
+      properties:
+        partitions:
+          type: array
+          items: { $ref: "#/components/schemas/PartitionDebt" }
+        truncated:
+          type: boolean
+          description: More groups existed than the requested limit.
+        stale_spec_groups:
+          type: integer
+          format: int64
+          description: >
+            Groups (across the whole result set, not just this page)
+            whose spec vintage is not the table's current live spec —
+            partitions a spec change left behind.
 
     Snapshot:
       type: object
@@ -1430,3 +1662,35 @@ components:
         table_uuid: { type: string, format: uuid }
         committed_snapshot: { type: integer, format: int64 }
         updated_at: { type: string, format: date-time }
+
+    ConsumerTableOffset:
+      type: object
+      required: [table_uuid, committed_snapshot, updated_at, table_dropped]
+      properties:
+        table_uuid: { type: string, format: uuid }
+        committed_snapshot: { type: integer, format: int64 }
+        updated_at: { type: string, format: date-time }
+        namespace:
+          type: string
+          description: Omitted only for a uuid no table incarnation ever carried.
+        table_name:
+          type: string
+          description: Live name, or the last name before the drop.
+        table_dropped: { type: boolean }
+
+    ConsumerSummary:
+      type: object
+      required: [consumer_id, offsets]
+      properties:
+        consumer_id: { type: string }
+        offsets:
+          type: array
+          items: { $ref: "#/components/schemas/ConsumerTableOffset" }
+
+    ConsumerList:
+      type: object
+      required: [consumers]
+      properties:
+        consumers:
+          type: array
+          items: { $ref: "#/components/schemas/ConsumerSummary" }

@@ -402,3 +402,45 @@ data class ConsumerOffsetDto(
 fun ConsumerOffset.toDto() = ConsumerOffsetDto(consumerId, tableUuid, committedSnapshot, updatedAt)
 
 data class CommitOffsetRequestDto(val snapshotId: Long)
+
+/** GET /v1/info — instance identity for the webui. Name omitted when unset. */
+data class InstanceInfoDto(val name: String?)
+
+/** One row of the catalog-wide consumer listing (GET /consumers). */
+data class ConsumerTableOffsetDto(
+    val tableUuid: UUID,
+    val committedSnapshot: Long,
+    val updatedAt: Instant,
+    val namespace: String?,
+    val tableName: String?,
+    val tableDropped: Boolean,
+)
+
+data class ConsumerSummaryDto(
+    val consumerId: String,
+    val offsets: List<ConsumerTableOffsetDto>,
+)
+
+data class ConsumerListDto(val consumers: List<ConsumerSummaryDto>)
+
+/** Group flat repo rows by consumer, preserving the repo's ordering. */
+fun List<com.posthog.hoglake.model.ConsumerTableOffset>.toConsumerListDto() =
+    ConsumerListDto(
+        groupBy { it.consumerId }
+            .map { (consumer, rows) ->
+                ConsumerSummaryDto(
+                    consumerId = consumer,
+                    offsets =
+                        rows.map {
+                            ConsumerTableOffsetDto(
+                                tableUuid = it.tableUuid,
+                                committedSnapshot = it.committedSnapshot,
+                                updatedAt = it.updatedAt,
+                                namespace = it.namespace,
+                                tableName = it.tableName,
+                                tableDropped = it.tableDropped,
+                            )
+                        },
+                )
+            },
+    )

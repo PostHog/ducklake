@@ -59,6 +59,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pyhoglake import (
     AlreadyExistsError,
+    CommitConflictError,
     ExpiredError,
     HoglakeClient,
     NotFoundError,
@@ -352,6 +353,7 @@ class Hedgerow:
 
         rows_read = rows_appended = appends = 0
         max_rows = cfg.replication.max_rows_per_append
+        max_append_retries = cfg.replication.max_append_retries
         batch_size = min(max_rows, _READ_BATCH_CAP)
         buffer: list[pa.RecordBatch] = []
         buffered = 0
@@ -372,38 +374,68 @@ class Hedgerow:
                 [b.cast(append_schema, safe=True) for b in buffer],
                 schema=append_schema,
             )
-            try:
-                dest_table.append(
-                    table,
-                    expected_table_uuid=self.dest_uuid,
-                    author=f"hedgerow/{cfg.source.consumer_id}",
-                    message=(
-                        f"replicated from {cfg.source.catalog}/"
-                        f"{cfg.source.namespace}.{cfg.source.table} "
-                        f"window=({plan.from_snapshot},{plan.to_snapshot}]"
-                    ),
-                )
-            except ClientIncarnationChangedError as e:
-                # BUG-1: the destination was dropped/recreated mid-window.
-                # The guard is atomic at commit time — the server 409s a
-                # mismatched expected_table_uuid with ZERO writes (and
-                # pyhoglake's pre-flight may fast-fail even earlier). HALT
-                # — never split appends across incarnations, never commit
-                # the offset over them.
-                raise IncarnationChangedError(
-                    f"destination table {cfg.destination.catalog}/"
-                    f"{cfg.destination.namespace}.{cfg.destination.table} "
-                    f"changed incarnation mid-window: {e}. HALT: the offset "
-                    "was not committed; rows appended to the dropped "
-                    "incarnation are gone with it and will be replayed."
-                ) from e
-            except NotFoundError as e:
-                raise IncarnationChangedError(
-                    f"destination table {cfg.destination.catalog}/"
-                    f"{cfg.destination.namespace}.{cfg.destination.table} "
-                    f"disappeared mid-window (pinned uuid {self.dest_uuid}): "
-                    f"{e}. HALT."
-                ) from e
+            # Retryable commit conflicts (409, concurrent DDL touched the
+            # destination) get bounded SINGLE-APPEND retries here, before
+            # anything escalates to the window-replay path: a re-append of
+            # this one buffer is duplicate-free, while a window replay
+            # duplicates every row appended before the failure (bugs.md
+            # #13). Incarnation/not-found behavior is unchanged — those
+            # halt, never retry.
+            attempts = 0
+            while True:
+                try:
+                    dest_table.append(
+                        table,
+                        expected_table_uuid=self.dest_uuid,
+                        author=f"hedgerow/{cfg.source.consumer_id}",
+                        message=(
+                            f"replicated from {cfg.source.catalog}/"
+                            f"{cfg.source.namespace}.{cfg.source.table} "
+                            f"window=({plan.from_snapshot},{plan.to_snapshot}]"
+                        ),
+                    )
+                    break
+                except ClientIncarnationChangedError as e:
+                    # BUG-1: the destination was dropped/recreated
+                    # mid-window. The guard is atomic at commit time — the
+                    # server 409s a mismatched expected_table_uuid with
+                    # ZERO writes (and pyhoglake's pre-flight may
+                    # fast-fail even earlier). HALT — never split appends
+                    # across incarnations, never commit the offset over
+                    # them.
+                    raise IncarnationChangedError(
+                        f"destination table {cfg.destination.catalog}/"
+                        f"{cfg.destination.namespace}.{cfg.destination.table} "
+                        f"changed incarnation mid-window: {e}. HALT: the "
+                        "offset was not committed; rows appended to the "
+                        "dropped incarnation are gone with it and will be "
+                        "replayed."
+                    ) from e
+                except NotFoundError as e:
+                    raise IncarnationChangedError(
+                        f"destination table {cfg.destination.catalog}/"
+                        f"{cfg.destination.namespace}.{cfg.destination.table} "
+                        f"disappeared mid-window (pinned uuid "
+                        f"{self.dest_uuid}): {e}. HALT."
+                    ) from e
+                except CommitConflictError as e:
+                    if not e.retryable or attempts >= max_append_retries:
+                        # Budget exhausted (or a non-retryable conflict):
+                        # let the existing window-replay machinery in
+                        # run_forever take over.
+                        raise
+                    attempts += 1
+                    backoff = min(0.1 * 2 ** (attempts - 1), 1.0)
+                    log.warning(
+                        "destination commit conflict (retryable); "
+                        "re-appending the same buffer (duplicate-free), "
+                        "attempt %d/%d after %.1fs: %s",
+                        attempts,
+                        max_append_retries,
+                        backoff,
+                        e,
+                    )
+                    self._sleep(backoff)
             rows_appended += buffered
             appends += 1
             buffer = []
@@ -464,17 +496,28 @@ class Hedgerow:
                 "offset deliberately."
             ) from e
 
+        # Pacing must not trust the head sampled BEFORE the cycle: a long
+        # cycle (big window, slow object store) leaves that observation
+        # stale, and a "caught up" verdict against it makes run_forever
+        # sleep a full poll interval on top of fresh backlog (bugs.md
+        # #22). Re-observe the head after the cycle completes — but only
+        # when the stale head claims we are caught up; a clamped window
+        # already knows backlog remains.
+        head_after = win.head_snapshot
+        if head_after <= plan.to_snapshot:
+            head_after = self._source_catalog.refresh().head_snapshot_id
+
         result = CycleResult(
             idle=False,
             from_snapshot=plan.from_snapshot,
             to_snapshot=plan.to_snapshot,
-            head_snapshot=win.head_snapshot,
+            head_snapshot=head_after,
             files=len(plan.files),
             rows_read=rows_read,
             rows_appended=rows_appended,
             appends=appends,
             committed_offset=plan.to_snapshot,
-            lag_snapshots=win.head_snapshot - plan.to_snapshot,
+            lag_snapshots=max(0, head_after - plan.to_snapshot),
             duration_s=time.monotonic() - t0,
         )
         self._finish_cycle(result)

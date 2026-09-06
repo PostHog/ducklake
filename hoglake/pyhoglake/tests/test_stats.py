@@ -129,3 +129,59 @@ def test_unknown_file_column_ignored():
     meta = _write(table, row_group_size=10)
     stats = extract_column_stats(meta, columns)
     assert [s.field_id for s in stats] == [1]
+
+
+# -- signed-zero bound determinism (bugs.md #20) -----------------------------
+
+
+def test_float_zero_bounds_deterministic_across_row_group_orders():
+    """bugs.md #20 regression: -0.0/0.0 bound bytes must not depend on
+    row-group order. Python's min/max keep the FIRST of equal values
+    (and -0.0 == 0.0), so mixed-sign zeros across row groups could flip
+    the encoded sign bit with the write order. Bounds now use IEEE
+    total-order semantics (java.lang.Double.compare: -0.0 < 0.0), so
+    both orders produce identical bytes: min prefers -0.0, max prefers
+    +0.0. (pyarrow's parquet writer already normalizes each row group's
+    zero stats the same way, so this also pins us to its convention.)"""
+    columns = (Column(name="x", type="double", field_id=1, ordinal=0),)
+    schema = columns_to_arrow_schema(columns)
+
+    def bounds(values):
+        table = pa.table({"x": pa.array(values, pa.float64())}, schema=schema)
+        meta = _write(table, row_group_size=1)  # one row group per value
+        assert meta.num_row_groups == len(values)
+        (s,) = extract_column_stats(meta, columns)
+        return s.lower_bound, s.upper_bound
+
+    neg_zero = struct.pack("<d", -0.0)
+    pos_zero = struct.pack("<d", 0.0)
+    assert neg_zero != pos_zero  # the sign bit is real on the wire
+
+    lo_a, hi_a = bounds([0.0, -0.0])
+    lo_b, hi_b = bounds([-0.0, 0.0])
+    assert (lo_a, hi_a) == (lo_b, hi_b)  # order-independent bytes
+    assert lo_a == neg_zero  # min prefers -0.0
+    assert hi_a == pos_zero  # max prefers +0.0
+
+
+def test_float_total_order_key_matches_double_compare():
+    from pyhoglake.stats import _float_total_order_key as key
+
+    # java.lang.Double.compare ordering on the interesting values
+    ordered = [
+        float("-inf"),
+        -2.0,
+        -1.0,
+        -0.0,
+        0.0,
+        1.0,
+        2.0,
+        float("inf"),
+    ]
+    assert sorted(ordered, key=key) == ordered
+    assert key(-0.0) < key(0.0)  # the pair Python's min/max cannot split
+    # deterministic zero choice regardless of argument order
+    assert str(min([0.0, -0.0], key=key)) == "-0.0"
+    assert str(min([-0.0, 0.0], key=key)) == "-0.0"
+    assert str(max([0.0, -0.0], key=key)) == "0.0"
+    assert str(max([-0.0, 0.0], key=key)) == "0.0"

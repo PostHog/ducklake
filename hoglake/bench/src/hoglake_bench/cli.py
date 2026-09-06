@@ -27,6 +27,7 @@ from typing import Any
 
 import httpx
 
+from . import seed as seed_task
 from .context import Bench, BenchConfig
 from .runner import BenchAbort, InvariantViolation
 from .scenarios import (
@@ -127,6 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=(mod.__doc__ or "").strip().splitlines()[0])
         _add_common(p)
         mod.add_args(p)
+    # `seed` is a task, not a scenario: it is deliberately NOT in
+    # SCENARIOS (so `all` never runs it) and journals no metrics.
+    p_seed = sub.add_parser(
+        "seed",
+        help="populate a catalog with a realistic fake data warehouse",
+    )
+    _add_common(p_seed)
+    seed_task.add_args(p_seed)
     p_all = sub.add_parser("all", help="run every scenario")
     _add_common(p_all)
     profile = p_all.add_mutually_exclusive_group()
@@ -260,15 +269,20 @@ def _namespace_for(
     SCENARIOS[name].add_args(p)
     ns = p.parse_args([])
     for k in vars(ns):
-        if hasattr(base, k) and getattr(base, k) is not None and k in (
-            "url",
-            "s3_endpoint",
-            "s3_access_key",
-            "s3_secret_key",
-            "bucket",
-            "results",
-            "duration",
-            "warmup",
+        if (
+            hasattr(base, k)
+            and getattr(base, k) is not None
+            and k
+            in (
+                "url",
+                "s3_endpoint",
+                "s3_access_key",
+                "s3_secret_key",
+                "bucket",
+                "results",
+                "duration",
+                "warmup",
+            )
         ):
             setattr(ns, k, getattr(base, k))
     for k, v in overrides.items():
@@ -295,6 +309,13 @@ def main(argv: list[str] | None = None) -> int:
     codes: list[int] = []
     flags: list[str] = []
     try:
+        if args.scenario == "seed":
+            try:
+                seed_task.run(bench, args)
+            except BenchAbort as exc:
+                print(f"\nABORT: {exc}", file=sys.stderr)
+                return EXIT_ABORT
+            return EXIT_OK
         if args.scenario == "all":
             profile = FULL_PROFILE if args.full else QUICK_PROFILE
             label = "full" if args.full else "quick"
@@ -313,16 +334,13 @@ def main(argv: list[str] | None = None) -> int:
                         check_server(cfg.url)
                     except BenchAbort:
                         print(
-                            "server unreachable — skipping remaining "
-                            "scenarios",
+                            "server unreachable — skipping remaining scenarios",
                             file=sys.stderr,
                         )
                         break
         else:
             config = {"url": cfg.url, "profile": None}
-            code, scenario_flags = _run_scenario(
-                bench, args.scenario, args, config
-            )
+            code, scenario_flags = _run_scenario(bench, args.scenario, args, config)
             codes.append(code)
             flags.extend(scenario_flags)
     finally:

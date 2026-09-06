@@ -21,6 +21,9 @@ dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
     "prometheus-client>=0.20",
+    # Pinned: see pyhoglake's note — an unpinned ruff resolves a
+    # different rule set per machine.
+    "ruff==0.16.6",
 ]
 
 [tool.uv.sources]

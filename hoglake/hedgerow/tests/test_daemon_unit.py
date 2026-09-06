@@ -68,6 +68,7 @@ def make_config(
     max_rows: int = 100,
     filter_cfg: FilterConfig | None = None,
     poll: float = 0.0,
+    append_retries: int = 3,
 ) -> HedgerowConfig:
     return HedgerowConfig(
         source=SourceConfig(
@@ -85,6 +86,7 @@ def make_config(
             poll_interval_s=poll,
             max_snapshot_window=max_window,
             max_rows_per_append=max_rows,
+            max_append_retries=append_retries,
         ),
         metrics=MetricsConfig(port=0),
         filter=filter_cfg,
@@ -372,6 +374,70 @@ def test_crash_mid_window_never_moves_offset():
     assert env.offset() == 2
 
 
+# -- retryable commit conflicts (bugs.md #13) --------------------------------
+
+
+def test_retryable_conflict_retries_single_append_no_window_replay():
+    """A transient destination commit conflict is retried as a
+    duplicate-free single append; the window-replay path (which
+    duplicates prior appends) is never engaged."""
+    env = build_env(files={1: src_data([1, 2, 3])})
+    env.dest_table.conflict_first_n_appends = 2  # two conflicts, then success
+    sleeps: list[float] = []
+    env.daemon._sleep = sleeps.append
+
+    result = env.daemon.run_once()
+
+    assert result.rows_appended == 3 and result.appends == 1
+    assert env.dest_table.total_rows == 3  # appended exactly once — no dupes
+    assert env.offset() == 1  # offset correct after in-place retries
+    # the window was planned exactly once: no replay
+    assert [c for c in env.source_table.calls if c[0] == "changes"] == [
+        ("changes", 0, 1)
+    ]
+    assert sleeps == [0.1, 0.2]  # one short backoff per retry
+
+
+def test_conflict_retries_exhausted_escalate_to_window_replay():
+    """When the per-append retry budget runs out, the conflict propagates
+    and the EXISTING window-replay machinery takes over (unchanged)."""
+    env = build_env(
+        files={1: src_data([1, 2])},
+        config=make_config(poll=1.0, append_retries=1),
+    )
+    # cycle 1 burns conflicts 1+2 (initial + 1 retry) and escalates;
+    # the replayed cycle 2 hits conflict 3, retries, and succeeds.
+    env.dest_table.conflict_first_n_appends = 3
+
+    sleeps: list[float] = []
+
+    def fake_sleep(s: float) -> None:
+        sleeps.append(s)
+        if env.offset() == 1 and s == 1.0:  # caught-up sleep after success
+            raise StopLoop()
+
+    env.daemon._sleep = fake_sleep
+    with pytest.raises(StopLoop):
+        env.daemon.run_forever()
+
+    assert env.dest_table.total_rows == 2  # nothing landed twice
+    assert env.offset() == 1
+    # the window WAS replayed once (changes planned twice)
+    assert len([c for c in env.source_table.calls if c[0] == "changes"]) == 2
+    # backoff, replay sleep, backoff, caught-up sleep
+    assert sleeps == [0.1, 1.0, 0.1, 1.0]
+
+
+def test_conflict_retries_disabled_escalates_immediately():
+    from pyhoglake import CommitConflictError
+
+    env = build_env(files={1: src_data([1])}, config=make_config(append_retries=0))
+    env.dest_table.conflict_first_n_appends = 1
+    with pytest.raises(CommitConflictError):
+        env.daemon.run_once()
+    assert env.offset() is None  # offset never moves over a failed append
+
+
 # -- halt paths -------------------------------------------------------------
 
 
@@ -519,6 +585,61 @@ def test_run_forever_halt_propagates():
     env.daemon._sleep = lambda s: None
     with pytest.raises(DeletesPresentError):
         env.daemon.run_forever()
+
+
+def test_backlog_pacing_reobserves_head_after_cycle():
+    """bugs.md #22: the sleep decision must not trust the head sampled
+    BEFORE a (possibly long) cycle — head advancing mid-cycle is fresh
+    backlog, not caught-up."""
+    env = build_env(files={1: src_data([1])})  # head = 1 at cycle start
+    orig_append = env.dest_table.append
+
+    def append_then_advance(data, **kw):
+        r = orig_append(data, **kw)
+        env.source_catalog.head_snapshot_id = 2  # head moved during the cycle
+        return r
+
+    env.dest_table.append = append_then_advance
+    result = env.daemon.run_once()
+    assert result.committed_offset == 1
+    assert result.head_snapshot == 2  # the post-cycle observation
+    assert result.lag_snapshots == 1
+    assert result.backlog_remains  # run_forever drains instead of sleeping
+
+
+def test_run_forever_no_spurious_sleep_when_head_advances_mid_cycle():
+    env = build_env(files={1: src_data([1])}, config=make_config(poll=9.0))
+    orig_append = env.dest_table.append
+    advanced = {"done": False}
+
+    def append_then_advance(data, **kw):
+        r = orig_append(data, **kw)
+        if not advanced["done"]:
+            advanced["done"] = True
+            tbl = src_data([2])
+            env.tables_by_path["s3://fake/2.parquet"] = tbl
+            env.source_table.files_by_snapshot[2] = [
+                data_file("s3://fake/2.parquet", tbl.num_rows, 2, 2)
+            ]
+            env.source_catalog.head_snapshot_id = 2
+        return r
+
+    env.dest_table.append = append_then_advance
+
+    sleeps: list[float] = []
+
+    def fake_sleep(s: float) -> None:
+        sleeps.append(s)
+        raise StopLoop()  # first sleep ends the test
+
+    env.daemon._sleep = fake_sleep
+    with pytest.raises(StopLoop):
+        env.daemon.run_forever()
+    # both windows drained back-to-back; the only sleep is after real
+    # catch-up — never a nap on top of the mid-cycle backlog
+    assert env.offset() == 2
+    assert env.dest_table.total_rows == 2
+    assert sleeps == [9.0]
 
 
 def test_run_forever_retries_transient_errors():

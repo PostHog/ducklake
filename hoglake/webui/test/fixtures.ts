@@ -10,6 +10,7 @@ import type {
   ConsumerOffset,
   DataFile,
   Namespace,
+  PartitionStatsResponse,
   ScanFile,
   SnapshotPage,
   Table,
@@ -181,6 +182,44 @@ export const consumerOffsetsFixture: ConsumerOffset[] = [
     updated_at: "2026-09-04T10:12:11Z",
   },
 ];
+
+// GET /v1/catalogs/{c}/stats/partitions — server-ordered by debt_score desc.
+export const partitionStatsFixture: PartitionStatsResponse = {
+  partitions: [
+    {
+      namespace: "events",
+      table: "pageviews",
+      table_uuid: "3f2c9c04-8a1b-4c7e-9f10-6d2a5b3e8c71",
+      partition_values: [
+        { field: "team_id", value: "42" },
+        { field: "month", value: "2026-09" },
+      ],
+      spec_id: "3",
+      file_count: "120",
+      small_file_count: "118",
+      total_bytes: "5368709120",
+      small_file_bytes: "943718400",
+      avg_file_bytes: "44739242",
+      dv_count: "2",
+      debt_score: "118",
+    },
+    {
+      namespace: "events",
+      table: "clicks",
+      table_uuid: "b7e6d9a2-15f3-4b08-a4c9-0e8f7d6c5b4a",
+      partition_values: [],
+      spec_id: "0",
+      file_count: "40",
+      small_file_count: "9",
+      total_bytes: "268435456",
+      small_file_bytes: "9437184",
+      avg_file_bytes: "6710886",
+      dv_count: "0",
+      debt_score: "9",
+    },
+  ],
+  truncated: false,
+};
 
 export const notFoundError: ApiErrorBody = {
   error: "not_found",

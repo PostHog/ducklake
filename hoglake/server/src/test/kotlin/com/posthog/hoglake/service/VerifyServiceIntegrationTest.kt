@@ -71,6 +71,18 @@ class VerifyServiceIntegrationTest {
 
     private fun VerifyReport.check(name: String) = checks.single { it.check == name }
 
+    @Test
+    fun `a freshly created never-committed catalog passes every check`() {
+        // Pinned for bug hunt #14 (a FALSE finding, verified here at the
+        // service level): createCatalog seeds snapshot 0, so a
+        // never-committed catalog has head=0, earliest=0, count(*)=1 —
+        // exactly head - earliest + 1. Formula and seed agree.
+        catalogs.createCatalog("vfy-fresh", "s3://vfy/vfy-fresh")
+        val report = verify.runOnce("vfy-fresh")
+        assertThat(report.status).isEqualTo("pass")
+        assertThat(report.check("snapshot_density").violations).isZero()
+    }
+
     private fun assertOnlyFails(
         report: VerifyReport,
         vararg failing: String,

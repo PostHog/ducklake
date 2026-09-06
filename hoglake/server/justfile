@@ -50,3 +50,14 @@ run:
 
 clean:
     {{_gradle}} clean --console=plain
+
+# Swagger UI over the OpenAPI spec, live-reloading on file edits
+# (volume mount). http://localhost:8090 — HOGLAKE_SWAGGER_PORT overrides.
+docs:
+    docker run --rm -p ${HOGLAKE_SWAGGER_PORT:-8090}:8080 \
+        -e SWAGGER_JSON=/spec/hoglake.yaml \
+        -v {{justfile_directory()}}/src/main/resources/openapi:/spec:ro \
+        --name hoglake-swagger swaggerapi/swagger-ui
+
+docs-down:
+    docker rm -f hoglake-swagger
