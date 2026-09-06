@@ -1,0 +1,2 @@
+Invalid Error: Failed to delete flushed inlined data in DuckLake from table ducklake_inlined_data_1_3: Failed to execute query "SELECT "begin_snapshot", ctid FROM "public"."ducklake_inlined_data_1_3" WHERE "begin_snapshot" <= '30';": ERROR:  column "ctid" does not exist
+

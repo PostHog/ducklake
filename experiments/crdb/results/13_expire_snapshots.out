@@ -1,0 +1,2 @@
+Invalid Error: Failed to delete snapshots in DuckLake: Failed to execute query "SELECT "snapshot_id", ctid FROM "public"."ducklake_snapshot" WHERE ("snapshot_id" >= '0' AND "snapshot_id" <= '27');": ERROR:  column "ctid" does not exist
+
