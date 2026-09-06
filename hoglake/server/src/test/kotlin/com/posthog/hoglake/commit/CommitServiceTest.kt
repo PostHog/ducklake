@@ -18,7 +18,6 @@ import java.util.concurrent.TimeUnit
 
 @Tag("integration")
 class CommitServiceTest {
-
     private val db = PgTestSupport.freshDatabase()
     private val jdbi: Jdbi get() = db.jdbi
     private val service = CommitService(db.jdbi)
@@ -42,69 +41,79 @@ class CommitServiceTest {
         namespace: String = "ns",
         tableNames: List<String> = listOf("events"),
         columnsPerTable: Int = 2,
-    ): Fixture = jdbi.withHandle<Fixture, Exception> { h ->
-        val catalogId = h.createQuery(
-            "INSERT INTO hog_catalog (name, data_path) VALUES (?, ?) RETURNING catalog_id",
-        ).bind(0, catalogName).bind(1, "s3://bucket/$catalogName").mapTo(Long::class.java).one()
+    ): Fixture =
+        jdbi.withHandle<Fixture, Exception> { h ->
+            val catalogId =
+                h.createQuery(
+                    "INSERT INTO hog_catalog (name, data_path) VALUES (?, ?) RETURNING catalog_id",
+                ).bind(0, catalogName).bind(1, "s3://bucket/$catalogName").mapTo(Long::class.java).one()
 
-        val namespaceId = h.createQuery(
-            """
+            val namespaceId =
+                h.createQuery(
+                    """
             UPDATE hog_catalog SET next_namespace_id = next_namespace_id + 1
              WHERE catalog_id = ? RETURNING next_namespace_id - 1
             """,
-        ).bind(0, catalogId).mapTo(Long::class.java).one()
-        h.createUpdate(
-            "INSERT INTO hog_namespace (catalog_id, namespace_id, name) VALUES (?, ?, ?)",
-        ).bind(0, catalogId).bind(1, namespaceId).bind(2, namespace).execute()
+                ).bind(0, catalogId).mapTo(Long::class.java).one()
+            h.createUpdate(
+                "INSERT INTO hog_namespace (catalog_id, namespace_id, name) VALUES (?, ?, ?)",
+            ).bind(0, catalogId).bind(1, namespaceId).bind(2, namespace).execute()
 
-        val tables = tableNames.associateWith { name ->
-            val tableId = h.createQuery(
-                """
+            val tables =
+                tableNames.associateWith { name ->
+                    val tableId =
+                        h.createQuery(
+                            """
                 UPDATE hog_catalog SET next_table_id = next_table_id + 1
                  WHERE catalog_id = ? RETURNING next_table_id - 1
                 """,
-            ).bind(0, catalogId).mapTo(Long::class.java).one()
-            h.createUpdate(
-                """
+                        ).bind(0, catalogId).mapTo(Long::class.java).one()
+                    h.createUpdate(
+                        """
                 INSERT INTO hog_table (catalog_id, table_id, created_snapshot, next_field_id)
                 VALUES (?, ?, 0, ?)
                 """,
-            ).bind(0, catalogId).bind(1, tableId).bind(2, columnsPerTable + 1L).execute()
-            h.createUpdate(
-                """
+                    ).bind(0, catalogId).bind(1, tableId).bind(2, columnsPerTable + 1L).execute()
+                    h.createUpdate(
+                        """
                 INSERT INTO hog_table_version (catalog_id, table_id, begin_snapshot, namespace_id, name)
                 VALUES (?, ?, 0, ?, ?)
                 """,
-            ).bind(0, catalogId).bind(1, tableId).bind(2, namespaceId).bind(3, name).execute()
-            val fieldIds = (1L..columnsPerTable).toList()
-            for ((ordinal, fieldId) in fieldIds.withIndex()) {
-                h.createUpdate(
-                    """
+                    ).bind(0, catalogId).bind(1, tableId).bind(2, namespaceId).bind(3, name).execute()
+                    val fieldIds = (1L..columnsPerTable).toList()
+                    for ((ordinal, fieldId) in fieldIds.withIndex()) {
+                        h.createUpdate(
+                            """
                     INSERT INTO hog_column (catalog_id, table_id, field_id, begin_snapshot,
                                             name, col_type, ordinal)
                     VALUES (?, ?, ?, 0, ?, ?, ?)
                     """,
-                ).bind(0, catalogId).bind(1, tableId).bind(2, fieldId)
-                    .bind(3, "col$fieldId").bind(4, if (ordinal == 0) "long" else "string")
-                    .bind(5, ordinal).execute()
-            }
-            h.createUpdate(
-                "INSERT INTO hog_table_stats (catalog_id, table_id) VALUES (?, ?)",
-            ).bind(0, catalogId).bind(1, tableId).execute()
-            tableId to fieldIds
+                        ).bind(0, catalogId).bind(1, tableId).bind(2, fieldId)
+                            .bind(3, "col$fieldId").bind(4, if (ordinal == 0) "long" else "string")
+                            .bind(5, ordinal).execute()
+                    }
+                    h.createUpdate(
+                        "INSERT INTO hog_table_stats (catalog_id, table_id) VALUES (?, ?)",
+                    ).bind(0, catalogId).bind(1, tableId).execute()
+                    tableId to fieldIds
+                }
+            Fixture(catalogId, namespaceId, tables)
         }
-        Fixture(catalogId, namespaceId, tables)
-    }
 
     /** Mint a snapshot with one change row via direct SQL (DDL simulation). */
-    private fun seedChange(catalogId: Long, kind: String, objectId: Long): Long =
+    private fun seedChange(
+        catalogId: Long,
+        kind: String,
+        objectId: Long,
+    ): Long =
         jdbi.withHandle<Long, Exception> { h ->
-            val snapshotId = h.createQuery(
-                """
+            val snapshotId =
+                h.createQuery(
+                    """
                 UPDATE hog_catalog SET last_snapshot_id = last_snapshot_id + 1
                  WHERE catalog_id = ? RETURNING last_snapshot_id
                 """,
-            ).bind(0, catalogId).mapTo(Long::class.java).one()
+                ).bind(0, catalogId).mapTo(Long::class.java).one()
             h.createUpdate(
                 """
                 INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version)
@@ -128,9 +137,18 @@ class CommitServiceTest {
         stats: List<ColumnStats>? = null,
     ) = FileRegistration(path, records, bytes, footerSize, stats)
 
-    private fun stats(fieldId: Long, values: Long, nulls: Long = 0) = ColumnStats(
-        fieldId = fieldId, valueCount = values, nullCount = nulls, nanCount = null,
-        sizeBytes = values * 8, lowerBound = byteArrayOf(0), upperBound = byteArrayOf(127),
+    private fun stats(
+        fieldId: Long,
+        values: Long,
+        nulls: Long = 0,
+    ) = ColumnStats(
+        fieldId = fieldId,
+        valueCount = values,
+        nullCount = nulls,
+        nanCount = null,
+        sizeBytes = values * 8,
+        lowerBound = byteArrayOf(0),
+        upperBound = byteArrayOf(127),
     )
 
     private data class DbFile(
@@ -154,14 +172,22 @@ class CommitServiceTest {
                 """,
             ).bind(0, catalogId).map { rs, _ ->
                 DbFile(
-                    rs.getLong(1), rs.getLong(2), rs.getString(3), rs.getLong(4),
-                    rs.getLong(5), rs.getString(6), rs.getLong(7),
+                    rs.getLong(1),
+                    rs.getLong(2),
+                    rs.getString(3),
+                    rs.getLong(4),
+                    rs.getLong(5),
+                    rs.getString(6),
+                    rs.getLong(7),
                     rs.getLong(8).let { if (rs.wasNull()) null else it },
                 )
             }.list()
         }
 
-    private fun tableStats(catalogId: Long, tableId: Long): Triple<Long, Long, Long> =
+    private fun tableStats(
+        catalogId: Long,
+        tableId: Long,
+    ): Triple<Long, Long, Long> =
         jdbi.withHandle<Triple<Long, Long, Long>, Exception> { h ->
             h.createQuery(
                 """
@@ -179,7 +205,10 @@ class CommitServiceTest {
             ).bind(0, catalogId).mapTo(Long::class.java).list()
         }
 
-    private fun changeRows(catalogId: Long, snapshotId: Long): List<Pair<String, Long>> =
+    private fun changeRows(
+        catalogId: Long,
+        snapshotId: Long,
+    ): List<Pair<String, Long>> =
         jdbi.withHandle<List<Pair<String, Long>>, Exception> { h ->
             h.createQuery(
                 """
@@ -205,37 +234,51 @@ class CommitServiceTest {
         val fx = seed()
         val (tableId, fieldIds) = fx.tables.getValue("events")
 
-        val result = service.commit(
-            "cat",
-            CommitRequest(
-                readSnapshot = 0,
-                appends = listOf(
-                    TableAppend(
-                        "ns", "events",
+        val result =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = 0,
+                    appends =
                         listOf(
-                            file("s3://bucket/cat/f1.parquet", 10, 1000, stats = fieldIds.map { stats(it, 10) }),
-                            file("s3://bucket/cat/f2.parquet", 5, 500, stats = fieldIds.map { stats(it, 5, 1) }),
+                            TableAppend(
+                                "ns",
+                                "events",
+                                listOf(
+                                    file(
+                                        "s3://bucket/cat/f1.parquet",
+                                        10,
+                                        1000,
+                                        stats = fieldIds.map { stats(it, 10) },
+                                    ),
+                                    file(
+                                        "s3://bucket/cat/f2.parquet",
+                                        5,
+                                        500,
+                                        stats = fieldIds.map { stats(it, 5, 1) },
+                                    ),
+                                ),
+                            ),
                         ),
-                    ),
+                    author = "jakob",
+                    message = "first commit",
                 ),
-                author = "jakob",
-                message = "first commit",
-            ),
-        )
+            )
 
         assertThat(result.snapshotId).isEqualTo(1)
         assertThat(result.schemaVersion).isEqualTo(0)
 
         // Snapshot row + typed change row.
-        val snap = jdbi.withHandle<Triple<Long, String?, String?>, Exception> { h ->
-            h.createQuery(
-                """
+        val snap =
+            jdbi.withHandle<Triple<Long, String?, String?>, Exception> { h ->
+                h.createQuery(
+                    """
                 SELECT schema_version, author, commit_message FROM hog_snapshot
                  WHERE catalog_id = ? AND snapshot_id = 1
                 """,
-            ).bind(0, fx.catalogId)
-                .map { rs, _ -> Triple(rs.getLong(1), rs.getString(2), rs.getString(3)) }.one()
-        }
+                ).bind(0, fx.catalogId)
+                    .map { rs, _ -> Triple(rs.getLong(1), rs.getString(2), rs.getString(3)) }.one()
+            }
         assertThat(snap).isEqualTo(Triple(0L, "jakob", "first commit"))
         assertThat(changeRows(fx.catalogId, 1))
             .containsExactly("table_inserted_into" to tableId)
@@ -253,14 +296,15 @@ class CommitServiceTest {
 
         // Stats rows for every (file, field).
         assertThat(statsRowCount(fx.catalogId)).isEqualTo(4)
-        val nullCounts = jdbi.withHandle<Map<Long, Long>, Exception> { h ->
-            h.createQuery(
-                """
+        val nullCounts =
+            jdbi.withHandle<Map<Long, Long>, Exception> { h ->
+                h.createQuery(
+                    """
                 SELECT field_id, null_count FROM hog_file_column_stats
                  WHERE catalog_id = ? AND data_file_id = 2
                 """,
-            ).bind(0, fx.catalogId).map { rs, _ -> rs.getLong(1) to rs.getLong(2) }.list().toMap()
-        }
+                ).bind(0, fx.catalogId).map { rs, _ -> rs.getLong(1) to rs.getLong(2) }.list().toMap()
+            }
         assertThat(nullCounts).isEqualTo(mapOf(1L to 1L, 2L to 1L))
 
         // Rollup + row-id allocator advanced.
@@ -273,17 +317,19 @@ class CommitServiceTest {
         val (eventsId, _) = fx.tables.getValue("events")
         val (personsId, _) = fx.tables.getValue("persons")
 
-        val result = service.commit(
-            "cat",
-            CommitRequest(
-                appends = listOf(
-                    TableAppend("ns", "events", listOf(file("s3://b/e1.parquet", 3))),
-                    TableAppend("ns", "persons", listOf(file("s3://b/p1.parquet", 7))),
-                    // Duplicate (ns, table): merged into the first events append.
-                    TableAppend("ns", "events", listOf(file("s3://b/e2.parquet", 4))),
+        val result =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend("ns", "events", listOf(file("s3://b/e1.parquet", 3))),
+                            TableAppend("ns", "persons", listOf(file("s3://b/p1.parquet", 7))),
+                            // Duplicate (ns, table): merged into the first events append.
+                            TableAppend("ns", "events", listOf(file("s3://b/e2.parquet", 4))),
+                        ),
                 ),
-            ),
-        )
+            )
 
         assertThat(result.snapshotId).isEqualTo(1)
         // One snapshot, one change row per touched table.
@@ -311,9 +357,10 @@ class CommitServiceTest {
         service.commit(
             "cat",
             CommitRequest(
-                appends = listOf(
-                    TableAppend("ns", "events", listOf(file("s3://b/f.parquet", 9, stats = null))),
-                ),
+                appends =
+                    listOf(
+                        TableAppend("ns", "events", listOf(file("s3://b/f.parquet", 9, stats = null))),
+                    ),
             ),
         )
         val files = dataFiles(fx.catalogId)
@@ -330,12 +377,14 @@ class CommitServiceTest {
         service.commit(
             "cat",
             CommitRequest(
-                appends = listOf(
-                    TableAppend(
-                        "ns", "events",
-                        listOf(file("s3://b/a.parquet", 100), file("s3://b/b.parquet", 50)),
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "events",
+                            listOf(file("s3://b/a.parquet", 100), file("s3://b/b.parquet", 50)),
+                        ),
                     ),
-                ),
             ),
         )
         service.commit(
@@ -369,9 +418,10 @@ class CommitServiceTest {
                 "cat",
                 CommitRequest(
                     readSnapshot = 0,
-                    appends = listOf(
-                        TableAppend("ns", "events", listOf(file("s3://b/f.parquet", 10))),
-                    ),
+                    appends =
+                        listOf(
+                            TableAppend("ns", "events", listOf(file("s3://b/f.parquet", 10))),
+                        ),
                 ),
             )
         }.isInstanceOf(HoglakeException.CommitConflict::class.java)
@@ -399,10 +449,11 @@ class CommitServiceTest {
                 "cat",
                 CommitRequest(
                     readSnapshot = 0,
-                    appends = listOf(
-                        TableAppend("ns", "events", listOf(file("s3://b/f.parquet", 1))),
-                        TableAppend("ns", "persons", listOf(file("s3://b/g.parquet", 1))),
-                    ),
+                    appends =
+                        listOf(
+                            TableAppend("ns", "events", listOf(file("s3://b/f.parquet", 1))),
+                            TableAppend("ns", "persons", listOf(file("s3://b/g.parquet", 1))),
+                        ),
                 ),
             )
         }.isInstanceOf(HoglakeException.CommitConflict::class.java)
@@ -422,13 +473,14 @@ class CommitServiceTest {
         ) // snapshot 1: table_inserted_into on events
 
         // readSnapshot 0 predates snapshot 1 — but appends never conflict with appends.
-        val result = service.commit(
-            "cat",
-            CommitRequest(
-                readSnapshot = 0,
-                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/b.parquet", 5)))),
-            ),
-        )
+        val result =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = 0,
+                    appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/b.parquet", 5)))),
+                ),
+            )
         assertThat(result.snapshotId).isEqualTo(2)
     }
 
@@ -438,13 +490,14 @@ class CommitServiceTest {
         val (tableId, _) = fx.tables.getValue("events")
         seedChange(fx.catalogId, "table_altered", tableId)
 
-        val result = service.commit(
-            "cat",
-            CommitRequest(
-                readSnapshot = null,
-                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/f.parquet", 2)))),
-            ),
-        )
+        val result =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = null,
+                    appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/f.parquet", 2)))),
+                ),
+            )
         assertThat(result.snapshotId).isEqualTo(2)
         assertThat(dataFiles(fx.catalogId)).hasSize(1)
     }
@@ -471,10 +524,11 @@ class CommitServiceTest {
             service.commit(
                 "cat",
                 CommitRequest(
-                    appends = listOf(
-                        TableAppend("ns", "events", listOf(file("s3://b/ok.parquet", 1))),
-                        TableAppend("ns", "ghosts", listOf(file("s3://b/g.parquet", 1))),
-                    ),
+                    appends =
+                        listOf(
+                            TableAppend("ns", "events", listOf(file("s3://b/ok.parquet", 1))),
+                            TableAppend("ns", "ghosts", listOf(file("s3://b/g.parquet", 1))),
+                        ),
                 ),
             )
         }.isInstanceOf(HoglakeException.Validation::class.java)
@@ -492,12 +546,14 @@ class CommitServiceTest {
             service.commit(
                 "cat",
                 CommitRequest(
-                    appends = listOf(
-                        TableAppend(
-                            "ns", "events",
-                            listOf(file("s3://b/f.parquet", 1, stats = listOf(stats(99, 1)))),
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "events",
+                                listOf(file("s3://b/f.parquet", 1, stats = listOf(stats(99, 1)))),
+                            ),
                         ),
-                    ),
                 ),
             )
         }.isInstanceOf(HoglakeException.Validation::class.java)
@@ -511,12 +567,13 @@ class CommitServiceTest {
     @Test
     fun `negative counts and blank path are Validation`() {
         seed()
-        val cases = listOf(
-            FileRegistration("  ", 1, 1),
-            FileRegistration("s3://b/f.parquet", -1, 1),
-            FileRegistration("s3://b/f.parquet", 1, -1),
-            FileRegistration("s3://b/f.parquet", 1, 1, columnStats = listOf(stats(1, -1))),
-        )
+        val cases =
+            listOf(
+                FileRegistration("  ", 1, 1),
+                FileRegistration("s3://b/f.parquet", -1, 1),
+                FileRegistration("s3://b/f.parquet", 1, -1),
+                FileRegistration("s3://b/f.parquet", 1, 1, columnStats = listOf(stats(1, -1))),
+            )
         for (bad in cases) {
             assertThatThrownBy {
                 service.commit(
@@ -571,41 +628,45 @@ class CommitServiceTest {
         val start = CountDownLatch(1)
         val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
         try {
-            val futures = (0 until threads).map { t ->
-                pool.submit {
-                    start.await()
-                    for (c in 0 until commitsPerThread) {
-                        try {
-                            // Mix: mostly single-table appends rotating across
-                            // tables (same-table contention), every 4th commit
-                            // multi-table.
-                            val primary = tableNames[(t + c) % tableNames.size]
-                            val appends = mutableListOf(
-                                TableAppend(
-                                    "ns", primary,
-                                    listOf(
-                                        file("s3://b/$t-$c-0.parquet", (t + 1L) * 10 + c),
-                                        file("s3://b/$t-$c-1.parquet", c + 1L),
-                                    ),
-                                ),
-                            )
-                            if (c % 4 == 3) {
-                                val secondary = tableNames[(t + c + 1) % tableNames.size]
-                                appends += TableAppend(
-                                    "ns", secondary,
-                                    listOf(file("s3://b/$t-$c-2.parquet", 7)),
-                                )
+            val futures =
+                (0 until threads).map { t ->
+                    pool.submit {
+                        start.await()
+                        for (c in 0 until commitsPerThread) {
+                            try {
+                                // Mix: mostly single-table appends rotating across
+                                // tables (same-table contention), every 4th commit
+                                // multi-table.
+                                val primary = tableNames[(t + c) % tableNames.size]
+                                val appends =
+                                    mutableListOf(
+                                        TableAppend(
+                                            "ns",
+                                            primary,
+                                            listOf(
+                                                file("s3://b/$t-$c-0.parquet", (t + 1L) * 10 + c),
+                                                file("s3://b/$t-$c-1.parquet", c + 1L),
+                                            ),
+                                        ),
+                                    )
+                                if (c % 4 == 3) {
+                                    val secondary = tableNames[(t + c + 1) % tableNames.size]
+                                    appends +=
+                                        TableAppend(
+                                            "ns", secondary,
+                                            listOf(file("s3://b/$t-$c-2.parquet", 7)),
+                                        )
+                                }
+                                // Half blind, half with a (stale) readSnapshot: only
+                                // table_inserted_into changes exist, so both succeed.
+                                val readSnapshot = if (c % 2 == 0) null else 0L
+                                service.commit("cat", CommitRequest(readSnapshot, appends))
+                            } catch (e: Throwable) {
+                                failures.add(e)
                             }
-                            // Half blind, half with a (stale) readSnapshot: only
-                            // table_inserted_into changes exist, so both succeed.
-                            val readSnapshot = if (c % 2 == 0) null else 0L
-                            service.commit("cat", CommitRequest(readSnapshot, appends))
-                        } catch (e: Throwable) {
-                            failures.add(e)
                         }
                     }
                 }
-            }
             start.countDown()
             futures.forEach { it.get(120, TimeUnit.SECONDS) }
         } finally {

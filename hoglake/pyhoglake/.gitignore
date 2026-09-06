@@ -1,0 +1,12 @@
+.venv/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.flox/run/
+.flox/cache/
+.flox/lib/
+.flox/log/
+.flox/telemetry_id
+# uv.lock is tracked
+.hypothesis/

@@ -6,8 +6,13 @@ info:
     The hoglake control plane: a Postgres-native lakehouse catalog.
     Clients never touch the backing Postgres; parquet lives in object
     storage and is written by clients, registered here via
-    footer-shipping commits. Append-only v1: no delete files, no
-    row-level mutation. Auth is out of scope for v1.
+    footer-shipping commits. Row-level deletes are deletion vectors
+    (client-written puffin DVs, registered like files). Retention is a
+    catalog property with a consumer-offset floor. Auth is out of scope
+    for v1.
+
+    Malformed bodies/params and unknown request fields are 400
+    bad_request; semantic failures are 422.
 servers:
   - url: /v1
 paths:
@@ -38,6 +43,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Catalog" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Validation failure (bad name, blank data_path)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}:
     get:
@@ -84,6 +94,20 @@ paths:
               schema: { $ref: "#/components/schemas/Namespace" }
         "409": { $ref: "#/components/responses/Conflict" }
 
+  /catalogs/{catalog}/namespaces/{namespace}:
+    get:
+      operationId: getNamespace
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: Namespace
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /catalogs/{catalog}/namespaces/{namespace}/tables:
     get:
       operationId: listTables
@@ -116,6 +140,12 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Table" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Validation failure (bad name, no columns,
+            duplicate/unknown column types)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}:
     get:
@@ -126,6 +156,7 @@ paths:
         - { $ref: "#/components/parameters/namespace" }
         - { $ref: "#/components/parameters/table" }
         - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
       responses:
         "200":
           description: Table
@@ -133,6 +164,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Table" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
     delete:
       operationId: dropTable
       summary: Drop a table (DDL commit; produces a snapshot)
@@ -197,6 +229,7 @@ paths:
         - { $ref: "#/components/parameters/namespace" }
         - { $ref: "#/components/parameters/table" }
         - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
       responses:
         "200":
           description: Scan plan
@@ -206,6 +239,7 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ScanFile" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
     get:
@@ -216,6 +250,7 @@ paths:
         - { $ref: "#/components/parameters/namespace" }
         - { $ref: "#/components/parameters/table" }
         - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
       responses:
         "200":
           description: Files
@@ -225,6 +260,7 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/DataFile" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/changes:
     get:
@@ -253,7 +289,167 @@ paths:
               schema: { $ref: "#/components/schemas/ChangePlan" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410":
-          description: Range no longer available (expired below from_snapshot)
+          description: >
+            from_snapshot falls below the catalog's expiry floor
+            (earliest_snapshot_id): part of the range is gone. The
+            consumer must reconcile (re-read from a full scan) rather
+            than silently skip.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/options:
+    get:
+      operationId: getCatalogOptions
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Options
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogOptions" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: patchCatalogOptions
+      summary: >
+        Update retention options. snapshot_retention_seconds null
+        disables expiry; consumer_floor controls whether expiry stops at
+        the min consumer offset.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                snapshot_retention_seconds:
+                  type: integer
+                  format: int64
+                  nullable: true
+                consumer_floor: { type: boolean }
+      responses:
+        "200":
+          description: Updated options
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogOptions" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: Invalid values
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/maintenance/expire:
+    post:
+      operationId: runExpiry
+      summary: >
+        Run one incremental expiry sweep now (the background loop calls
+        the same path). Bounded per run; never expires head; respects
+        the consumer floor when enabled.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/maintenanceBatch" }
+      responses:
+        "200":
+          description: Sweep result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExpiryResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/maintenance/cleanup:
+    post:
+      operationId: runCleanup
+      summary: >
+        Drain one batch of the file-removal queue. Every entry is
+        liveness-checked against live references before physical
+        deletion; still-referenced entries are skipped and counted (an
+        invariant violation, never a deletion).
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/maintenanceBatch" }
+      responses:
+        "200":
+          description: Drain result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CleanupResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/views:
+    get:
+      operationId: listViews
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: Views live at head
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/View" }
+    post:
+      operationId: createView
+      summary: Create a view (DDL commit; view SQL is stored verbatim with its dialect)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, sql]
+              properties:
+                name: { type: string }
+                sql: { type: string }
+                dialect: { type: string, default: trino }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/View" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/views/{view}:
+    get:
+      operationId: getView
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - name: view
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: View
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/View" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: dropView
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - name: view
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Dropped; the snapshot that recorded it
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /catalogs/{catalog}/snapshots:
     get:
@@ -309,6 +505,71 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+
+  # ---- CDC publications (SPECIFIED, NOT YET IMPLEMENTED: all return 501) ----
+  # The WAL tap: a catalog-managed publication tails a table's changefeed
+  # and produces its rows directly to Kafka. The publisher's progress is a
+  # first-class consumer offset (consumer_id "publication:{name}"), so the
+  # retention floor protects an unpublished range exactly as it protects
+  # any lagging consumer. Delivery is at-least-once; records are keyed by
+  # (table_uuid, row_id) so compacted topics converge. Deletes are emitted
+  # from deletion-vector diffs as tombstone-shaped records.
+  /catalogs/{catalog}/publications:
+    get:
+      operationId: listPublications
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Publications
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Publication" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+    post:
+      operationId: createPublication
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePublicationRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Publication" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /catalogs/{catalog}/publications/{publication}:
+    get:
+      operationId: getPublication
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: publication
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Publication with live status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Publication" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+    delete:
+      operationId: dropPublication
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: publication
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Removed (its consumer offset is released) }
+        "501": { $ref: "#/components/responses/NotImplemented" }
 
   /catalogs/{catalog}/consumers/{consumer}/offsets:
     get:
@@ -383,12 +644,45 @@ components:
       name: snapshot
       in: query
       required: false
-      description: Time travel; defaults to head.
+      description: Time travel; defaults to head. Mutually exclusive
+        with at_timestamp.
       schema: { type: integer, format: int64 }
+    atTimestamp:
+      name: at_timestamp
+      in: query
+      required: false
+      description: >
+        Time travel by timestamp (ISO-8601 instant WITH a UTC offset,
+        e.g. 2026-09-05T00:00:00Z; an offset-less local datetime is a
+        400 bad_request): resolves to the largest snapshot with
+        snapshot_time <= at_timestamp. Mutually exclusive with snapshot
+        (422 if both). Before the earliest retained snapshot -> 410;
+        after head -> head.
+      schema: { type: string, format: date-time }
+    maintenanceBatch:
+      name: batch
+      in: query
+      required: false
+      description: Per-run bound override (expire default 10000
+        snapshots, cleanup default 2000 queue entries).
+      schema: { type: integer }
 
   responses:
+    NotImplemented:
+      description: Specified but not yet implemented.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
     NotFound:
       description: Not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    Gone:
+      description: >
+        The requested snapshot (or resolved timestamp) is below the
+        expiry floor — that history has been expired. Re-read at a
+        retained snapshot.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ApiError" }
@@ -666,7 +960,7 @@ components:
 
     ChangePlan:
       type: object
-      required: [table_uuid, from_snapshot, to_snapshot, files]
+      required: [table_uuid, from_snapshot, to_snapshot, files, delete_files]
       properties:
         table_uuid: { type: string, format: uuid }
         from_snapshot: { type: integer, format: int64 }
@@ -674,6 +968,52 @@ components:
         files:
           type: array
           items: { $ref: "#/components/schemas/DataFile" }
+        delete_files:
+          type: array
+          description: DVs registered in (from, to] — the deletions feed.
+          items: { $ref: "#/components/schemas/DeleteFile" }
+
+    View:
+      type: object
+      required: [name, namespace, view_uuid, dialect, sql]
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        view_uuid: { type: string, format: uuid }
+        dialect: { type: string }
+        sql: { type: string }
+
+    CatalogOptions:
+      type: object
+      required: [consumer_floor, earliest_snapshot_id]
+      properties:
+        snapshot_retention_seconds:
+          type: integer
+          format: int64
+          nullable: true
+        consumer_floor: { type: boolean }
+        earliest_snapshot_id: { type: integer, format: int64 }
+
+    ExpiryResult:
+      type: object
+      required: [snapshots_expired, data_files_queued, delete_files_queued,
+                 new_earliest_snapshot_id]
+      properties:
+        snapshots_expired: { type: integer, format: int64 }
+        data_files_queued: { type: integer, format: int64 }
+        delete_files_queued: { type: integer, format: int64 }
+        new_earliest_snapshot_id: { type: integer, format: int64 }
+        floored_by_consumer:
+          type: string
+          description: Consumer id pinning the floor, when the sweep was capped.
+
+    CleanupResult:
+      type: object
+      required: [removed, missing, still_referenced]
+      properties:
+        removed: { type: integer, format: int64 }
+        missing: { type: integer, format: int64 }
+        still_referenced: { type: integer, format: int64 }
 
     Snapshot:
       type: object
@@ -701,6 +1041,50 @@ components:
           type: array
           items: { $ref: "#/components/schemas/Snapshot" }
         has_more: { type: boolean }
+
+    KafkaSink:
+      type: object
+      required: [type, bootstrap_servers, topic]
+      properties:
+        type: { type: string, enum: [kafka] }
+        bootstrap_servers: { type: string }
+        topic: { type: string }
+        format:
+          type: string
+          enum: [arrow_ipc, json]
+          default: arrow_ipc
+          description: >
+            arrow_ipc: one record per Arrow IPC batch (efficient, typed).
+            json: one record per row (envelope
+            {op, snapshot_id, row_id, columns...}; deletes carry op +
+            row_id only).
+
+    CreatePublicationRequest:
+      type: object
+      required: [name, namespace, table, sink]
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        table: { type: string }
+        sink: { $ref: "#/components/schemas/KafkaSink" }
+        from_snapshot:
+          type: integer
+          format: int64
+          description: Start point; defaults to head at creation time.
+
+    Publication:
+      type: object
+      required: [name, table_uuid, sink, state, committed_snapshot]
+      properties:
+        name: { type: string }
+        table_uuid: { type: string, format: uuid }
+        sink: { $ref: "#/components/schemas/KafkaSink" }
+        state:
+          type: string
+          enum: [pending, active, halted]
+        committed_snapshot: { type: integer, format: int64 }
+        lag_snapshots: { type: integer, format: int64 }
+        last_error: { type: string }
 
     ConsumerOffset:
       type: object

@@ -1,0 +1,8 @@
+root = true
+
+[*.{kt,kts}]
+indent_size = 4
+max_line_length = 120
+ktlint_standard_no-wildcard-imports = enabled
+# Test names use backticked sentences; agents write descriptive names.
+ktlint_standard_function-naming = disabled

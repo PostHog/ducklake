@@ -1,6 +1,7 @@
 plugins {
     kotlin("jvm") version "2.2.0"
     application
+    id("org.jlleitschuh.gradle.ktlint") version "12.1.2"
 }
 
 group = "com.posthog.hoglake"
@@ -41,9 +42,12 @@ dependencies {
     implementation("software.amazon.awssdk:s3:$awsSdkVersion")
     implementation("dev.hardwood:hardwood-core:1.1.0.Beta1")
 
-    // Logging
+    // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.5.12")
     implementation("io.github.oshai:kotlin-logging-jvm:7.0.3")
+    implementation("net.logstash.logback:logstash-logback-encoder:8.0")
+    implementation("io.ktor:ktor-server-metrics-micrometer:$ktorVersion")
+    implementation("io.micrometer:micrometer-registry-prometheus:1.14.2")
 
     // Tests
     testImplementation(kotlin("test"))
@@ -57,6 +61,7 @@ dependencies {
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
     testImplementation("org.awaitility:awaitility:4.2.2")
+    testImplementation("io.kotest:kotest-property:5.9.1")
 }
 
 kotlin {

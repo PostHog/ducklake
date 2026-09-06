@@ -10,12 +10,16 @@ import org.jdbi.v3.core.statement.UnableToExecuteStatementException
  * requires emptiness); liveness is the `dropped` flag.
  */
 object NamespaceRepo {
-
     /**
      * Insert a namespace row. The live-name unique index backstops the
      * service-level duplicate check -> [HoglakeException.AlreadyExists].
      */
-    fun insert(handle: Handle, catalogId: Long, namespaceId: Long, name: String): NamespaceInfo =
+    fun insert(
+        handle: Handle,
+        catalogId: Long,
+        namespaceId: Long,
+        name: String,
+    ): NamespaceInfo =
         try {
             handle.createUpdate(
                 """
@@ -35,7 +39,11 @@ object NamespaceRepo {
             throw e
         }
 
-    fun findLiveByName(handle: Handle, catalogId: Long, name: String): NamespaceInfo? =
+    fun findLiveByName(
+        handle: Handle,
+        catalogId: Long,
+        name: String,
+    ): NamespaceInfo? =
         handle.createQuery(
             """
             SELECT namespace_id, name FROM hog_namespace
@@ -48,7 +56,10 @@ object NamespaceRepo {
             .findOne()
             .orElse(null)
 
-    fun listLive(handle: Handle, catalogId: Long): List<NamespaceInfo> =
+    fun listLive(
+        handle: Handle,
+        catalogId: Long,
+    ): List<NamespaceInfo> =
         handle.createQuery(
             """
             SELECT namespace_id, name FROM hog_namespace

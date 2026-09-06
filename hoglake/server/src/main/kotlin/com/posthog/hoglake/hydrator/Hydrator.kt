@@ -2,6 +2,7 @@ package com.posthog.hoglake.hydrator
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.observability.Metrics
 import dev.hardwood.InputFile
 import dev.hardwood.metadata.FileMetaData
 import dev.hardwood.reader.ParquetFileReader
@@ -45,9 +46,10 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
 
     /** One sweep: hydrate up to [limit] pending files. Returns files processed. */
     fun runOnce(limit: Int = 100): Int {
-        val pending = jdbi.withHandle<List<PendingFile>, Exception> { h ->
-            h.createQuery(
-                """
+        val pending =
+            jdbi.withHandle<List<PendingFile>, Exception> { h ->
+                h.createQuery(
+                    """
                 SELECT catalog_id, data_file_id, table_id, path, record_count,
                        file_size_bytes, footer_size
                 FROM hog_data_file
@@ -55,21 +57,21 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
                 ORDER BY catalog_id, data_file_id
                 LIMIT :limit
                 """,
-            )
-                .bind("limit", limit)
-                .map { rs, _ ->
-                    PendingFile(
-                        catalogId = rs.getLong("catalog_id"),
-                        dataFileId = rs.getLong("data_file_id"),
-                        tableId = rs.getLong("table_id"),
-                        path = rs.getString("path"),
-                        recordCount = rs.getLong("record_count"),
-                        fileSizeBytes = rs.getLong("file_size_bytes"),
-                        footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
-                    )
-                }
-                .list()
-        }
+                )
+                    .bind("limit", limit)
+                    .map { rs, _ ->
+                        PendingFile(
+                            catalogId = rs.getLong("catalog_id"),
+                            dataFileId = rs.getLong("data_file_id"),
+                            tableId = rs.getLong("table_id"),
+                            path = rs.getString("path"),
+                            recordCount = rs.getLong("record_count"),
+                            fileSizeBytes = rs.getLong("file_size_bytes"),
+                            footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
+                        )
+                    }
+                    .list()
+            }
         for (file in pending) {
             try {
                 hydrate(file)
@@ -91,21 +93,22 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
     fun startLoop(intervalMs: Long): AutoCloseable {
         if (intervalMs <= 0) return AutoCloseable { }
         val running = AtomicBoolean(true)
-        val worker = thread(name = "hoglake-hydrator", isDaemon = true) {
-            while (running.get()) {
-                try {
-                    runOnce()
-                } catch (e: Exception) {
-                    log.error(e) { "hydrator sweep failed" }
-                }
-                try {
-                    Thread.sleep(intervalMs)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    break
+        val worker =
+            thread(name = "hoglake-hydrator", isDaemon = true) {
+                while (running.get()) {
+                    try {
+                        runOnce()
+                    } catch (e: Exception) {
+                        log.error(e) { "hydrator sweep failed" }
+                    }
+                    try {
+                        Thread.sleep(intervalMs)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
                 }
             }
-        }
         return AutoCloseable {
             running.set(false)
             worker.interrupt()
@@ -128,26 +131,32 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
         val aggs = FooterStats.aggregate(meta, columns, file.path)
         jdbi.useTransaction<Exception> { h ->
             for (agg in aggs) upsertStats(h, file, agg)
-            val flipped = h.createUpdate(
-                """
+            val flipped =
+                h.createUpdate(
+                    """
                 UPDATE hog_data_file SET stats_state = 'provided'
                 WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
                   AND stats_state = 'pending'
                 """,
-            )
-                .bind("catalogId", file.catalogId)
-                .bind("dataFileId", file.dataFileId)
-                .execute()
+                )
+                    .bind("catalogId", file.catalogId)
+                    .bind("dataFileId", file.dataFileId)
+                    .execute()
             if (flipped == 0) {
                 log.warn {
                     "file ${file.dataFileId} left 'pending' concurrently; stats upserted anyway"
                 }
             }
         }
+        Metrics.statsHydrated("provided")
         log.debug { "hydrated file ${file.dataFileId} (${file.path}): ${aggs.size} column stats" }
     }
 
-    private fun upsertStats(h: Handle, file: PendingFile, agg: FooterStats.ColumnAgg) {
+    private fun upsertStats(
+        h: Handle,
+        file: PendingFile,
+        agg: FooterStats.ColumnAgg,
+    ) {
         h.createUpdate(
             """
             INSERT INTO hog_file_column_stats
@@ -177,6 +186,7 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
     }
 
     private fun markFailed(file: PendingFile) {
+        Metrics.statsHydrated("failed")
         try {
             jdbi.useHandle<Exception> { h ->
                 h.createUpdate(
@@ -213,9 +223,10 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
                         fieldId = rs.getLong("field_id"),
                         name = rs.getString("name"),
                         type = ColType.fromWire(rs.getString("col_type")),
-                        decimalScale = rs.getString("type_params")?.let { params ->
-                            json.readTree(params).get("scale")?.takeIf { it.isInt }?.asInt()
-                        },
+                        decimalScale =
+                            rs.getString("type_params")?.let { params ->
+                                json.readTree(params).get("scale")?.takeIf { it.isInt }?.asInt()
+                            },
                     )
                 }
                 .list()
@@ -239,10 +250,12 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
         return parseFooter(InputFile.of(ByteBuffer.wrap(bytes)))
     }
 
-    private fun parseFooter(input: InputFile): FileMetaData =
-        ParquetFileReader.open(input).use { it.fileMetaData }
+    private fun parseFooter(input: InputFile): FileMetaData = ParquetFileReader.open(input).use { it.fileMetaData }
 
-    private fun tailInput(file: PendingFile, footerSize: Long): InputFile {
+    private fun tailInput(
+        file: PendingFile,
+        footerSize: Long,
+    ): InputFile {
         val tailStart = file.fileSizeBytes - footerSize - FOOTER_SUFFIX
         val tail = store.getTail(file.path, tailStart)
         // Hardwood validates the leading "PAR1" magic at open, so fetch the
@@ -265,10 +278,17 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
         private val uri: String,
     ) : InputFile {
         override fun open() {}
+
         override fun length(): Long = totalLength
+
         override fun name(): String = uri
+
         override fun close() {}
-        override fun readRange(offset: Long, length: Int): ByteBuffer {
+
+        override fun readRange(
+            offset: Long,
+            length: Int,
+        ): ByteBuffer {
             if (offset >= 0 && offset + length <= prefix.size) {
                 return ByteBuffer.wrap(prefix, Math.toIntExact(offset), length).slice()
             }
@@ -291,8 +311,12 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
     }
 }
 
-private fun Update.bindNullableLong(name: String, value: Long?): Update =
-    if (value == null) bindNull(name, Types.BIGINT) else bind(name, value)
+private fun Update.bindNullableLong(
+    name: String,
+    value: Long?,
+): Update = if (value == null) bindNull(name, Types.BIGINT) else bind(name, value)
 
-private fun Update.bindNullableBytes(name: String, value: ByteArray?): Update =
-    if (value == null) bindNull(name, Types.BINARY) else bind(name, value)
+private fun Update.bindNullableBytes(
+    name: String,
+    value: ByteArray?,
+): Update = if (value == null) bindNull(name, Types.BINARY) else bind(name, value)

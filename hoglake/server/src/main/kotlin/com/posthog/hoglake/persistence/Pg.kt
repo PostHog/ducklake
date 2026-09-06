@@ -19,20 +19,15 @@ internal object Pg {
     private val mapType = object : TypeReference<Map<String, Any?>>() {}
 
     /** SQLSTATE of the underlying SQLException, or null if not one. */
-    fun sqlState(e: UnableToExecuteStatementException): String? =
-        (e.cause as? SQLException)?.sqlState
+    fun sqlState(e: UnableToExecuteStatementException): String? = (e.cause as? SQLException)?.sqlState
 
-    fun isUniqueViolation(e: UnableToExecuteStatementException): Boolean =
-        sqlState(e) == UNIQUE_VIOLATION
+    fun isUniqueViolation(e: UnableToExecuteStatementException): Boolean = sqlState(e) == UNIQUE_VIOLATION
 
-    fun isCheckViolation(e: UnableToExecuteStatementException): Boolean =
-        sqlState(e) == CHECK_VIOLATION
+    fun isCheckViolation(e: UnableToExecuteStatementException): Boolean = sqlState(e) == CHECK_VIOLATION
 
     /** Serialize column type params for a jsonb column; null stays null. */
-    fun toJson(params: Map<String, Any?>?): String? =
-        params?.let { json.writeValueAsString(it) }
+    fun toJson(params: Map<String, Any?>?): String? = params?.let { json.writeValueAsString(it) }
 
     /** Parse a jsonb column back into type params; null stays null. */
-    fun fromJson(s: String?): Map<String, Any?>? =
-        s?.let { json.readValue(it, mapType) }
+    fun fromJson(s: String?): Map<String, Any?>? = s?.let { json.readValue(it, mapType) }
 }

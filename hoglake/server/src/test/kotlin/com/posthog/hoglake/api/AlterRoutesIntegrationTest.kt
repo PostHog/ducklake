@@ -41,7 +41,6 @@ import java.util.concurrent.atomic.AtomicInteger
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class AlterRoutesIntegrationTest {
-
     private val db = PgTestSupport.freshDatabase()
     private val catalogs = CatalogService(db.jdbi)
     private val alter = AlterService(db.jdbi)
@@ -72,14 +71,16 @@ class AlterRoutesIntegrationTest {
             block(client)
         }
 
-    private suspend fun HttpClient.alterJson(path: String, body: String): HttpResponse =
+    private suspend fun HttpClient.alterJson(
+        path: String,
+        body: String,
+    ): HttpResponse =
         post(path) {
             contentType(ContentType.Application.Json)
             setBody(body)
         }
 
-    private suspend fun body(response: HttpResponse): JsonNode =
-        json.readTree(response.bodyAsText())
+    private suspend fun body(response: HttpResponse): JsonNode = json.readTree(response.bodyAsText())
 
     private suspend fun assertApiError(
         response: HttpResponse,
@@ -99,7 +100,9 @@ class AlterRoutesIntegrationTest {
         catalogs.createCatalog(cat, "s3://bucket/$cat")
         catalogs.createNamespace(cat, "ns")
         catalogs.createTable(
-            cat, "ns", "events",
+            cat,
+            "ns",
+            "events",
             listOf(
                 ColumnDef("id", ColType.LONG, nullable = false),
                 ColumnDef("ts", ColType.TIMESTAMPTZ),
@@ -111,11 +114,13 @@ class AlterRoutesIntegrationTest {
     // ---- happy path ------------------------------------------------------
 
     @Test
-    fun `alter happy path - add column and set spec, snake_case wire shape`() = api { client ->
-        val url = fixture()
-        val resp = client.alterJson(
-            url,
-            """
+    fun `alter happy path - add column and set spec, snake_case wire shape`() =
+        api { client ->
+            val url = fixture()
+            val resp =
+                client.alterJson(
+                    url,
+                    """
             {"ops": [
                 {"op": "add_column",
                  "column": {"name": "team_id", "type": "int", "nullable": false}},
@@ -126,121 +131,132 @@ class AlterRoutesIntegrationTest {
                  ]}
             ]}
             """,
-        )
-        assertThat(resp.status).isEqualTo(HttpStatusCode.OK)
-        val table = body(resp)
-        assertThat(table["name"].asText()).isEqualTo("events")
-        assertThat(table["namespace"].asText()).isEqualTo("ns")
-        assertThat(table["table_uuid"].asText()).isNotBlank()
-        assertThat(table["record_count"].asLong()).isEqualTo(0)
-        assertThat(table["file_count"].asLong()).isEqualTo(0)
-        assertThat(table["file_size_bytes"].asLong()).isEqualTo(0)
+                )
+            assertThat(resp.status).isEqualTo(HttpStatusCode.OK)
+            val table = body(resp)
+            assertThat(table["name"].asText()).isEqualTo("events")
+            assertThat(table["namespace"].asText()).isEqualTo("ns")
+            assertThat(table["table_uuid"].asText()).isNotBlank()
+            assertThat(table["record_count"].asLong()).isEqualTo(0)
+            assertThat(table["file_count"].asLong()).isEqualTo(0)
+            assertThat(table["file_size_bytes"].asLong()).isEqualTo(0)
 
-        val cols = table["columns"]
-        assertThat(cols.map { it["name"].asText() }).containsExactly("id", "ts", "team_id")
-        val added = cols[2]
-        assertThat(added["type"].asText()).isEqualTo("int")
-        assertThat(added["nullable"].asBoolean()).isFalse()
-        assertThat(added["field_id"].asLong()).isEqualTo(3)
-        assertThat(added["ordinal"].asInt()).isEqualTo(2)
+            val cols = table["columns"]
+            assertThat(cols.map { it["name"].asText() }).containsExactly("id", "ts", "team_id")
+            val added = cols[2]
+            assertThat(added["type"].asText()).isEqualTo("int")
+            assertThat(added["nullable"].asBoolean()).isFalse()
+            assertThat(added["field_id"].asLong()).isEqualTo(3)
+            assertThat(added["ordinal"].asInt()).isEqualTo(2)
 
-        val spec = table["partition_spec"]
-        assertThat(spec["spec_id"].asLong()).isEqualTo(1)
-        val fields = spec["fields"]
-        assertThat(fields).hasSize(2)
-        assertThat(fields[0]["source_field_id"].asLong()).isEqualTo(2)
-        assertThat(fields[0]["transform"].asText()).isEqualTo("day")
-        assertThat(fields[0].has("transform_param")).isFalse()
-        assertThat(fields[1]["transform"].asText()).isEqualTo("bucket")
-        assertThat(fields[1]["transform_param"].asInt()).isEqualTo(8)
-    }
+            val spec = table["partition_spec"]
+            assertThat(spec["spec_id"].asLong()).isEqualTo(1)
+            val fields = spec["fields"]
+            assertThat(fields).hasSize(2)
+            assertThat(fields[0]["source_field_id"].asLong()).isEqualTo(2)
+            assertThat(fields[0]["transform"].asText()).isEqualTo("day")
+            assertThat(fields[0].has("transform_param")).isFalse()
+            assertThat(fields[1]["transform"].asText()).isEqualTo("bucket")
+            assertThat(fields[1]["transform_param"].asInt()).isEqualTo(8)
+        }
 
     @Test
-    fun `unpartitioned table omits partition_spec entirely`() = api { client ->
-        val url = fixture()
-        val resp = client.alterJson(
-            url,
-            """{"ops": [{"op": "rename_column", "from": "ts", "to": "occurred_at"}]}""",
-        )
-        assertThat(resp.status).isEqualTo(HttpStatusCode.OK)
-        val table = body(resp)
-        assertThat(table.has("partition_spec")).isFalse()
-        assertThat(table["columns"].map { it["name"].asText() })
-            .containsExactly("id", "occurred_at")
-    }
+    fun `unpartitioned table omits partition_spec entirely`() =
+        api { client ->
+            val url = fixture()
+            val resp =
+                client.alterJson(
+                    url,
+                    """{"ops": [{"op": "rename_column", "from": "ts", "to": "occurred_at"}]}""",
+                )
+            assertThat(resp.status).isEqualTo(HttpStatusCode.OK)
+            val table = body(resp)
+            assertThat(table.has("partition_spec")).isFalse()
+            assertThat(table["columns"].map { it["name"].asText() })
+                .containsExactly("id", "occurred_at")
+        }
 
     // ---- error shapes ----------------------------------------------------
 
     @Test
-    fun `unknown op is 400 bad_request`() = api { client ->
-        val url = fixture()
-        val resp = client.alterJson(url, """{"ops": [{"op": "explode_table"}]}""")
-        val err = assertApiError(resp, HttpStatusCode.BadRequest, "bad_request")
-        assertThat(err["detail"].asText()).contains("explode_table")
-    }
-
-    @Test
-    fun `missing field for the chosen op is 400 bad_request`() = api { client ->
-        val url = fixture()
-        val cases = listOf(
-            """{"ops": [{"op": "add_column"}]}""",
-            """{"ops": [{"op": "drop_column"}]}""",
-            """{"ops": [{"op": "rename_column", "from": "id"}]}""",
-            """{"ops": [{"op": "rename_table"}]}""",
-            """{"ops": [{"op": "set_partition_spec"}]}""",
-        )
-        for (case in cases) {
-            assertApiError(client.alterJson(url, case), HttpStatusCode.BadRequest, "bad_request")
+    fun `unknown op is 400 bad_request`() =
+        api { client ->
+            val url = fixture()
+            val resp = client.alterJson(url, """{"ops": [{"op": "explode_table"}]}""")
+            val err = assertApiError(resp, HttpStatusCode.BadRequest, "bad_request")
+            assertThat(err["detail"].asText()).contains("explode_table")
         }
-    }
 
     @Test
-    fun `empty ops is 400 bad_request`() = api { client ->
-        val url = fixture()
-        assertApiError(
-            client.alterJson(url, """{"ops": []}"""),
-            HttpStatusCode.BadRequest,
-            "bad_request",
-        )
-    }
+    fun `missing field for the chosen op is 400 bad_request`() =
+        api { client ->
+            val url = fixture()
+            val cases =
+                listOf(
+                    """{"ops": [{"op": "add_column"}]}""",
+                    """{"ops": [{"op": "drop_column"}]}""",
+                    """{"ops": [{"op": "rename_column", "from": "id"}]}""",
+                    """{"ops": [{"op": "rename_table"}]}""",
+                    """{"ops": [{"op": "set_partition_spec"}]}""",
+                )
+            for (case in cases) {
+                assertApiError(client.alterJson(url, case), HttpStatusCode.BadRequest, "bad_request")
+            }
+        }
 
     @Test
-    fun `semantic failure is 422 validation`() = api { client ->
-        val url = fixture()
-        val resp = client.alterJson(url, """{"ops": [{"op": "drop_column", "name": "nope"}]}""")
-        val err = assertApiError(resp, HttpStatusCode.UnprocessableEntity, "validation")
-        assertThat(err["detail"].asText()).contains("nope")
-
-        // Illegal promotion.
-        assertApiError(
-            client.alterJson(
-                url,
-                """{"ops": [{"op": "promote_column", "name": "id", "to": "int"}]}""",
-            ),
-            HttpStatusCode.UnprocessableEntity,
-            "validation",
-        )
-    }
+    fun `empty ops is 400 bad_request`() =
+        api { client ->
+            val url = fixture()
+            assertApiError(
+                client.alterJson(url, """{"ops": []}"""),
+                HttpStatusCode.BadRequest,
+                "bad_request",
+            )
+        }
 
     @Test
-    fun `unknown table is 404 not_found`() = api { client ->
-        fixture()
-        val resp = client.alterJson(
-            "/v1/catalogs/no-such/namespaces/ns/tables/events/alter",
-            """{"ops": [{"op": "drop_column", "name": "ts"}]}""",
-        )
-        assertApiError(resp, HttpStatusCode.NotFound, "not_found")
-    }
+    fun `semantic failure is 422 validation`() =
+        api { client ->
+            val url = fixture()
+            val resp = client.alterJson(url, """{"ops": [{"op": "drop_column", "name": "nope"}]}""")
+            val err = assertApiError(resp, HttpStatusCode.UnprocessableEntity, "validation")
+            assertThat(err["detail"].asText()).contains("nope")
+
+            // Illegal promotion.
+            assertApiError(
+                client.alterJson(
+                    url,
+                    """{"ops": [{"op": "promote_column", "name": "id", "to": "int"}]}""",
+                ),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+        }
 
     @Test
-    fun `rename_table collision is 409 already_exists`() = api { client ->
-        val url = fixture()
-        val cat = url.removePrefix("/v1/catalogs/").substringBefore("/")
-        catalogs.createTable(cat, "ns", "taken", listOf(ColumnDef("id", ColType.LONG)))
-        val resp = client.alterJson(
-            url,
-            """{"ops": [{"op": "rename_table", "new_name": "taken"}]}""",
-        )
-        assertApiError(resp, HttpStatusCode.Conflict, "already_exists")
-    }
+    fun `unknown table is 404 not_found`() =
+        api { client ->
+            fixture()
+            val resp =
+                client.alterJson(
+                    "/v1/catalogs/no-such/namespaces/ns/tables/events/alter",
+                    """{"ops": [{"op": "drop_column", "name": "ts"}]}""",
+                )
+            assertApiError(resp, HttpStatusCode.NotFound, "not_found")
+        }
+
+    @Test
+    fun `rename_table collision is 409 already_exists`() =
+        api { client ->
+            val url = fixture()
+            val cat = url.removePrefix("/v1/catalogs/").substringBefore("/")
+            catalogs.createTable(cat, "ns", "taken", listOf(ColumnDef("id", ColType.LONG)))
+            val resp =
+                client.alterJson(
+                    url,
+                    """{"ops": [{"op": "rename_table", "new_name": "taken"}]}""",
+                )
+            assertApiError(resp, HttpStatusCode.Conflict, "already_exists")
+        }
 }

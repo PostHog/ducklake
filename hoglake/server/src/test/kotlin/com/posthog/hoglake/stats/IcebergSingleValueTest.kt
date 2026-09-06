@@ -20,7 +20,6 @@ import java.util.UUID
  * "Binary single-value serialization" section.
  */
 class IcebergSingleValueTest {
-
     private fun bytes(vararg b: Int): ByteArray = ByteArray(b.size) { b[it].toByte() }
 
     @Nested
@@ -308,21 +307,22 @@ class IcebergSingleValueTest {
 
         @Test
         fun `every ColType dispatches`() {
-            val samples = mapOf<ColType, Any>(
-                ColType.BOOLEAN to true,
-                ColType.INT to 1,
-                ColType.LONG to 1L,
-                ColType.FLOAT to 1f,
-                ColType.DOUBLE to 1.0,
-                ColType.DECIMAL to BigDecimal.ONE,
-                ColType.DATE to LocalDate.EPOCH,
-                ColType.TIME to LocalTime.NOON,
-                ColType.TIMESTAMP to LocalDateTime.of(2020, 1, 1, 0, 0),
-                ColType.TIMESTAMPTZ to Instant.EPOCH,
-                ColType.STRING to "s",
-                ColType.UUID_T to UUID.randomUUID(),
-                ColType.BINARY to byteArrayOf(1),
-            )
+            val samples =
+                mapOf<ColType, Any>(
+                    ColType.BOOLEAN to true,
+                    ColType.INT to 1,
+                    ColType.LONG to 1L,
+                    ColType.FLOAT to 1f,
+                    ColType.DOUBLE to 1.0,
+                    ColType.DECIMAL to BigDecimal.ONE,
+                    ColType.DATE to LocalDate.EPOCH,
+                    ColType.TIME to LocalTime.NOON,
+                    ColType.TIMESTAMP to LocalDateTime.of(2020, 1, 1, 0, 0),
+                    ColType.TIMESTAMPTZ to Instant.EPOCH,
+                    ColType.STRING to "s",
+                    ColType.UUID_T to UUID.randomUUID(),
+                    ColType.BINARY to byteArrayOf(1),
+                )
             for ((type, value) in samples) {
                 assertThat(IcebergSingleValue.encode(type, value)).isNotNull()
             }

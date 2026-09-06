@@ -1,6 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.model.CatalogInfo
+import com.posthog.hoglake.model.ChangesPlan
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
@@ -19,10 +20,11 @@ import com.posthog.hoglake.model.Snapshot
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.TableInfo
+import com.posthog.hoglake.model.ViewInfo
 import java.time.Instant
 import java.util.UUID
 
-/**
+/*
  * Wire DTOs mirroring the OpenAPI schemas (openapi/hoglake.yaml).
  *
  * Naming: Kotlin camelCase properties; the ObjectMapper installed in
@@ -67,16 +69,18 @@ data class ColumnDefDto(
     val typeParams: Map<String, Any?>? = null,
     val nullable: Boolean = true,
 ) {
-    fun toModel(): ColumnDef = ColumnDef(
-        name = name,
-        type = try {
-            ColType.fromWire(type)
-        } catch (_: IllegalArgumentException) {
-            throw HoglakeException.Validation("unknown column type '$type' for column '$name'")
-        },
-        typeParams = typeParams,
-        nullable = nullable,
-    )
+    fun toModel(): ColumnDef =
+        ColumnDef(
+            name = name,
+            type =
+                try {
+                    ColType.fromWire(type)
+                } catch (_: IllegalArgumentException) {
+                    throw HoglakeException.Validation("unknown column type '$type' for column '$name'")
+                },
+            typeParams = typeParams,
+            nullable = nullable,
+        )
 }
 
 data class CreateTableRequestDto(val name: String, val columns: List<ColumnDefDto>)
@@ -90,14 +94,15 @@ data class ColumnDto(
     val ordinal: Int,
 )
 
-fun Column.toDto() = ColumnDto(
-    name = def.name,
-    type = def.type.wire,
-    typeParams = def.typeParams,
-    nullable = def.nullable,
-    fieldId = fieldId,
-    ordinal = ordinal,
-)
+fun Column.toDto() =
+    ColumnDto(
+        name = def.name,
+        type = def.type.wire,
+        typeParams = def.typeParams,
+        nullable = def.nullable,
+        fieldId = fieldId,
+        ordinal = ordinal,
+    )
 
 data class TableSummaryDto(val name: String, val tableUuid: UUID)
 
@@ -111,17 +116,24 @@ data class TableDto(
     val recordCount: Long,
     val fileCount: Long,
     val fileSizeBytes: Long,
+    /**
+     * The spec visible at the requested snapshot (AlterDto's shape);
+     * NON_NULL omits it for an unpartitioned table.
+     */
+    val partitionSpec: AlterPartitionSpecDto? = null,
 )
 
-fun TableInfo.toDto() = TableDto(
-    name = name,
-    namespace = namespace,
-    tableUuid = tableUuid,
-    columns = columns.map { it.toDto() },
-    recordCount = recordCount,
-    fileCount = fileCount,
-    fileSizeBytes = fileSizeBytes,
-)
+fun TableInfo.toDto() =
+    TableDto(
+        name = name,
+        namespace = namespace,
+        tableUuid = tableUuid,
+        columns = columns.map { it.toDto() },
+        recordCount = recordCount,
+        fileCount = fileCount,
+        fileSizeBytes = fileSizeBytes,
+        partitionSpec = partitionSpec?.toAlterDto(),
+    )
 
 // ---- commits -------------------------------------------------------------
 
@@ -134,15 +146,16 @@ data class ColumnStatsDto(
     val lowerBound: ByteArray? = null,
     val upperBound: ByteArray? = null,
 ) {
-    fun toModel() = ColumnStats(
-        fieldId = fieldId,
-        valueCount = valueCount,
-        nullCount = nullCount,
-        nanCount = nanCount,
-        sizeBytes = sizeBytes,
-        lowerBound = lowerBound,
-        upperBound = upperBound,
-    )
+    fun toModel() =
+        ColumnStats(
+            fieldId = fieldId,
+            valueCount = valueCount,
+            nullCount = nullCount,
+            nanCount = nanCount,
+            sizeBytes = sizeBytes,
+            lowerBound = lowerBound,
+            upperBound = upperBound,
+        )
 
     // ByteArray members: identity equals/hashCode are fine — DTOs are
     // one-way carriers, never compared.
@@ -156,14 +169,15 @@ data class FileRegistrationDto(
     val columnStats: List<ColumnStatsDto>? = null,
     val partitionValues: List<String?>? = null,
 ) {
-    fun toModel() = FileRegistration(
-        path = path,
-        recordCount = recordCount,
-        fileSizeBytes = fileSizeBytes,
-        footerSize = footerSize,
-        columnStats = columnStats?.map { it.toModel() },
-        partitionValues = partitionValues,
-    )
+    fun toModel() =
+        FileRegistration(
+            path = path,
+            recordCount = recordCount,
+            fileSizeBytes = fileSizeBytes,
+            footerSize = footerSize,
+            columnStats = columnStats?.map { it.toModel() },
+            partitionValues = partitionValues,
+        )
 }
 
 data class TableAppendDto(
@@ -185,12 +199,13 @@ data class DeleteFileRegistrationDto(
     val deleteCount: Long,
     val fileSizeBytes: Long,
 ) {
-    fun toModel() = DeleteFileRegistration(
-        dataFileId = dataFileId,
-        path = path,
-        deleteCount = deleteCount,
-        fileSizeBytes = fileSizeBytes,
-    )
+    fun toModel() =
+        DeleteFileRegistration(
+            dataFileId = dataFileId,
+            path = path,
+            deleteCount = deleteCount,
+            fileSizeBytes = fileSizeBytes,
+        )
 }
 
 data class TableDeletesDto(
@@ -215,13 +230,14 @@ data class CommitRequestDto(
     val author: String? = null,
     val message: String? = null,
 ) {
-    fun toModel() = CommitRequest(
-        readSnapshot = readSnapshot,
-        appends = appends.map { it.toModel() },
-        deletes = deletes.map { it.toModel() },
-        author = author,
-        message = message,
-    )
+    fun toModel() =
+        CommitRequest(
+            readSnapshot = readSnapshot,
+            appends = appends.map { it.toModel() },
+            deletes = deletes.map { it.toModel() },
+            author = author,
+            message = message,
+        )
 }
 
 data class CommitResultDto(val snapshotId: Long, val schemaVersion: Long)
@@ -246,19 +262,20 @@ data class DataFileDto(
     val partitionValues: List<String?>? = null,
 )
 
-fun DataFile.toDto() = DataFileDto(
-    dataFileId = dataFileId,
-    path = path,
-    fileFormat = fileFormat,
-    recordCount = recordCount,
-    fileSizeBytes = fileSizeBytes,
-    footerSize = footerSize,
-    rowIdStart = rowIdStart,
-    statsState = statsState.wire,
-    beginSnapshot = beginSnapshot,
-    specId = specId,
-    partitionValues = partitionValues,
-)
+fun DataFile.toDto() =
+    DataFileDto(
+        dataFileId = dataFileId,
+        path = path,
+        fileFormat = fileFormat,
+        recordCount = recordCount,
+        fileSizeBytes = fileSizeBytes,
+        footerSize = footerSize,
+        rowIdStart = rowIdStart,
+        statsState = statsState.wire,
+        beginSnapshot = beginSnapshot,
+        specId = specId,
+        partitionValues = partitionValues,
+    )
 
 // ---- scan planning -------------------------------------------------------
 
@@ -272,31 +289,70 @@ data class DeleteFileDto(
     val beginSnapshot: Long,
 )
 
-fun DeleteFile.toDto() = DeleteFileDto(
-    deleteFileId = deleteFileId,
-    dataFileId = dataFileId,
-    path = path,
-    fileFormat = fileFormat,
-    deleteCount = deleteCount,
-    fileSizeBytes = fileSizeBytes,
-    beginSnapshot = beginSnapshot,
-)
+fun DeleteFile.toDto() =
+    DeleteFileDto(
+        deleteFileId = deleteFileId,
+        dataFileId = dataFileId,
+        path = path,
+        fileFormat = fileFormat,
+        deleteCount = deleteCount,
+        fileSizeBytes = fileSizeBytes,
+        beginSnapshot = beginSnapshot,
+    )
 
 data class ScanFileDto(
     val dataFile: DataFileDto,
     val deleteFile: DeleteFileDto? = null,
 )
 
-fun ScanFile.toDto() = ScanFileDto(
-    dataFile = dataFile.toDto(),
-    deleteFile = deleteFile?.toDto(),
-)
+fun ScanFile.toDto() =
+    ScanFileDto(
+        dataFile = dataFile.toDto(),
+        deleteFile = deleteFile?.toDto(),
+    )
 
 data class ChangePlanDto(
     val tableUuid: UUID,
     val fromSnapshot: Long,
     val toSnapshot: Long,
     val files: List<DataFileDto>,
+    /** DVs registered in (from, to] — the deletions feed. */
+    val deleteFiles: List<DeleteFileDto>,
+)
+
+fun ChangesPlan.toDto() =
+    ChangePlanDto(
+        tableUuid = tableUuid,
+        fromSnapshot = fromSnapshot,
+        toSnapshot = toSnapshot,
+        files = files.map { it.toDto() },
+        deleteFiles = deleteFiles.map { it.toDto() },
+    )
+
+// ---- views ---------------------------------------------------------------
+
+data class ViewDto(
+    val name: String,
+    val namespace: String,
+    val viewUuid: UUID,
+    val dialect: String,
+    val sql: String,
+)
+
+fun ViewInfo.toDto() =
+    ViewDto(
+        name = name,
+        namespace = namespace,
+        viewUuid = viewUuid,
+        dialect = dialect,
+        sql = sql,
+    )
+
+data class CreateViewRequestDto(
+    val name: String,
+    /** Stored verbatim — the server never parses view SQL. */
+    val sql: String,
+    val dialect: String = "trino",
 )
 
 // ---- snapshots -----------------------------------------------------------
@@ -312,14 +368,15 @@ data class SnapshotDto(
     val changes: List<SnapshotChangeDto>,
 )
 
-fun Snapshot.toDto() = SnapshotDto(
-    snapshotId = snapshotId,
-    snapshotTime = snapshotTime,
-    schemaVersion = schemaVersion,
-    author = author,
-    message = message,
-    changes = changes.map { SnapshotChangeDto(it.kind.wire, it.objectId) },
-)
+fun Snapshot.toDto() =
+    SnapshotDto(
+        snapshotId = snapshotId,
+        snapshotTime = snapshotTime,
+        schemaVersion = schemaVersion,
+        author = author,
+        message = message,
+        changes = changes.map { SnapshotChangeDto(it.kind.wire, it.objectId) },
+    )
 
 data class SnapshotPageDto(val snapshots: List<SnapshotDto>, val hasMore: Boolean)
 

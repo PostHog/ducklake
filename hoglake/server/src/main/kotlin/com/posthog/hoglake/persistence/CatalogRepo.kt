@@ -16,23 +16,27 @@ data class SnapshotAlloc(val snapshotId: Long, val schemaVersion: Long)
  * callers own that discipline.
  */
 object CatalogRepo {
-
-    private val catalogMapper = RowMapper { rs, _ ->
-        CatalogInfo(
-            catalogId = rs.getLong("catalog_id"),
-            name = rs.getString("name"),
-            dataPath = rs.getString("data_path"),
-            headSnapshotId = rs.getLong("last_snapshot_id"),
-            schemaVersion = rs.getLong("schema_version"),
-        )
-    }
+    private val catalogMapper =
+        RowMapper { rs, _ ->
+            CatalogInfo(
+                catalogId = rs.getLong("catalog_id"),
+                name = rs.getString("name"),
+                dataPath = rs.getString("data_path"),
+                headSnapshotId = rs.getLong("last_snapshot_id"),
+                schemaVersion = rs.getLong("schema_version"),
+            )
+        }
 
     /**
      * Insert a new catalog with all allocators at their defaults.
      * Duplicate name -> [HoglakeException.AlreadyExists]; a name failing
      * the schema CHECK -> [HoglakeException.Validation].
      */
-    fun insert(handle: Handle, name: String, dataPath: String): CatalogInfo =
+    fun insert(
+        handle: Handle,
+        name: String,
+        dataPath: String,
+    ): CatalogInfo =
         try {
             handle.createQuery(
                 """
@@ -57,7 +61,10 @@ object CatalogRepo {
             }
         }
 
-    fun findByName(handle: Handle, name: String): CatalogInfo? =
+    fun findByName(
+        handle: Handle,
+        name: String,
+    ): CatalogInfo? =
         handle.createQuery(
             """
             SELECT catalog_id, name, data_path, last_snapshot_id, schema_version
@@ -83,7 +90,10 @@ object CatalogRepo {
      * Mint the next snapshot id (and schema version) for a DDL/commit
      * tail. Caller must hold the catalog commit lock.
      */
-    fun allocateSnapshot(handle: Handle, catalogId: Long): SnapshotAlloc =
+    fun allocateSnapshot(
+        handle: Handle,
+        catalogId: Long,
+    ): SnapshotAlloc =
         handle.createQuery(
             """
             UPDATE hog_catalog
@@ -98,7 +108,10 @@ object CatalogRepo {
             .one()
 
     /** Allocate the next namespace id. Caller holds the commit lock. */
-    fun allocateNamespaceId(handle: Handle, catalogId: Long): Long =
+    fun allocateNamespaceId(
+        handle: Handle,
+        catalogId: Long,
+    ): Long =
         handle.createQuery(
             """
             UPDATE hog_catalog SET next_namespace_id = next_namespace_id + 1
@@ -111,7 +124,10 @@ object CatalogRepo {
             .one()
 
     /** Allocate the next table id. Caller holds the commit lock. */
-    fun allocateTableId(handle: Handle, catalogId: Long): Long =
+    fun allocateTableId(
+        handle: Handle,
+        catalogId: Long,
+    ): Long =
         handle.createQuery(
             """
             UPDATE hog_catalog SET next_table_id = next_table_id + 1

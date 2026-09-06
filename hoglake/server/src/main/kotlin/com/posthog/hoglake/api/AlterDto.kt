@@ -10,7 +10,7 @@ import com.posthog.hoglake.model.Transform
 import io.ktor.server.plugins.BadRequestException
 import java.util.UUID
 
-/**
+/*
  * Wire DTOs for the /alter endpoint (openapi/hoglake.yaml: AlterOp,
  * PartitionField, PartitionSpec, Table-with-partition_spec).
  *
@@ -33,19 +33,20 @@ data class AlterPartitionFieldDto(
     val transform: String,
     val transformParam: Int? = null,
 ) {
-    fun toModel() = PartitionFieldDef(
-        sourceFieldId = sourceFieldId,
-        transform = try {
-            Transform.fromWire(transform)
-        } catch (_: IllegalArgumentException) {
-            throw HoglakeException.Validation("unknown partition transform '$transform'")
-        },
-        transformParam = transformParam,
-    )
+    fun toModel() =
+        PartitionFieldDef(
+            sourceFieldId = sourceFieldId,
+            transform =
+                try {
+                    Transform.fromWire(transform)
+                } catch (_: IllegalArgumentException) {
+                    throw HoglakeException.Validation("unknown partition transform '$transform'")
+                },
+            transformParam = transformParam,
+        )
 }
 
-fun PartitionFieldDef.toAlterDto() =
-    AlterPartitionFieldDto(sourceFieldId, transform.wire, transformParam)
+fun PartitionFieldDef.toAlterDto() = AlterPartitionFieldDto(sourceFieldId, transform.wire, transformParam)
 
 data class AlterPartitionSpecDto(
     val specId: Long,
@@ -66,26 +67,30 @@ data class AlterOpDto(
     val newName: String? = null,
     val fields: List<AlterPartitionFieldDto>? = null,
 ) {
-    fun toModel(): AlterOp = when (op) {
-        "add_column" -> AlterOp.AddColumn(required(column, "column").toModel())
-        "drop_column" -> AlterOp.DropColumn(required(name, "name"))
-        "rename_column" -> AlterOp.RenameColumn(required(from, "from"), required(to, "to"))
-        "promote_column" ->
-            AlterOp.PromoteColumn(required(name, "name"), parseColType(required(to, "to")))
-        "rename_table" -> AlterOp.RenameTable(required(newName, "new_name"))
-        "set_partition_spec" ->
-            AlterOp.SetPartitionSpec(required(fields, "fields").map { it.toModel() })
-        else -> throw BadRequestException("unknown alter op '$op'")
-    }
+    fun toModel(): AlterOp =
+        when (op) {
+            "add_column" -> AlterOp.AddColumn(required(column, "column").toModel())
+            "drop_column" -> AlterOp.DropColumn(required(name, "name"))
+            "rename_column" -> AlterOp.RenameColumn(required(from, "from"), required(to, "to"))
+            "promote_column" ->
+                AlterOp.PromoteColumn(required(name, "name"), parseColType(required(to, "to")))
+            "rename_table" -> AlterOp.RenameTable(required(newName, "new_name"))
+            "set_partition_spec" ->
+                AlterOp.SetPartitionSpec(required(fields, "fields").map { it.toModel() })
+            else -> throw BadRequestException("unknown alter op '$op'")
+        }
 
-    private fun <T : Any> required(value: T?, field: String): T =
-        value ?: throw BadRequestException("op '$op' requires field '$field'")
+    private fun <T : Any> required(
+        value: T?,
+        field: String,
+    ): T = value ?: throw BadRequestException("op '$op' requires field '$field'")
 
-    private fun parseColType(s: String): ColType = try {
-        ColType.fromWire(s)
-    } catch (_: IllegalArgumentException) {
-        throw HoglakeException.Validation("unknown column type '$s'")
-    }
+    private fun parseColType(s: String): ColType =
+        try {
+            ColType.fromWire(s)
+        } catch (_: IllegalArgumentException) {
+            throw HoglakeException.Validation("unknown column type '$s'")
+        }
 }
 
 data class AlterTableRequestDto(val ops: List<AlterOpDto> = emptyList())
@@ -104,13 +109,14 @@ data class AlteredTableDto(
     val partitionSpec: AlterPartitionSpecDto? = null,
 )
 
-fun TableInfo.toAlteredDto() = AlteredTableDto(
-    name = name,
-    namespace = namespace,
-    tableUuid = tableUuid,
-    columns = columns.map { it.toDto() },
-    recordCount = recordCount,
-    fileCount = fileCount,
-    fileSizeBytes = fileSizeBytes,
-    partitionSpec = partitionSpec?.toAlterDto(),
-)
+fun TableInfo.toAlteredDto() =
+    AlteredTableDto(
+        name = name,
+        namespace = namespace,
+        tableUuid = tableUuid,
+        columns = columns.map { it.toDto() },
+        recordCount = recordCount,
+        fileCount = fileCount,
+        fileSizeBytes = fileSizeBytes,
+        partitionSpec = partitionSpec?.toAlterDto(),
+    )

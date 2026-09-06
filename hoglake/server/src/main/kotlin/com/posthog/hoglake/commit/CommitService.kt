@@ -5,6 +5,8 @@ import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.observability.Audit
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -56,11 +58,52 @@ import org.jdbi.v3.core.Jdbi
  * deletes).
  */
 class CommitService(private val jdbi: Jdbi) {
+    private companion object {
+        /**
+         * Per-file record_count sanity cap (2^48 ≈ 281T rows). No real
+         * parquet file gets anywhere close; the cap keeps a hostile
+         * registration from racing the row-id allocator toward overflow.
+         */
+        const val MAX_FILE_RECORD_COUNT: Long = 1L shl 48
+    }
 
-    fun commit(catalog: String, request: CommitRequest): CommitResult =
-        jdbi.inTransaction<CommitResult, RuntimeException> { handle ->
-            doCommit(handle, catalog, request)
-        }
+    /**
+     * Commit entry point. Metrics + audit are emitted HERE, after the
+     * transaction has committed (or rolled back on the way out as an
+     * exception) — never inside it.
+     */
+    fun commit(
+        catalog: String,
+        request: CommitRequest,
+    ): CommitResult {
+        val files = request.appends.sumOf { it.files.size }
+        val deletes = request.deletes.sumOf { it.files.size }
+        val result =
+            try {
+                jdbi.inTransaction<CommitResult, RuntimeException> { handle ->
+                    doCommit(handle, catalog, request)
+                }
+            } catch (e: HoglakeException) {
+                Metrics.commitFailureResult(e)?.let { Metrics.commitRecorded(catalog, it) }
+                Audit.event(
+                    action = "commit",
+                    catalog = catalog,
+                    obj = null,
+                    outcome = Audit.failureOutcome(e),
+                    detail = e.message,
+                )
+                throw e
+            }
+        Metrics.commitRecorded(catalog, "committed")
+        Audit.event(
+            action = "commit",
+            catalog = catalog,
+            obj = null,
+            outcome = "committed",
+            detail = "snapshot=${result.snapshotId} files=$files deletes=$deletes",
+        )
+        return result
+    }
 
     /** Live partition spec header: id + field arity. */
     private data class LiveSpec(val specId: Long, val fieldCount: Int)
@@ -81,21 +124,27 @@ class CommitService(private val jdbi: Jdbi) {
         val files: List<DeleteFileRegistration>,
     )
 
-    private fun doCommit(h: Handle, catalogName: String, req: CommitRequest): CommitResult {
+    private fun doCommit(
+        h: Handle,
+        catalogName: String,
+        req: CommitRequest,
+    ): CommitResult {
         // 1. Resolve catalog, then serialize the commit tail.
-        val catalogId = h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = ?")
-            .bind(0, catalogName)
-            .mapTo(Long::class.java)
-            .findOne()
-            .orElseThrow { HoglakeException.NotFound("catalog '$catalogName'") }
+        val catalogId =
+            h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = ?")
+                .bind(0, catalogName)
+                .mapTo(Long::class.java)
+                .findOne()
+                .orElseThrow { HoglakeException.NotFound("catalog '$catalogName'") }
         Locks.acquireCatalogCommitLock(h, catalogId)
 
-        val (head, schemaVersion) = h.createQuery(
-            "SELECT last_snapshot_id, schema_version FROM hog_catalog WHERE catalog_id = ?",
-        )
-            .bind(0, catalogId)
-            .map { rs, _ -> rs.getLong(1) to rs.getLong(2) }
-            .one()
+        val (head, schemaVersion) =
+            h.createQuery(
+                "SELECT last_snapshot_id, schema_version FROM hog_catalog WHERE catalog_id = ?",
+            )
+                .bind(0, catalogId)
+                .map { rs, _ -> rs.getLong(1) to rs.getLong(2) }
+                .one()
 
         // 2. Merge duplicate (namespace, table) appends/deletes, preserving
         // request order (first occurrence for tables, concatenation for
@@ -114,26 +163,35 @@ class CommitService(private val jdbi: Jdbi) {
             throw HoglakeException.Validation("commit has no appends or deletes")
         }
         val readSnapshot = req.readSnapshot
+        if (readSnapshot != null && readSnapshot < 0) {
+            throw HoglakeException.Validation(
+                "read_snapshot must be >= 0, got $readSnapshot",
+            )
+        }
         if (mergedDeletes.isNotEmpty() && readSnapshot == null) {
             throw HoglakeException.Validation(
                 "read_snapshot is required when the commit contains deletes",
             )
         }
-        val resolvedAppends = mergedAppends.map { (key, files) ->
-            val (namespace, table) = key
-            val tableId = resolveLiveTable(h, catalogId, namespace, table)
-                ?: throw HoglakeException.Validation("unknown table $namespace.$table")
-            ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId))
-        }
+        val resolvedAppends =
+            mergedAppends.map { (key, files) ->
+                val (namespace, table) = key
+                val tableId =
+                    resolveLiveTable(h, catalogId, namespace, table)
+                        ?: throw HoglakeException.Validation("unknown table $namespace.$table")
+                ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId))
+            }
         val appendTableIdByName =
             resolvedAppends.associate { (it.namespace to it.table) to it.tableId }
-        val resolvedDeletes = mergedDeletes.map { (key, files) ->
-            val (namespace, table) = key
-            val tableId = appendTableIdByName[key]
-                ?: resolveLiveTable(h, catalogId, namespace, table)
-                ?: throw HoglakeException.Validation("unknown table $namespace.$table")
-            ResolvedDeletes(namespace, table, tableId, files)
-        }
+        val resolvedDeletes =
+            mergedDeletes.map { (key, files) ->
+                val (namespace, table) = key
+                val tableId =
+                    appendTableIdByName[key]
+                        ?: resolveLiveTable(h, catalogId, namespace, table)
+                        ?: throw HoglakeException.Validation("unknown table $namespace.$table")
+                ResolvedDeletes(namespace, table, tableId, files)
+            }
 
         // 3. Structural validation. Nothing is written unless all of it passes.
         for (append in resolvedAppends) {
@@ -163,19 +221,20 @@ class CommitService(private val jdbi: Jdbi) {
         val appendFileCount = resolvedAppends.sumOf { it.files.size }
         val deleteFileCount = resolvedDeletes.sumOf { it.files.size }
         val totalFiles = appendFileCount + deleteFileCount
-        val (snapshotId, firstFileId) = h.createQuery(
-            """
+        val (snapshotId, firstFileId) =
+            h.createQuery(
+                """
             UPDATE hog_catalog
                SET last_snapshot_id = last_snapshot_id + 1,
                    next_file_id = next_file_id + ?
              WHERE catalog_id = ?
             RETURNING last_snapshot_id, next_file_id
             """,
-        )
-            .bind(0, totalFiles)
-            .bind(1, catalogId)
-            .map { rs, _ -> rs.getLong(1) to (rs.getLong(2) - totalFiles) }
-            .one()
+            )
+                .bind(0, totalFiles)
+                .bind(1, catalogId)
+                .map { rs, _ -> rs.getLong(1) to (rs.getLong(2) - totalFiles) }
+                .one()
 
         // 6. Writes: snapshot, change rows, then appends before deletes (a
         // delete targeting a same-commit data file is detected below by its
@@ -193,12 +252,13 @@ class CommitService(private val jdbi: Jdbi) {
             .bind("message", req.message)
             .execute()
 
-        val changeBatch = h.prepareBatch(
-            """
+        val changeBatch =
+            h.prepareBatch(
+                """
             INSERT INTO hog_snapshot_change (catalog_id, snapshot_id, kind, object_id)
             VALUES (:catalogId, :snapshotId, :kind, :tableId)
             """,
-        )
+            )
         for (append in resolvedAppends) {
             changeBatch
                 .bind("catalogId", catalogId)
@@ -233,8 +293,9 @@ class CommitService(private val jdbi: Jdbi) {
         resolved: List<ResolvedAppend>,
     ): Long {
         if (resolved.isEmpty()) return firstFileId
-        val fileBatch = h.prepareBatch(
-            """
+        val fileBatch =
+            h.prepareBatch(
+                """
             INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
                                        path, record_count, file_size_bytes, footer_size,
                                        row_id_start, stats_state, spec_id)
@@ -242,9 +303,10 @@ class CommitService(private val jdbi: Jdbi) {
                     :path, :recordCount, :fileSizeBytes, :footerSize,
                     :rowIdStart, :statsState, :specId)
             """,
-        )
-        val statsBatch = h.prepareBatch(
-            """
+            )
+        val statsBatch =
+            h.prepareBatch(
+                """
             INSERT INTO hog_file_column_stats (catalog_id, data_file_id, field_id, value_count,
                                                null_count, nan_count, size_bytes,
                                                lower_bound, upper_bound)
@@ -252,42 +314,72 @@ class CommitService(private val jdbi: Jdbi) {
                     :nullCount, :nanCount, :sizeBytes,
                     :lowerBound, :upperBound)
             """,
-        )
-        val partitionBatch = h.prepareBatch(
-            """
+            )
+        val partitionBatch =
+            h.prepareBatch(
+                """
             INSERT INTO hog_file_partition_value (catalog_id, data_file_id, key_index, value)
             VALUES (:catalogId, :dataFileId, :keyIndex, :value)
             """,
-        )
+            )
         var nextFileId = firstFileId
         var haveStats = false
         var havePartitionValues = false
         for (append in resolved) {
-            val recordSum = append.files.sumOf { it.recordCount }
+            // The per-table record sum and the allocator advancement are
+            // both overflow-checked (Math.addExact): a wrapped sum would
+            // hand out negative / reused row-id ranges, silently breaking
+            // THE lineage guarantee. The CHECK (next_row_id >= 0) on
+            // hog_table_stats is the DB backstop for the same invariant.
+            val recordSum =
+                try {
+                    append.files.fold(0L) { acc, f -> Math.addExact(acc, f.recordCount) }
+                } catch (_: ArithmeticException) {
+                    throw HoglakeException.Validation("record_count sum overflows row-id space")
+                }
             val byteSum = append.files.sumOf { it.fileSizeBytes }
-            // Per-table row-id range, advanced with the table's rollup in one
-            // statement; each file gets a contiguous slice in request order.
-            var rowId = h.createQuery(
+            // Per-table row-id range: read the allocator, advance it with
+            // the table's rollup (safe read-then-write — the per-catalog
+            // advisory lock serializes every writer); each file gets a
+            // contiguous slice in request order.
+            val rowIdStart =
+                h.createQuery(
+                    """
+                SELECT next_row_id FROM hog_table_stats
+                 WHERE catalog_id = :catalogId AND table_id = :tableId
+                """,
+                )
+                    .bind("catalogId", catalogId)
+                    .bind("tableId", append.tableId)
+                    .mapTo(Long::class.java)
+                    .findOne()
+                    .orElseThrow {
+                        IllegalStateException(
+                            "missing hog_table_stats row for table_id=${append.tableId}",
+                        )
+                    }
+            val newNextRowId =
+                try {
+                    Math.addExact(rowIdStart, recordSum)
+                } catch (_: ArithmeticException) {
+                    throw HoglakeException.Validation("record_count sum overflows row-id space")
+                }
+            h.createUpdate(
                 """
                 UPDATE hog_table_stats
-                   SET next_row_id = next_row_id + :records,
+                   SET next_row_id = :newNextRowId,
                        record_count = record_count + :records,
                        file_size_bytes = file_size_bytes + :bytes
                  WHERE catalog_id = :catalogId AND table_id = :tableId
-                RETURNING next_row_id
                 """,
             )
+                .bind("newNextRowId", newNextRowId)
                 .bind("records", recordSum)
                 .bind("bytes", byteSum)
                 .bind("catalogId", catalogId)
                 .bind("tableId", append.tableId)
-                .mapTo(Long::class.java)
-                .findOne()
-                .orElseThrow {
-                    IllegalStateException(
-                        "missing hog_table_stats row for table_id=${append.tableId}",
-                    )
-                } - recordSum
+                .execute()
+            var rowId = rowIdStart
 
             for (file in append.files) {
                 val dataFileId = nextFileId++
@@ -357,36 +449,38 @@ class CommitService(private val jdbi: Jdbi) {
         if (resolved.isEmpty()) return
         checkNotNull(readSnapshot) { "deletes require a readSnapshot (validated earlier)" }
         var nextFileId = firstFileId
-        val insertBatch = h.prepareBatch(
-            """
+        val insertBatch =
+            h.prepareBatch(
+                """
             INSERT INTO hog_delete_file (catalog_id, delete_file_id, table_id, data_file_id,
                                          begin_snapshot, path, delete_count, file_size_bytes)
             VALUES (:catalogId, :deleteFileId, :tableId, :dataFileId,
                     :beginSnapshot, :path, :deleteCount, :fileSizeBytes)
             """,
-        )
+            )
         for (deletes in resolved) {
             val qualified = "${deletes.namespace}.${deletes.table}"
             for (reg in deletes.files) {
-                val target = h.createQuery(
-                    """
+                val target =
+                    h.createQuery(
+                        """
                     SELECT table_id, record_count, begin_snapshot,
                            (end_snapshot IS NULL) AS live
                       FROM hog_data_file
                      WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
                     """,
-                )
-                    .bind("catalogId", catalogId)
-                    .bind("dataFileId", reg.dataFileId)
-                    .map { rs, _ ->
-                        Triple(rs.getLong(1), rs.getLong(2), rs.getLong(3)) to rs.getBoolean(4)
-                    }
-                    .findOne()
-                    .orElseThrow {
-                        HoglakeException.Validation(
-                            "delete for $qualified targets unknown data_file_id ${reg.dataFileId}",
-                        )
-                    }
+                    )
+                        .bind("catalogId", catalogId)
+                        .bind("dataFileId", reg.dataFileId)
+                        .map { rs, _ ->
+                            Triple(rs.getLong(1), rs.getLong(2), rs.getLong(3)) to rs.getBoolean(4)
+                        }
+                        .findOne()
+                        .orElseThrow {
+                            HoglakeException.Validation(
+                                "delete for $qualified targets unknown data_file_id ${reg.dataFileId}",
+                            )
+                        }
                 val (tableIdRecordsBegin, live) = target
                 val (targetTableId, recordCount, targetBegin) = tableIdRecordsBegin
                 if (targetBegin == snapshotId) {
@@ -418,19 +512,20 @@ class CommitService(private val jdbi: Jdbi) {
                 // DV registered after the writer's readSnapshot means the new
                 // vector was built without seeing it — retryable conflict,
                 // regardless of counts.
-                val current = h.createQuery(
-                    """
+                val current =
+                    h.createQuery(
+                        """
                     SELECT delete_file_id, delete_count, begin_snapshot
                       FROM hog_delete_file
                      WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
                        AND end_snapshot IS NULL
                     """,
-                )
-                    .bind("catalogId", catalogId)
-                    .bind("dataFileId", reg.dataFileId)
-                    .map { rs, _ -> Triple(rs.getLong(1), rs.getLong(2), rs.getLong(3)) }
-                    .findOne()
-                    .orElse(null)
+                    )
+                        .bind("catalogId", catalogId)
+                        .bind("dataFileId", reg.dataFileId)
+                        .map { rs, _ -> Triple(rs.getLong(1), rs.getLong(2), rs.getLong(3)) }
+                        .findOne()
+                        .orElse(null)
                 if (current != null) {
                     val (currentId, currentCount, currentBegin) = current
                     if (currentBegin > readSnapshot) {
@@ -479,8 +574,9 @@ class CommitService(private val jdbi: Jdbi) {
         catalogId: Long,
         namespace: String,
         table: String,
-    ): Long? = h.createQuery(
-        """
+    ): Long? =
+        h.createQuery(
+            """
         SELECT tv.table_id
           FROM hog_table_version tv
           JOIN hog_namespace ns
@@ -494,19 +590,26 @@ class CommitService(private val jdbi: Jdbi) {
            AND NOT ns.dropped
            AND t.dropped_snapshot IS NULL
         """,
-    )
-        .bind("catalogId", catalogId)
-        .bind("namespace", namespace)
-        .bind("table", table)
-        .mapTo(Long::class.java)
-        .findOne()
-        .orElse(null)
+        )
+            .bind("catalogId", catalogId)
+            .bind("namespace", namespace)
+            .bind("table", table)
+            .mapTo(Long::class.java)
+            .findOne()
+            .orElse(null)
 
     /**
      * The table's live partition spec, or null when unpartitioned. A spec
      * with zero fields (SetPartitionSpec([])) is unpartitioned too.
+     * Deliberately inline rather than persistence/SpecRepo.specAt: the
+     * commit tail only needs the spec header + field COUNT (one query),
+     * not the full field list.
      */
-    private fun liveSpec(h: Handle, catalogId: Long, tableId: Long): LiveSpec? =
+    private fun liveSpec(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+    ): LiveSpec? =
         h.createQuery(
             """
             SELECT ps.spec_id,
@@ -525,7 +628,11 @@ class CommitService(private val jdbi: Jdbi) {
             .orElse(null)
             ?.takeIf { it.fieldCount > 0 }
 
-    private fun validateFiles(h: Handle, catalogId: Long, append: ResolvedAppend) {
+    private fun validateFiles(
+        h: Handle,
+        catalogId: Long,
+        append: ResolvedAppend,
+    ) {
         val qualified = "${append.namespace}.${append.table}"
         val liveFieldIds: Set<Long> by lazy {
             h.createQuery(
@@ -546,6 +653,12 @@ class CommitService(private val jdbi: Jdbi) {
             if (file.recordCount < 0) {
                 throw HoglakeException.Validation(
                     "negative record_count for ${file.path} in $qualified",
+                )
+            }
+            if (file.recordCount > MAX_FILE_RECORD_COUNT) {
+                throw HoglakeException.Validation(
+                    "record_count ${file.recordCount} for ${file.path} in $qualified exceeds " +
+                        "the per-file cap $MAX_FILE_RECORD_COUNT (2^48); no real file has that many rows",
                 )
             }
             if (file.fileSizeBytes < 0) {
@@ -639,20 +752,21 @@ class CommitService(private val jdbi: Jdbi) {
         readSnapshot: Long,
         nameByTableId: Map<Long, String>,
     ) {
-        val conflicted = h.createQuery(
-            """
+        val conflicted =
+            h.createQuery(
+                """
             SELECT DISTINCT object_id FROM hog_snapshot_change
              WHERE catalog_id = :catalogId
                AND kind IN ('table_dropped', 'table_altered')
                AND object_id IN (<tableIds>)
                AND snapshot_id > :readSnapshot
             """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("readSnapshot", readSnapshot)
-            .bindList("tableIds", nameByTableId.keys.toList())
-            .mapTo(Long::class.java)
-            .list()
+            )
+                .bind("catalogId", catalogId)
+                .bind("readSnapshot", readSnapshot)
+                .bindList("tableIds", nameByTableId.keys.toList())
+                .mapTo(Long::class.java)
+                .list()
         if (conflicted.isNotEmpty()) {
             val names = conflicted.mapNotNull(nameByTableId::get).sorted()
             throw HoglakeException.CommitConflict(

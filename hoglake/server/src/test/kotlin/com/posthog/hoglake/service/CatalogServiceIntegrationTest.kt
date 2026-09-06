@@ -17,7 +17,6 @@ import org.junit.jupiter.api.TestInstance
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class CatalogServiceIntegrationTest {
-
     private val db = PgTestSupport.freshDatabase()
     private val svc = CatalogService(db.jdbi)
 
@@ -110,11 +109,13 @@ class CatalogServiceIntegrationTest {
     fun `createTable assigns 1-based field ids and positional ordinals`() {
         svc.createCatalog("tbl-cat", "s3://bucket/t")
         svc.createNamespace("tbl-cat", "ns")
-        val decimalCol = ColumnDef(
-            "amount", ColType.DECIMAL,
-            typeParams = mapOf("precision" to 38, "scale" to 9),
-            nullable = false,
-        )
+        val decimalCol =
+            ColumnDef(
+                "amount",
+                ColType.DECIMAL,
+                typeParams = mapOf("precision" to 38, "scale" to 9),
+                nullable = false,
+            )
         val t = svc.createTable("tbl-cat", "ns", "events", listOf(idCol, nameCol, decimalCol))
 
         assertThat(t.columns).hasSize(3)
@@ -141,21 +142,23 @@ class CatalogServiceIntegrationTest {
             .isEqualTo(mapOf("precision" to 38, "scale" to 9))
 
         // The field-id allocator advanced past the assigned ids.
-        val nextFieldId = db.jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                "SELECT next_field_id FROM hog_table WHERE catalog_id = :cid AND table_id = :tid",
-            ).bind("cid", cat.catalogId).bind("tid", t.tableId)
-                .mapTo(Long::class.javaObjectType).one()
-        }
+        val nextFieldId =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT next_field_id FROM hog_table WHERE catalog_id = :cid AND table_id = :tid",
+                ).bind("cid", cat.catalogId).bind("tid", t.tableId)
+                    .mapTo(Long::class.javaObjectType).one()
+            }
         assertThat(nextFieldId).isEqualTo(4)
 
         // hog_table_stats row exists.
-        val statsRows = db.jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                "SELECT count(*) FROM hog_table_stats WHERE catalog_id = :cid AND table_id = :tid",
-            ).bind("cid", cat.catalogId).bind("tid", t.tableId)
-                .mapTo(Long::class.javaObjectType).one()
-        }
+        val statsRows =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_table_stats WHERE catalog_id = :cid AND table_id = :tid",
+                ).bind("cid", cat.catalogId).bind("tid", t.tableId)
+                    .mapTo(Long::class.javaObjectType).one()
+            }
         assertThat(statsRows).isEqualTo(1)
     }
 
@@ -242,29 +245,32 @@ class CatalogServiceIntegrationTest {
 
         // The drop end-snapshotted identity, version, columns, and files.
         db.jdbi.withHandleUnchecked { h ->
-            val droppedSnapshot = h.createQuery(
-                "SELECT dropped_snapshot FROM hog_table WHERE catalog_id = :cid AND table_id = :tid",
-            ).bind("cid", catId).bind("tid", t.tableId)
-                .mapTo(Long::class.javaObjectType).one()
+            val droppedSnapshot =
+                h.createQuery(
+                    "SELECT dropped_snapshot FROM hog_table WHERE catalog_id = :cid AND table_id = :tid",
+                ).bind("cid", catId).bind("tid", t.tableId)
+                    .mapTo(Long::class.javaObjectType).one()
             assertThat(droppedSnapshot).isEqualTo(drop.snapshotId)
 
             for (table in listOf("hog_table_version", "hog_column", "hog_data_file")) {
-                val liveRows = h.createQuery(
-                    """
+                val liveRows =
+                    h.createQuery(
+                        """
                     SELECT count(*) FROM $table
                     WHERE catalog_id = :cid AND table_id = :tid AND end_snapshot IS NULL
                     """,
-                ).bind("cid", catId).bind("tid", t.tableId)
-                    .mapTo(Long::class.javaObjectType).one()
+                    ).bind("cid", catId).bind("tid", t.tableId)
+                        .mapTo(Long::class.javaObjectType).one()
                 assertThat(liveRows).describedAs("live rows left in %s", table).isZero()
 
-                val endedAtDrop = h.createQuery(
-                    """
+                val endedAtDrop =
+                    h.createQuery(
+                        """
                     SELECT count(*) FROM $table
                     WHERE catalog_id = :cid AND table_id = :tid AND end_snapshot = :snap
                     """,
-                ).bind("cid", catId).bind("tid", t.tableId).bind("snap", drop.snapshotId)
-                    .mapTo(Long::class.javaObjectType).one()
+                    ).bind("cid", catId).bind("tid", t.tableId).bind("snap", drop.snapshotId)
+                        .mapTo(Long::class.javaObjectType).one()
                 assertThat(endedAtDrop).describedAs("rows ended at drop in %s", table)
                     .isGreaterThan(0)
             }

@@ -10,15 +10,15 @@ import java.util.UUID
 
 /** hog_consumer_offset: the per-consumer committed-offset log primitive. */
 object OffsetRepo {
-
-    private val offsetMapper = RowMapper { rs, _ ->
-        ConsumerOffset(
-            consumerId = rs.getString("consumer_id"),
-            tableUuid = rs.getObject("table_uuid") as UUID,
-            committedSnapshot = rs.getLong("committed_snapshot"),
-            updatedAt = rs.getObject("updated_at", OffsetDateTime::class.java).toInstant(),
-        )
-    }
+    private val offsetMapper =
+        RowMapper { rs, _ ->
+            ConsumerOffset(
+                consumerId = rs.getString("consumer_id"),
+                tableUuid = rs.getObject("table_uuid") as UUID,
+                committedSnapshot = rs.getLong("committed_snapshot"),
+                updatedAt = rs.getObject("updated_at", OffsetDateTime::class.java).toInstant(),
+            )
+        }
 
     /**
      * Monotonic upsert: the update only fires when the stored offset is
@@ -60,7 +60,11 @@ object OffsetRepo {
             throw e
         }
 
-    fun list(handle: Handle, catalogId: Long, consumerId: String): List<ConsumerOffset> =
+    fun list(
+        handle: Handle,
+        catalogId: Long,
+        consumerId: String,
+    ): List<ConsumerOffset> =
         handle.createQuery(
             """
             SELECT consumer_id, table_uuid, committed_snapshot, updated_at

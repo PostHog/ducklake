@@ -8,8 +8,10 @@ import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.TableRepo
+import com.posthog.hoglake.persistence.TimeTravelRepo
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
+import java.time.Instant
 
 /**
  * Read planning: the data files visible at a snapshot, each paired with
@@ -26,30 +28,59 @@ import org.jdbi.v3.core.kotlin.withHandleUnchecked
  * written under a partition spec.
  */
 class ScanService(private val jdbi: Jdbi) {
-
     fun planScan(
         catalog: String,
         namespace: String,
         table: String,
         snapshot: Long? = null,
-    ): List<ScanFile> = jdbi.withHandleUnchecked { h ->
-        val cat = CatalogRepo.findByName(h, catalog)
-            ?: throw HoglakeException.NotFound("catalog '$catalog'")
-        val at = snapshot ?: cat.headSnapshotId
-        if (at < 0 || at > cat.headSnapshotId) {
-            throw HoglakeException.Validation(
-                "snapshot $at out of range [0, ${cat.headSnapshotId}] for catalog '${cat.name}'",
-            )
-        }
-        val ns = NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)
-            ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
-        val t = TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
-            ?: throw HoglakeException.NotFound(
-                "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
-            )
+        atTimestamp: Instant? = null,
+    ): List<ScanFile> =
+        jdbi.withHandleUnchecked { h ->
+            val cat =
+                CatalogRepo.findByName(h, catalog)
+                    ?: throw HoglakeException.NotFound("catalog '$catalog'")
+            // Same read-target rules as CatalogService.getTable/listFiles:
+            // at most one of snapshot / at_timestamp; explicit targets below
+            // the expiry floor are Expired (410); head reads never are.
+            if (snapshot != null && atTimestamp != null) {
+                throw HoglakeException.Validation(
+                    "snapshot and at_timestamp are mutually exclusive; supply at most one",
+                )
+            }
+            val at: Long
+            if (atTimestamp != null) {
+                at =
+                    TimeTravelRepo.resolveTimestamp(
+                        h, cat.catalogId, TimeTravelRepo.earliestSnapshotId(h, cat.catalogId), atTimestamp,
+                    )
+            } else {
+                at = snapshot ?: cat.headSnapshotId
+                if (at < 0 || at > cat.headSnapshotId) {
+                    throw HoglakeException.Validation(
+                        "snapshot $at out of range [0, ${cat.headSnapshotId}] for catalog '${cat.name}'",
+                    )
+                }
+                if (snapshot != null) {
+                    val earliest = TimeTravelRepo.earliestSnapshotId(h, cat.catalogId)
+                    if (at < earliest) {
+                        throw HoglakeException.Expired(
+                            "snapshot $at is below the expiry floor (earliest retained " +
+                                "snapshot is $earliest) for catalog '${cat.name}'",
+                        )
+                    }
+                }
+            }
+            val ns =
+                NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)
+                    ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+            val t =
+                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
+                    ?: throw HoglakeException.NotFound(
+                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
+                    )
 
-        h.createQuery(
-            """
+            h.createQuery(
+                """
             SELECT df.data_file_id, df.table_id, df.path, df.file_format,
                    df.record_count, df.file_size_bytes, df.footer_size,
                    df.row_id_start, df.stats_state, df.begin_snapshot, df.spec_id,
@@ -75,45 +106,48 @@ class ScanService(private val jdbi: Jdbi) {
                AND (df.end_snapshot IS NULL OR :snapshot < df.end_snapshot)
              ORDER BY df.row_id_start, df.data_file_id
             """,
-        )
-            .bind("catalogId", cat.catalogId)
-            .bind("tableId", t.tableId)
-            .bind("snapshot", at)
-            .map { rs, _ ->
-                val specId = rs.getLong("spec_id").let { if (rs.wasNull()) null else it }
-                val values = rs.getArray("partition_values")?.let { arr ->
-                    (arr.array as Array<*>).map { it as String? }
+            )
+                .bind("catalogId", cat.catalogId)
+                .bind("tableId", t.tableId)
+                .bind("snapshot", at)
+                .map { rs, _ ->
+                    val specId = rs.getLong("spec_id").let { if (rs.wasNull()) null else it }
+                    val values =
+                        rs.getArray("partition_values")?.let { arr ->
+                            (arr.array as Array<*>).map { it as String? }
+                        }
+                    val dataFile =
+                        DataFile(
+                            dataFileId = rs.getLong("data_file_id"),
+                            tableId = rs.getLong("table_id"),
+                            path = rs.getString("path"),
+                            fileFormat = rs.getString("file_format"),
+                            recordCount = rs.getLong("record_count"),
+                            fileSizeBytes = rs.getLong("file_size_bytes"),
+                            footerSize = rs.getLong("footer_size").let { if (rs.wasNull()) null else it },
+                            rowIdStart = rs.getLong("row_id_start"),
+                            statsState = StatsState.fromWire(rs.getString("stats_state")),
+                            beginSnapshot = rs.getLong("begin_snapshot"),
+                            specId = specId,
+                            partitionValues = values,
+                        )
+                    val dvId = rs.getLong("dv_id")
+                    val deleteFile =
+                        if (rs.wasNull()) {
+                            null
+                        } else {
+                            DeleteFile(
+                                deleteFileId = dvId,
+                                dataFileId = dataFile.dataFileId,
+                                path = rs.getString("dv_path"),
+                                fileFormat = rs.getString("dv_format"),
+                                deleteCount = rs.getLong("dv_delete_count"),
+                                fileSizeBytes = rs.getLong("dv_file_size_bytes"),
+                                beginSnapshot = rs.getLong("dv_begin_snapshot"),
+                            )
+                        }
+                    ScanFile(dataFile, deleteFile)
                 }
-                val dataFile = DataFile(
-                    dataFileId = rs.getLong("data_file_id"),
-                    tableId = rs.getLong("table_id"),
-                    path = rs.getString("path"),
-                    fileFormat = rs.getString("file_format"),
-                    recordCount = rs.getLong("record_count"),
-                    fileSizeBytes = rs.getLong("file_size_bytes"),
-                    footerSize = rs.getLong("footer_size").let { if (rs.wasNull()) null else it },
-                    rowIdStart = rs.getLong("row_id_start"),
-                    statsState = StatsState.fromWire(rs.getString("stats_state")),
-                    beginSnapshot = rs.getLong("begin_snapshot"),
-                    specId = specId,
-                    partitionValues = values,
-                )
-                val dvId = rs.getLong("dv_id")
-                val deleteFile = if (rs.wasNull()) {
-                    null
-                } else {
-                    DeleteFile(
-                        deleteFileId = dvId,
-                        dataFileId = dataFile.dataFileId,
-                        path = rs.getString("dv_path"),
-                        fileFormat = rs.getString("dv_format"),
-                        deleteCount = rs.getLong("dv_delete_count"),
-                        fileSizeBytes = rs.getLong("dv_file_size_bytes"),
-                        beginSnapshot = rs.getLong("dv_begin_snapshot"),
-                    )
-                }
-                ScanFile(dataFile, deleteFile)
-            }
-            .list()
-    }
+                .list()
+        }
 }

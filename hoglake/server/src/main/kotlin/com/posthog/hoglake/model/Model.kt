@@ -11,38 +11,77 @@ import java.util.UUID
  */
 
 enum class ColType {
-    BOOLEAN, INT, LONG, FLOAT, DOUBLE, DECIMAL, DATE, TIME,
-    TIMESTAMP, TIMESTAMPTZ, STRING, UUID_T, BINARY;
+    BOOLEAN,
+    INT,
+    LONG,
+    FLOAT,
+    DOUBLE,
+    DECIMAL,
+    DATE,
+    TIME,
+    TIMESTAMP,
+    TIMESTAMPTZ,
+    STRING,
+    UUID_T,
+    BINARY,
+    ;
 
     /** Wire/DB name (lowercase; UUID_T stored as "uuid"). */
     val wire: String get() = if (this == UUID_T) "uuid" else name.lowercase()
 
     companion object {
-        fun fromWire(s: String): ColType =
-            if (s == "uuid") UUID_T else valueOf(s.uppercase())
+        fun fromWire(s: String): ColType = if (s == "uuid") UUID_T else valueOf(s.uppercase())
     }
 }
 
-enum class StatsState { PROVIDED, PENDING, FAILED;
+enum class StatsState {
+    PROVIDED,
+    PENDING,
+    FAILED,
+    ;
+
     val wire: String get() = name.lowercase()
-    companion object { fun fromWire(s: String) = valueOf(s.uppercase()) }
+
+    companion object {
+        fun fromWire(s: String) = valueOf(s.uppercase())
+    }
 }
 
 /** Typed conflict vocabulary — mirrors the CHECK constraint on hog_snapshot_change. */
 enum class ChangeKind {
-    NAMESPACE_CREATED, NAMESPACE_DROPPED,
-    TABLE_CREATED, TABLE_DROPPED, TABLE_ALTERED, TABLE_INSERTED_INTO,
-    TABLE_DELETED_FROM;
+    NAMESPACE_CREATED,
+    NAMESPACE_DROPPED,
+    TABLE_CREATED,
+    TABLE_DROPPED,
+    TABLE_ALTERED,
+    TABLE_INSERTED_INTO,
+    TABLE_DELETED_FROM,
+    VIEW_CREATED,
+    VIEW_DROPPED,
+    ;
 
     val wire: String get() = name.lowercase()
-    companion object { fun fromWire(s: String) = valueOf(s.uppercase()) }
+
+    companion object {
+        fun fromWire(s: String) = valueOf(s.uppercase())
+    }
 }
 
 /** Iceberg-semantics partition transforms (iceberg-federation.md §3). */
 enum class Transform {
-    IDENTITY, BUCKET, YEAR, MONTH, DAY, HOUR;
+    IDENTITY,
+    BUCKET,
+    YEAR,
+    MONTH,
+    DAY,
+    HOUR,
+    ;
+
     val wire: String get() = name.lowercase()
-    companion object { fun fromWire(s: String) = valueOf(s.uppercase()) }
+
+    companion object {
+        fun fromWire(s: String) = valueOf(s.uppercase())
+    }
 }
 
 data class PartitionFieldDef(
@@ -58,19 +97,25 @@ data class PartitionSpec(
 )
 
 /** Widening promotions the ALTER path permits (Iceberg-compatible set). */
-fun ColType.canPromoteTo(target: ColType): Boolean = when (this) {
-    ColType.INT -> target == ColType.LONG
-    ColType.FLOAT -> target == ColType.DOUBLE
-    else -> false
-}
+fun ColType.canPromoteTo(target: ColType): Boolean =
+    when (this) {
+        ColType.INT -> target == ColType.LONG
+        ColType.FLOAT -> target == ColType.DOUBLE
+        else -> false
+    }
 
 /** One typed ALTER TABLE operation. */
 sealed class AlterOp {
     data class AddColumn(val def: ColumnDef) : AlterOp()
+
     data class DropColumn(val name: String) : AlterOp()
+
     data class RenameColumn(val from: String, val to: String) : AlterOp()
+
     data class PromoteColumn(val name: String, val to: ColType) : AlterOp()
+
     data class RenameTable(val newName: String) : AlterOp()
+
     /** Replace the partition spec (empty list = unpartitioned). */
     data class SetPartitionSpec(val fields: List<PartitionFieldDef>) : AlterOp()
 }
@@ -170,12 +215,14 @@ data class ColumnStats(
     val lowerBound: ByteArray?,
     val upperBound: ByteArray?,
 ) {
-    override fun equals(other: Any?): Boolean = other is ColumnStats &&
-        fieldId == other.fieldId && valueCount == other.valueCount &&
-        nullCount == other.nullCount && nanCount == other.nanCount &&
-        sizeBytes == other.sizeBytes &&
-        lowerBound.contentEquals(other.lowerBound) &&
-        upperBound.contentEquals(other.upperBound)
+    override fun equals(other: Any?): Boolean =
+        other is ColumnStats &&
+            fieldId == other.fieldId && valueCount == other.valueCount &&
+            nullCount == other.nullCount && nanCount == other.nanCount &&
+            sizeBytes == other.sizeBytes &&
+            lowerBound.contentEquals(other.lowerBound) &&
+            upperBound.contentEquals(other.upperBound)
+
     override fun hashCode(): Int = fieldId.hashCode()
 }
 
@@ -235,11 +282,64 @@ data class ConsumerOffset(
     val updatedAt: Instant,
 )
 
+data class ViewInfo(
+    val viewId: Long,
+    val viewUuid: UUID,
+    val namespace: String,
+    val name: String,
+    val dialect: String,
+    val sql: String,
+)
+
+/** Catalog retention/behavior options (the options API surface). */
+data class CatalogOptions(
+    /** null = snapshot expiry disabled. */
+    val snapshotRetentionSeconds: Long?,
+    /** Expiry never passes the min consumer offset when true. */
+    val consumerFloor: Boolean,
+    val earliestSnapshotId: Long,
+)
+
+/** One expiry sweep's outcome. */
+data class ExpiryResult(
+    val snapshotsExpired: Long,
+    val dataFilesQueued: Long,
+    val deleteFilesQueued: Long,
+    val newEarliestSnapshotId: Long,
+    /** Non-null when the consumer floor capped the sweep (page-worthy). */
+    val flooredByConsumer: String?,
+)
+
+/** One cleanup drain's outcome. */
+data class CleanupResult(
+    val removed: Long,
+    val missing: Long,
+    /** Entries skipped because the path is still referenced — an
+     *  invariant violation worth alerting on, never a deletion. */
+    val stillReferenced: Long,
+)
+
+/** Changefeed plan for (from, to]: appended files + DVs registered in range. */
+data class ChangesPlan(
+    val tableUuid: UUID,
+    val fromSnapshot: Long,
+    val toSnapshot: Long,
+    val files: List<DataFile>,
+    val deleteFiles: List<DeleteFile>,
+)
+
 /** Service-level failures the API layer maps to status codes. */
 sealed class HoglakeException(message: String) : RuntimeException(message) {
     class NotFound(what: String) : HoglakeException(what)
+
     class AlreadyExists(what: String) : HoglakeException(what)
+
     class CommitConflict(detail: String) : HoglakeException(detail)
+
     class Validation(detail: String) : HoglakeException(detail)
+
     class OffsetRegression(detail: String) : HoglakeException(detail)
+
+    /** Requested range fell below the catalog's expiry floor -> HTTP 410. */
+    class Expired(detail: String) : HoglakeException(detail)
 }

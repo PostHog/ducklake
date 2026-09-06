@@ -11,25 +11,26 @@ import org.jdbi.v3.core.mapper.RowMapper
  * service, not here.
  */
 object FileRepo {
-
-    private val fileMapper = RowMapper { rs, _ ->
-        DataFile(
-            dataFileId = rs.getLong("data_file_id"),
-            tableId = rs.getLong("table_id"),
-            path = rs.getString("path"),
-            fileFormat = rs.getString("file_format"),
-            recordCount = rs.getLong("record_count"),
-            fileSizeBytes = rs.getLong("file_size_bytes"),
-            footerSize = rs.getObject("footer_size")?.let { (it as Number).toLong() },
-            rowIdStart = rs.getLong("row_id_start"),
-            statsState = StatsState.fromWire(rs.getString("stats_state")),
-            beginSnapshot = rs.getLong("begin_snapshot"),
-            specId = rs.getObject("spec_id")?.let { (it as Number).toLong() },
-            partitionValues = (rs.getArray("partition_values")?.array as? Array<*>)
-                ?.map { it as String? }
-                ?.takeIf { it.isNotEmpty() },
-        )
-    }
+    private val fileMapper =
+        RowMapper { rs, _ ->
+            DataFile(
+                dataFileId = rs.getLong("data_file_id"),
+                tableId = rs.getLong("table_id"),
+                path = rs.getString("path"),
+                fileFormat = rs.getString("file_format"),
+                recordCount = rs.getLong("record_count"),
+                fileSizeBytes = rs.getLong("file_size_bytes"),
+                footerSize = rs.getObject("footer_size")?.let { (it as Number).toLong() },
+                rowIdStart = rs.getLong("row_id_start"),
+                statsState = StatsState.fromWire(rs.getString("stats_state")),
+                beginSnapshot = rs.getLong("begin_snapshot"),
+                specId = rs.getObject("spec_id")?.let { (it as Number).toLong() },
+                partitionValues =
+                    (rs.getArray("partition_values")?.array as? Array<*>)
+                        ?.map { it as String? }
+                        ?.takeIf { it.isNotEmpty() },
+            )
+        }
 
     private const val COLUMNS =
         """f.data_file_id, f.table_id, f.path, f.file_format, f.record_count,
@@ -41,7 +42,12 @@ object FileRepo {
               AND pv.data_file_id = f.data_file_id) AS partition_values"""
 
     /** Files visible at [snapshot], in row-id order. */
-    fun listAt(handle: Handle, catalogId: Long, tableId: Long, snapshot: Long): List<DataFile> =
+    fun listAt(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ): List<DataFile> =
         handle.createQuery(
             """
             SELECT $COLUMNS
@@ -58,8 +64,45 @@ object FileRepo {
             .map(fileMapper)
             .list()
 
+    /**
+     * Snapshot-scoped table aggregates: (file_count, record_count,
+     * file_size_bytes) over the files VISIBLE at [snapshot]. TableInfo
+     * must use this, never hog_table_stats — the stats row is the gross
+     * append counter (row-id allocator anchor) and is head-scoped by
+     * nature; aggregating visible files keeps time-travel reads honest
+     * (found by pyhoglake's integration suite, 2026-09-05).
+     */
+    data class TableAggregates(val fileCount: Long, val recordCount: Long, val fileSizeBytes: Long)
+
+    fun aggregateAt(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ): TableAggregates =
+        handle.createQuery(
+            """
+            SELECT count(*) AS fc, coalesce(sum(record_count), 0) AS rc,
+                   coalesce(sum(file_size_bytes), 0) AS fb
+            FROM hog_data_file
+            WHERE catalog_id = :catalogId AND table_id = :tableId
+              AND begin_snapshot <= :snapshot
+              AND (end_snapshot IS NULL OR :snapshot < end_snapshot)
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("snapshot", snapshot)
+            .map { rs, _ -> TableAggregates(rs.getLong("fc"), rs.getLong("rc"), rs.getLong("fb")) }
+            .one()
+
     /** Count of files visible at [snapshot]. */
-    fun countAt(handle: Handle, catalogId: Long, tableId: Long, snapshot: Long): Long =
+    fun countAt(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ): Long =
         handle.createQuery(
             """
             SELECT count(*) FROM hog_data_file
@@ -106,7 +149,12 @@ object FileRepo {
             .list()
 
     /** Drop tail: end-snapshot every live file of the table. */
-    fun endLiveFiles(handle: Handle, catalogId: Long, tableId: Long, snapshot: Long): Int =
+    fun endLiveFiles(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ): Int =
         handle.createUpdate(
             """
             UPDATE hog_data_file SET end_snapshot = :snapshot

@@ -32,31 +32,38 @@ data class TableStatsRow(
  * iff begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot).
  */
 object TableRepo {
-
-    private val tableRowMapper = RowMapper { rs, _ ->
-        TableRow(
-            tableId = rs.getLong("table_id"),
-            tableUuid = rs.getObject("table_uuid") as UUID,
-            namespaceId = rs.getLong("namespace_id"),
-            name = rs.getString("name"),
-        )
-    }
-
-    private val columnMapper = RowMapper { rs, _ ->
-        Column(
-            fieldId = rs.getLong("field_id"),
-            ordinal = rs.getInt("ordinal"),
-            def = ColumnDef(
+    private val tableRowMapper =
+        RowMapper { rs, _ ->
+            TableRow(
+                tableId = rs.getLong("table_id"),
+                tableUuid = rs.getObject("table_uuid") as UUID,
+                namespaceId = rs.getLong("namespace_id"),
                 name = rs.getString("name"),
-                type = ColType.fromWire(rs.getString("col_type")),
-                typeParams = Pg.fromJson(rs.getString("type_params")),
-                nullable = rs.getBoolean("nullable"),
-            ),
-        )
-    }
+            )
+        }
+
+    private val columnMapper =
+        RowMapper { rs, _ ->
+            Column(
+                fieldId = rs.getLong("field_id"),
+                ordinal = rs.getInt("ordinal"),
+                def =
+                    ColumnDef(
+                        name = rs.getString("name"),
+                        type = ColType.fromWire(rs.getString("col_type")),
+                        typeParams = Pg.fromJson(rs.getString("type_params")),
+                        nullable = rs.getBoolean("nullable"),
+                    ),
+            )
+        }
 
     /** Insert the identity row; returns the generated table_uuid. */
-    fun insertTable(handle: Handle, catalogId: Long, tableId: Long, createdSnapshot: Long): UUID =
+    fun insertTable(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        createdSnapshot: Long,
+    ): UUID =
         handle.createQuery(
             """
             INSERT INTO hog_table (catalog_id, table_id, created_snapshot)
@@ -75,7 +82,12 @@ object TableRepo {
      * (1-based). Returns the first allocated id. Caller holds the
      * catalog commit lock.
      */
-    fun allocateFieldIds(handle: Handle, catalogId: Long, tableId: Long, count: Int): Long =
+    fun allocateFieldIds(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        count: Int,
+    ): Long =
         handle.createQuery(
             """
             UPDATE hog_table SET next_field_id = next_field_id + :count
@@ -130,15 +142,16 @@ object TableRepo {
         beginSnapshot: Long,
         columns: List<Column>,
     ) {
-        val batch = handle.prepareBatch(
-            """
+        val batch =
+            handle.prepareBatch(
+                """
             INSERT INTO hog_column
                 (catalog_id, table_id, field_id, begin_snapshot, name, col_type,
                  type_params, nullable, ordinal)
             VALUES (:catalogId, :tableId, :fieldId, :beginSnapshot, :name, :colType,
                     :typeParams::jsonb, :nullable, :ordinal)
             """,
-        )
+            )
         for (c in columns) {
             batch
                 .bind("catalogId", catalogId)
@@ -156,7 +169,11 @@ object TableRepo {
     }
 
     /** Create the one-per-table rollup/allocator row, all zeros. */
-    fun insertStatsRow(handle: Handle, catalogId: Long, tableId: Long) {
+    fun insertStatsRow(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+    ) {
         handle.createUpdate(
             """
             INSERT INTO hog_table_stats (catalog_id, table_id)
@@ -198,7 +215,12 @@ object TableRepo {
             .orElse(null)
 
     /** Resolve a live (head-visible) table by (namespace, name). */
-    fun findLive(handle: Handle, catalogId: Long, namespaceId: Long, name: String): TableRow? =
+    fun findLive(
+        handle: Handle,
+        catalogId: Long,
+        namespaceId: Long,
+        name: String,
+    ): TableRow? =
         handle.createQuery(
             """
             SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name
@@ -219,7 +241,11 @@ object TableRepo {
             .orElse(null)
 
     /** All live tables in a namespace, ordered by name. */
-    fun listLive(handle: Handle, catalogId: Long, namespaceId: Long): List<TableRow> =
+    fun listLive(
+        handle: Handle,
+        catalogId: Long,
+        namespaceId: Long,
+    ): List<TableRow> =
         handle.createQuery(
             """
             SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name
@@ -238,7 +264,12 @@ object TableRepo {
             .list()
 
     /** Column definitions visible at [snapshot], ordered by ordinal. */
-    fun columnsAt(handle: Handle, catalogId: Long, tableId: Long, snapshot: Long): List<Column> =
+    fun columnsAt(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ): List<Column> =
         handle.createQuery(
             """
             SELECT field_id, name, col_type, type_params, nullable, ordinal
@@ -255,7 +286,11 @@ object TableRepo {
             .map(columnMapper)
             .list()
 
-    fun stats(handle: Handle, catalogId: Long, tableId: Long): TableStatsRow =
+    fun stats(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+    ): TableStatsRow =
         handle.createQuery(
             """
             SELECT record_count, file_size_bytes, next_row_id
@@ -280,7 +315,12 @@ object TableRepo {
      * and end-snapshots the live version and column rows. Data files
      * are end-snapshotted by [FileRepo.endLiveFiles].
      */
-    fun markDropped(handle: Handle, catalogId: Long, tableId: Long, snapshot: Long) {
+    fun markDropped(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ) {
         handle.createUpdate(
             """
             UPDATE hog_table SET dropped_snapshot = :snapshot

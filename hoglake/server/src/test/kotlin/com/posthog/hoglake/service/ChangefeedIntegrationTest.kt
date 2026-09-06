@@ -27,7 +27,6 @@ import org.junit.jupiter.api.TestInstance
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class ChangefeedIntegrationTest {
-
     private val db = PgTestSupport.freshDatabase()
     private val svc = CatalogService(db.jdbi)
     private val idCol = ColumnDef("id", ColType.LONG, nullable = false)
@@ -56,7 +55,11 @@ class ChangefeedIntegrationTest {
     @AfterAll
     fun tearDown() = db.close()
 
-    private fun insertFile(fileId: Long, begin: Long, rowIdStart: Long) {
+    private fun insertFile(
+        fileId: Long,
+        begin: Long,
+        rowIdStart: Long,
+    ) {
         db.jdbi.withHandleUnchecked { h ->
             h.createUpdate(
                 """
@@ -98,23 +101,26 @@ class ChangefeedIntegrationTest {
         val head = svc.getCatalog(cat).headSnapshotId
 
         // Default to = head; from is exclusive.
-        val (uuid, range, files) = svc.changes(cat, "ns", "t", fromSnapshot = 3)
-        assertThat(uuid).isEqualTo(svc.getTable(cat, "ns", "t").tableUuid)
-        assertThat(range).isEqualTo(3L..head)
-        assertThat(files.map { it.dataFileId }).containsExactly(2L, 4L, 3L)
+        // [changes() now returns ChangesPlan instead of Triple/LongRange.]
+        val plan = svc.changes(cat, "ns", "t", fromSnapshot = 3)
+        assertThat(plan.tableUuid).isEqualTo(svc.getTable(cat, "ns", "t").tableUuid)
+        assertThat(plan.fromSnapshot).isEqualTo(3L)
+        assertThat(plan.toSnapshot).isEqualTo(head)
+        assertThat(plan.files.map { it.dataFileId }).containsExactly(2L, 4L, 3L)
 
         // Explicit sub-range.
-        val (_, subRange, subFiles) = svc.changes(cat, "ns", "t", fromSnapshot = 3, toSnapshot = 4)
-        assertThat(subRange).isEqualTo(3L..4L)
-        assertThat(subFiles.map { it.dataFileId }).containsExactly(2L, 4L)
+        val sub = svc.changes(cat, "ns", "t", fromSnapshot = 3, toSnapshot = 4)
+        assertThat(sub.fromSnapshot).isEqualTo(3L)
+        assertThat(sub.toSnapshot).isEqualTo(4L)
+        assertThat(sub.files.map { it.dataFileId }).containsExactly(2L, 4L)
 
         // From 0 catches everything appended so far.
-        val (_, _, all) = svc.changes(cat, "ns", "t", fromSnapshot = 0)
-        assertThat(all.map { it.dataFileId }).containsExactly(1L, 2L, 4L, 3L)
+        val all = svc.changes(cat, "ns", "t", fromSnapshot = 0)
+        assertThat(all.files.map { it.dataFileId }).containsExactly(1L, 2L, 4L, 3L)
 
         // Empty range: from == to.
-        val (_, _, none) = svc.changes(cat, "ns", "t", fromSnapshot = head, toSnapshot = head)
-        assertThat(none).isEmpty()
+        val none = svc.changes(cat, "ns", "t", fromSnapshot = head, toSnapshot = head)
+        assertThat(none.files).isEmpty()
     }
 
     @Test
@@ -159,9 +165,10 @@ class ChangefeedIntegrationTest {
         // At the pre-drop snapshot everything is still visible, even
         // though the drop end-snapshotted the file rows.
         assertThat(svc.listFiles(cat, "drop-ns", "d", snapshot = createdAt)).hasSize(1)
-        val (uuid, _, files) =
+        // [changes() now returns ChangesPlan instead of Triple.]
+        val past =
             svc.changes(cat, "drop-ns", "d", fromSnapshot = 0, toSnapshot = drop.snapshotId - 1)
-        assertThat(uuid).isEqualTo(t.tableUuid)
-        assertThat(files).hasSize(1)
+        assertThat(past.tableUuid).isEqualTo(t.tableUuid)
+        assertThat(past.files).hasSize(1)
     }
 }

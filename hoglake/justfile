@@ -1,0 +1,18 @@
+# hoglake — top-level recipes composing the per-component justfiles.
+# `just server test`, `just pyhoglake unit`, `just test-all`, ...
+
+mod server
+mod pyhoglake
+mod webui
+mod hedgerow
+mod bench
+
+# Full verification: server then client suites (client integration skips unless a server is up; `just dev` first for end-to-end)
+test-all:
+    just server test
+    just pyhoglake test
+
+# Bring up the dev stack and the server (foreground).
+dev:
+    just server compose-up
+    just server run

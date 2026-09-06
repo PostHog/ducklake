@@ -31,7 +31,6 @@ import java.time.Instant
  */
 @Tag("integration")
 class HydratorIntegrationTest {
-
     private val db = PgTestSupport.freshDatabase()
     private val jdbi get() = db.jdbi
     private val hydrator by lazy { Hydrator(jdbi, store) }
@@ -72,19 +71,23 @@ class HydratorIntegrationTest {
         }
 
         fun writeSampleParquet(): ByteArray {
-            val schema = FileSchema.builder("hoglake_test")
-                .addColumn("id", PhysicalType.INT64, RepetitionType.REQUIRED)
-                .addColumn("score", PhysicalType.DOUBLE, RepetitionType.OPTIONAL)
-                .addColumn("name", PhysicalType.BYTE_ARRAY, RepetitionType.OPTIONAL, LogicalType.StringType())
-                .addColumn(
-                    "ts", PhysicalType.INT64, RepetitionType.OPTIONAL,
-                    LogicalType.TimestampType(true, LogicalType.TimeUnit.MICROS),
-                )
-                .build()
+            val schema =
+                FileSchema.builder("hoglake_test")
+                    .addColumn("id", PhysicalType.INT64, RepetitionType.REQUIRED)
+                    .addColumn("score", PhysicalType.DOUBLE, RepetitionType.OPTIONAL)
+                    .addColumn("name", PhysicalType.BYTE_ARRAY, RepetitionType.OPTIONAL, LogicalType.StringType())
+                    .addColumn(
+                        "ts",
+                        PhysicalType.INT64,
+                        RepetitionType.OPTIONAL,
+                        LogicalType.TimestampType(true, LogicalType.TimeUnit.MICROS),
+                    )
+                    .build()
             val tmp = Files.createTempFile("hoglake-hydrator", ".parquet")
             try {
                 ParquetFileWriter.create(
-                    OutputFile.of(tmp), schema,
+                    OutputFile.of(tmp),
+                    schema,
                     WriterConfig.builder().rowGroupTargetRows(10).build(),
                 ).use { writer ->
                     val rows = writer.rowWriter()
@@ -107,11 +110,12 @@ class HydratorIntegrationTest {
     // ---- catalog seeding ---------------------------------------------------
 
     private fun seedCatalogAndTable(): Long {
-        val catalogId = jdbi.withHandle<Long, Exception> { h ->
-            h.createQuery(
-                "INSERT INTO hog_catalog (name, data_path) VALUES ('cat', 's3://$BUCKET/') RETURNING catalog_id",
-            ).mapTo(Long::class.java).one()
-        }
+        val catalogId =
+            jdbi.withHandle<Long, Exception> { h ->
+                h.createQuery(
+                    "INSERT INTO hog_catalog (name, data_path) VALUES ('cat', 's3://$BUCKET/') RETURNING catalog_id",
+                ).mapTo(Long::class.java).one()
+            }
         jdbi.useHandle<Exception> { h ->
             h.execute(
                 "INSERT INTO hog_namespace (catalog_id, namespace_id, name) VALUES (?, 1, 'ns')",
@@ -134,7 +138,11 @@ class HydratorIntegrationTest {
                         (catalog_id, table_id, field_id, begin_snapshot, name, col_type, ordinal)
                     VALUES (?, 1, ?, 1, ?, ?, ?)
                     """,
-                    catalogId, fieldId, spec.first, spec.second, ordinal++,
+                    catalogId,
+                    fieldId,
+                    spec.first,
+                    spec.second,
+                    ordinal++,
                 )
             }
         }
@@ -157,12 +165,20 @@ class HydratorIntegrationTest {
                      record_count, file_size_bytes, footer_size, row_id_start, stats_state)
                 VALUES (?, ?, 1, 1, ?, ?, ?, ?, 0, 'pending')
                 """,
-                catalogId, dataFileId, path, recordCount, fileSizeBytes, footerSize,
+                catalogId,
+                dataFileId,
+                path,
+                recordCount,
+                fileSizeBytes,
+                footerSize,
             )
         }
     }
 
-    private fun statsState(catalogId: Long, dataFileId: Long): String =
+    private fun statsState(
+        catalogId: Long,
+        dataFileId: Long,
+    ): String =
         jdbi.withHandle<String, Exception> { h ->
             h.createQuery(
                 "SELECT stats_state FROM hog_data_file WHERE catalog_id = ? AND data_file_id = ?",
@@ -178,7 +194,10 @@ class HydratorIntegrationTest {
         val upper: ByteArray?,
     )
 
-    private fun statsRows(catalogId: Long, dataFileId: Long): Map<Long, StatsRow> =
+    private fun statsRows(
+        catalogId: Long,
+        dataFileId: Long,
+    ): Map<Long, StatsRow> =
         jdbi.withHandle<Map<Long, StatsRow>, Exception> { h ->
             h.createQuery(
                 """
@@ -189,14 +208,15 @@ class HydratorIntegrationTest {
                 """,
             ).bind(0, catalogId).bind(1, dataFileId)
                 .map { rs, _ ->
-                    rs.getLong("field_id") to StatsRow(
-                        valueCount = rs.getLong("value_count"),
-                        nullCount = rs.getLong("null_count"),
-                        nanCount = rs.getObject("nan_count", java.lang.Long::class.java)?.toLong(),
-                        sizeBytes = rs.getObject("size_bytes", java.lang.Long::class.java)?.toLong(),
-                        lower = rs.getBytes("lower_bound"),
-                        upper = rs.getBytes("upper_bound"),
-                    )
+                    rs.getLong("field_id") to
+                        StatsRow(
+                            valueCount = rs.getLong("value_count"),
+                            nullCount = rs.getLong("null_count"),
+                            nanCount = rs.getObject("nan_count", java.lang.Long::class.java)?.toLong(),
+                            sizeBytes = rs.getObject("size_bytes", java.lang.Long::class.java)?.toLong(),
+                            lower = rs.getBytes("lower_bound"),
+                            upper = rs.getBytes("upper_bound"),
+                        )
                 }
                 .list().toMap()
         }

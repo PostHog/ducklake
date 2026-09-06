@@ -24,7 +24,6 @@ import java.util.concurrent.atomic.AtomicInteger
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class AlterServiceIntegrationTest {
-
     private val db = PgTestSupport.freshDatabase()
     private val alter = AlterService(db.jdbi)
     private val catalogs = CatalogService(db.jdbi)
@@ -58,11 +57,17 @@ class AlterServiceIntegrationTest {
     @Test
     fun `add column appends with fresh field_id and next ordinal`() {
         val (cat, ns) = fixture()
-        val info = alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.AddColumn(ColumnDef("tags", ColType.STRING)),
-        ))
+        val info =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.AddColumn(ColumnDef("tags", ColType.STRING)),
+                ),
+            )
         val added = info.columns.single { it.def.name == "tags" }
-        assertThat(added.fieldId).isEqualTo(6)      // fields 1..5 existed
+        assertThat(added.fieldId).isEqualTo(6) // fields 1..5 existed
         assertThat(added.ordinal).isEqualTo(5)
         assertThat(info.columns).hasSize(6)
         assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name })
@@ -92,8 +97,9 @@ class AlterServiceIntegrationTest {
         assertThat(renamed.ordinal).isEqualTo(oldCol.ordinal)
         assertThat(renamed.def.type).isEqualTo(ColType.STRING)
 
-        val old = catalogs.getTable(cat, ns, "t", snapshot = before)
-            .columns.single { it.fieldId == oldCol.fieldId }
+        val old =
+            catalogs.getTable(cat, ns, "t", snapshot = before)
+                .columns.single { it.fieldId == oldCol.fieldId }
         assertThat(old.def.name).isEqualTo("name")
     }
 
@@ -101,10 +107,16 @@ class AlterServiceIntegrationTest {
     fun `promote int to long and float to double`() {
         val (cat, ns) = fixture()
         val before = head(cat)
-        val info = alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.PromoteColumn("count", ColType.LONG),
-            AlterOp.PromoteColumn("score", ColType.DOUBLE),
-        ))
+        val info =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.PromoteColumn("count", ColType.LONG),
+                    AlterOp.PromoteColumn("score", ColType.DOUBLE),
+                ),
+            )
         assertThat(info.columns.single { it.def.name == "count" }.def.type)
             .isEqualTo(ColType.LONG)
         assertThat(info.columns.single { it.def.name == "score" }.def.type)
@@ -135,13 +147,21 @@ class AlterServiceIntegrationTest {
     fun `set partition spec returns spec_id 1 with ordered fields`() {
         val (cat, ns) = fixture()
         val cols = catalogs.getTable(cat, ns, "t").columns.associateBy { it.def.name }
-        val info = alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.SetPartitionSpec(listOf(
-                PartitionFieldDef(cols["ts"]!!.fieldId, Transform.DAY),
-                PartitionFieldDef(cols["id"]!!.fieldId, Transform.BUCKET, 16),
-                PartitionFieldDef(cols["name"]!!.fieldId, Transform.IDENTITY),
-            )),
-        ))
+        val info =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(
+                        listOf(
+                            PartitionFieldDef(cols["ts"]!!.fieldId, Transform.DAY),
+                            PartitionFieldDef(cols["id"]!!.fieldId, Transform.BUCKET, 16),
+                            PartitionFieldDef(cols["name"]!!.fieldId, Transform.IDENTITY),
+                        ),
+                    ),
+                ),
+            )
         val spec = info.partitionSpec!!
         assertThat(spec.specId).isEqualTo(1)
         assertThat(spec.fields).containsExactly(
@@ -150,14 +170,15 @@ class AlterServiceIntegrationTest {
             PartitionFieldDef(cols["name"]!!.fieldId, Transform.IDENTITY),
         )
         // key_index mirrors list position in the DB.
-        val keyed = db.jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                """
+        val keyed =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
                 SELECT key_index, source_field_id FROM hog_partition_field
                 WHERE catalog_id = :c AND table_id = :t ORDER BY key_index
                 """,
-            ).bind("c", catId(cat)).bind("t", info.tableId).mapToMap().list()
-        }
+                ).bind("c", catId(cat)).bind("t", info.tableId).mapToMap().list()
+            }
         assertThat(keyed.map { it["key_index"] }).containsExactly(0, 1, 2)
     }
 
@@ -177,12 +198,13 @@ class AlterServiceIntegrationTest {
         assertThat(second.partitionSpec!!.specId).isEqualTo(2)
         assertThat(second.partitionSpec!!.fields).containsExactly(idField)
 
-        val specs = db.jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                "SELECT spec_id, end_snapshot FROM hog_partition_spec " +
-                    "WHERE catalog_id = :c AND table_id = :t ORDER BY spec_id",
-            ).bind("c", catId(cat)).bind("t", second.tableId).mapToMap().list()
-        }
+        val specs =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT spec_id, end_snapshot FROM hog_partition_spec " +
+                        "WHERE catalog_id = :c AND table_id = :t ORDER BY spec_id",
+                ).bind("c", catId(cat)).bind("t", second.tableId).mapToMap().list()
+            }
         assertThat(specs).hasSize(2)
         assertThat(specs[0]["end_snapshot"]).isNotNull()
         assertThat(specs[1]["end_snapshot"]).isNull()
@@ -190,12 +212,13 @@ class AlterServiceIntegrationTest {
         // Clear back to unpartitioned: no live spec row remains.
         val cleared = alter.alterTable(cat, ns, "t", listOf(AlterOp.SetPartitionSpec(emptyList())))
         assertThat(cleared.partitionSpec).isNull()
-        val live = db.jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                "SELECT count(*) FROM hog_partition_spec " +
-                    "WHERE catalog_id = :c AND table_id = :t AND end_snapshot IS NULL",
-            ).bind("c", catId(cat)).bind("t", second.tableId).mapTo(Long::class.javaObjectType).one()
-        }
+        val live =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_partition_spec " +
+                        "WHERE catalog_id = :c AND table_id = :t AND end_snapshot IS NULL",
+                ).bind("c", catId(cat)).bind("t", second.tableId).mapTo(Long::class.javaObjectType).one()
+            }
         assertThat(live).isEqualTo(0)
     }
 
@@ -203,17 +226,27 @@ class AlterServiceIntegrationTest {
     fun `dropping a live spec source column is rejected`() {
         val (cat, ns) = fixture()
         val ts = catalogs.getTable(cat, ns, "t").columns.single { it.def.name == "ts" }
-        alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(ts.fieldId, Transform.DAY))),
-        ))
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(
+                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(ts.fieldId, Transform.DAY))),
+            ),
+        )
         assertThatThrownBy { alter.alterTable(cat, ns, "t", listOf(AlterOp.DropColumn("ts"))) }
             .isInstanceOf(HoglakeException.Validation::class.java)
             .hasMessageContaining("partition spec")
         // Clearing the spec unblocks the drop.
-        alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.SetPartitionSpec(emptyList()),
-            AlterOp.DropColumn("ts"),
-        ))
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(
+                AlterOp.SetPartitionSpec(emptyList()),
+                AlterOp.DropColumn("ts"),
+            ),
+        )
         assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name })
             .doesNotContain("ts")
     }
@@ -223,10 +256,15 @@ class AlterServiceIntegrationTest {
         val (cat, ns) = fixture()
         val ts = catalogs.getTable(cat, ns, "t").columns.single { it.def.name == "ts" }
         assertThatThrownBy {
-            alter.alterTable(cat, ns, "t", listOf(
-                AlterOp.DropColumn("ts"),
-                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(ts.fieldId, Transform.DAY))),
-            ))
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.DropColumn("ts"),
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(ts.fieldId, Transform.DAY))),
+                ),
+            )
         }
             .isInstanceOf(HoglakeException.Validation::class.java)
             .hasMessageContaining("not a live column")
@@ -243,44 +281,77 @@ class AlterServiceIntegrationTest {
 
         // Temporal transform on a string column.
         assertThatThrownBy {
-            alter.alterTable(cat, ns, "t", listOf(
-                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(nameId, Transform.MONTH))),
-            ))
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(nameId, Transform.MONTH))),
+                ),
+            )
         }.isInstanceOf(HoglakeException.Validation::class.java)
 
         // Bucket without a param, bucket with param 0.
         assertThatThrownBy {
-            alter.alterTable(cat, ns, "t", listOf(
-                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(nameId, Transform.BUCKET))),
-            ))
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(nameId, Transform.BUCKET))),
+                ),
+            )
         }.isInstanceOf(HoglakeException.Validation::class.java)
         assertThatThrownBy {
-            alter.alterTable(cat, ns, "t", listOf(
-                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(nameId, Transform.BUCKET, 0))),
-            ))
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(nameId, Transform.BUCKET, 0))),
+                ),
+            )
         }.isInstanceOf(HoglakeException.Validation::class.java)
 
         // Param on a non-bucket transform.
         assertThatThrownBy {
-            alter.alterTable(cat, ns, "t", listOf(
-                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(tsId, Transform.DAY, 4))),
-            ))
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(tsId, Transform.DAY, 4))),
+                ),
+            )
         }.isInstanceOf(HoglakeException.Validation::class.java)
 
         // Unknown field id.
         assertThatThrownBy {
-            alter.alterTable(cat, ns, "t", listOf(
-                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(9999, Transform.IDENTITY))),
-            ))
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(9999, Transform.IDENTITY))),
+                ),
+            )
         }.isInstanceOf(HoglakeException.Validation::class.java)
 
         // Bucket is legal on any type; year/month/day/hour on date/ts/tstz.
-        val ok = alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.SetPartitionSpec(listOf(
-                PartitionFieldDef(nameId, Transform.BUCKET, 8),
-                PartitionFieldDef(tsId, Transform.HOUR),
-            )),
-        ))
+        val ok =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(
+                        listOf(
+                            PartitionFieldDef(nameId, Transform.BUCKET, 8),
+                            PartitionFieldDef(tsId, Transform.HOUR),
+                        ),
+                    ),
+                ),
+            )
         assertThat(ok.partitionSpec!!.fields).hasSize(2)
     }
 
@@ -289,19 +360,26 @@ class AlterServiceIntegrationTest {
     @Test
     fun `add then rename the new column in one request`() {
         val (cat, ns) = fixture()
-        val info = alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.AddColumn(ColumnDef("tmp", ColType.STRING)),
-            AlterOp.RenameColumn("tmp", "final"),
-        ))
+        val info =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.AddColumn(ColumnDef("tmp", ColType.STRING)),
+                    AlterOp.RenameColumn("tmp", "final"),
+                ),
+            )
         assertThat(info.columns.map { it.def.name }).contains("final").doesNotContain("tmp")
         // Only one live row for the field; the tmp row was never visible.
         val fieldId = info.columns.single { it.def.name == "final" }.fieldId
-        val rows = db.jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                "SELECT name FROM hog_column WHERE catalog_id = :c AND table_id = :t AND field_id = :f",
-            ).bind("c", catId(cat)).bind("t", info.tableId).bind("f", fieldId)
-                .mapTo(String::class.java).list()
-        }
+        val rows =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT name FROM hog_column WHERE catalog_id = :c AND table_id = :t AND field_id = :f",
+                ).bind("c", catId(cat)).bind("t", info.tableId).bind("f", fieldId)
+                    .mapTo(String::class.java).list()
+            }
         assertThat(rows).containsExactly("final")
     }
 
@@ -309,10 +387,15 @@ class AlterServiceIntegrationTest {
     fun `drop then reference the dropped column fails`() {
         val (cat, ns) = fixture()
         assertThatThrownBy {
-            alter.alterTable(cat, ns, "t", listOf(
-                AlterOp.DropColumn("name"),
-                AlterOp.RenameColumn("name", "label"),
-            ))
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.DropColumn("name"),
+                    AlterOp.RenameColumn("name", "label"),
+                ),
+            )
         }.isInstanceOf(HoglakeException.Validation::class.java)
         // Rolled back: name is still there.
         assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name }).contains("name")
@@ -323,37 +406,53 @@ class AlterServiceIntegrationTest {
         val (cat, ns) = fixture()
         val before = head(cat)
         val fieldId = catalogs.getTable(cat, ns, "t").columns.single { it.def.name == "name" }.fieldId
-        val info = alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.RenameColumn("name", "mid"),
-            AlterOp.RenameColumn("mid", "end"),
-        ))
+        val info =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.RenameColumn("name", "mid"),
+                    AlterOp.RenameColumn("mid", "end"),
+                ),
+            )
         assertThat(info.columns.map { it.def.name }).contains("end")
-        val rows = db.jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                "SELECT name, end_snapshot FROM hog_column " +
-                    "WHERE catalog_id = :c AND table_id = :t AND field_id = :f ORDER BY begin_snapshot",
-            ).bind("c", catId(cat)).bind("t", info.tableId).bind("f", fieldId).mapToMap().list()
-        }
+        val rows =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT name, end_snapshot FROM hog_column " +
+                        "WHERE catalog_id = :c AND table_id = :t AND field_id = :f ORDER BY begin_snapshot",
+                ).bind("c", catId(cat)).bind("t", info.tableId).bind("f", fieldId).mapToMap().list()
+            }
         // "mid" never persisted: only the original (ended) and "end" (live).
         assertThat(rows.map { it["name"] }).containsExactly("name", "end")
-        assertThat(catalogs.getTable(cat, ns, "t", snapshot = before)
-            .columns.single { it.fieldId == fieldId }.def.name).isEqualTo("name")
+        assertThat(
+            catalogs.getTable(cat, ns, "t", snapshot = before)
+                .columns.single { it.fieldId == fieldId }.def.name,
+        ).isEqualTo("name")
     }
 
     @Test
     fun `add then drop the same column in one request leaves no trace`() {
         val (cat, ns) = fixture()
-        val info = alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.AddColumn(ColumnDef("ghost", ColType.STRING)),
-            AlterOp.DropColumn("ghost"),
-        ))
+        val info =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.AddColumn(ColumnDef("ghost", ColType.STRING)),
+                    AlterOp.DropColumn("ghost"),
+                ),
+            )
         assertThat(info.columns.map { it.def.name }).doesNotContain("ghost")
-        val count = db.jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                "SELECT count(*) FROM hog_column " +
-                    "WHERE catalog_id = :c AND table_id = :t AND name = 'ghost'",
-            ).bind("c", catId(cat)).bind("t", info.tableId).mapTo(Long::class.javaObjectType).one()
-        }
+        val count =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_column " +
+                        "WHERE catalog_id = :c AND table_id = :t AND name = 'ghost'",
+                ).bind("c", catId(cat)).bind("t", info.tableId).mapTo(Long::class.javaObjectType).one()
+            }
         assertThat(count).isEqualTo(0)
     }
 
@@ -361,17 +460,24 @@ class AlterServiceIntegrationTest {
     fun `set spec twice in one request keeps only the final spec`() {
         val (cat, ns) = fixture()
         val cols = catalogs.getTable(cat, ns, "t").columns.associateBy { it.def.name }
-        val info = alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(cols["ts"]!!.fieldId, Transform.DAY))),
-            AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(cols["id"]!!.fieldId, Transform.IDENTITY))),
-        ))
+        val info =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(cols["ts"]!!.fieldId, Transform.DAY))),
+                    AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(cols["id"]!!.fieldId, Transform.IDENTITY))),
+                ),
+            )
         assertThat(info.partitionSpec!!.fields)
             .containsExactly(PartitionFieldDef(cols["id"]!!.fieldId, Transform.IDENTITY))
-        val specCount = db.jdbi.withHandleUnchecked { h ->
-            h.createQuery(
-                "SELECT count(*) FROM hog_partition_spec WHERE catalog_id = :c AND table_id = :t",
-            ).bind("c", catId(cat)).bind("t", info.tableId).mapTo(Long::class.javaObjectType).one()
-        }
+        val specCount =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_partition_spec WHERE catalog_id = :c AND table_id = :t",
+                ).bind("c", catId(cat)).bind("t", info.tableId).mapTo(Long::class.javaObjectType).one()
+            }
         assertThat(specCount).isEqualTo(1)
     }
 
@@ -380,13 +486,19 @@ class AlterServiceIntegrationTest {
     @Test
     fun `promotion lattice rejects everything but int-long and float-double`() {
         val (cat, ns) = fixture()
-        val illegal = listOf(
-            "count" to ColType.DOUBLE,   // int -> double
-            "count" to ColType.INT,      // no-op promotion
-            "id" to ColType.INT,         // narrowing long -> int
-            "score" to ColType.LONG,     // float -> long
-            "name" to ColType.LONG,      // string -> anything
-        )
+        val illegal =
+            listOf(
+                // int -> double
+                "count" to ColType.DOUBLE,
+                // no-op promotion
+                "count" to ColType.INT,
+                // narrowing long -> int
+                "id" to ColType.INT,
+                // float -> long
+                "score" to ColType.LONG,
+                // string -> anything
+                "name" to ColType.LONG,
+            )
         for ((col, target) in illegal) {
             assertThatThrownBy {
                 alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn(col, target)))
@@ -452,11 +564,17 @@ class AlterServiceIntegrationTest {
     fun `each alter bumps schema_version and records exactly one table_altered change`() {
         val (cat, ns) = fixture()
         val before = catalogs.getCatalog(cat)
-        val info = alter.alterTable(cat, ns, "t", listOf(
-            AlterOp.AddColumn(ColumnDef("a", ColType.STRING)),
-            AlterOp.AddColumn(ColumnDef("b", ColType.STRING)),
-            AlterOp.RenameColumn("a", "c"),
-        ))
+        val info =
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(
+                    AlterOp.AddColumn(ColumnDef("a", ColType.STRING)),
+                    AlterOp.AddColumn(ColumnDef("b", ColType.STRING)),
+                    AlterOp.RenameColumn("a", "c"),
+                ),
+            )
         val after = catalogs.getCatalog(cat)
         assertThat(after.headSnapshotId).isEqualTo(before.headSnapshotId + 1)
         assertThat(after.schemaVersion).isEqualTo(before.schemaVersion + 1)

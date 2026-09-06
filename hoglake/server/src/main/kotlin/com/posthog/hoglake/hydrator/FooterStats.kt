@@ -78,11 +78,12 @@ object FooterStats {
 
         val out = ArrayList<ColumnAgg>(columns.size)
         for (col in columns) {
-            val leaf = if (useFieldIds) {
-                byFieldId[Math.toIntExact(col.fieldId)]
-            } else {
-                byName[col.name]
-            }
+            val leaf =
+                if (useFieldIds) {
+                    byFieldId[Math.toIntExact(col.fieldId)]
+                } else {
+                    byName[col.name]
+                }
             if (leaf == null) {
                 log.debug {
                     "column ${col.name} (field ${col.fieldId}) not present in $filePath; no stats"
@@ -161,7 +162,11 @@ object FooterStats {
     }
 
     /** Decoded (lower, upper) for one chunk, or null when unreliable. */
-    private fun chunkBounds(col: CatalogColumn, leaf: Leaf, st: Statistics?): Pair<Any, Any>? {
+    private fun chunkBounds(
+        col: CatalogColumn,
+        leaf: Leaf,
+        st: Statistics?,
+    ): Pair<Any, Any>? {
         if (st == null || st.isMinMaxDeprecated) return null
         val rawMin = st.minValue() ?: return null
         val rawMax = st.maxValue() ?: return null
@@ -171,32 +176,38 @@ object FooterStats {
         return lo to hi
     }
 
-    private fun isNan(v: Any): Boolean =
-        (v is Float && v.isNaN()) || (v is Double && v.isNaN())
+    private fun isNan(v: Any): Boolean = (v is Float && v.isNaN()) || (v is Double && v.isNaN())
 
     /**
      * Decode one parquet statistics value into the typed representation for
      * the catalog column type, or null when the physical/logical shape does
      * not decode safely under that type.
      */
-    private fun decode(col: CatalogColumn, leaf: Leaf, raw: ByteArray, upper: Boolean): Any? =
+    private fun decode(
+        col: CatalogColumn,
+        leaf: Leaf,
+        raw: ByteArray,
+        upper: Boolean,
+    ): Any? =
         when (col.type) {
             ColType.BOOLEAN ->
                 if (leaf.physical == PhysicalType.BOOLEAN && raw.size == 1) raw[0] != 0.toByte() else null
             ColType.INT ->
                 if (leaf.physical == PhysicalType.INT32) readIntLE(raw) else null
-            ColType.LONG -> when (leaf.physical) {
-                PhysicalType.INT64 -> readLongLE(raw)
-                PhysicalType.INT32 -> readIntLE(raw)?.toLong()
-                else -> null
-            }
+            ColType.LONG ->
+                when (leaf.physical) {
+                    PhysicalType.INT64 -> readLongLE(raw)
+                    PhysicalType.INT32 -> readIntLE(raw)?.toLong()
+                    else -> null
+                }
             ColType.FLOAT ->
                 if (leaf.physical == PhysicalType.FLOAT) readIntLE(raw)?.let { Float.fromBits(it) } else null
-            ColType.DOUBLE -> when (leaf.physical) {
-                PhysicalType.DOUBLE -> readLongLE(raw)?.let { Double.fromBits(it) }
-                PhysicalType.FLOAT -> readIntLE(raw)?.let { Float.fromBits(it).toDouble() }
-                else -> null
-            }
+            ColType.DOUBLE ->
+                when (leaf.physical) {
+                    PhysicalType.DOUBLE -> readLongLE(raw)?.let { Double.fromBits(it) }
+                    PhysicalType.FLOAT -> readIntLE(raw)?.let { Float.fromBits(it).toDouble() }
+                    else -> null
+                }
             ColType.DATE ->
                 if (leaf.physical == PhysicalType.INT32) readIntLE(raw) else null
             ColType.TIME -> decodeTime(leaf, raw)
@@ -205,20 +216,25 @@ object FooterStats {
                 if (leaf.physical == PhysicalType.BYTE_ARRAY) raw else null
             ColType.UUID_T ->
                 if (leaf.physical == PhysicalType.FIXED_LEN_BYTE_ARRAY && raw.size == 16) raw else null
-            ColType.BINARY -> when (leaf.physical) {
-                PhysicalType.BYTE_ARRAY, PhysicalType.FIXED_LEN_BYTE_ARRAY -> raw
-                else -> null
-            }
+            ColType.BINARY ->
+                when (leaf.physical) {
+                    PhysicalType.BYTE_ARRAY, PhysicalType.FIXED_LEN_BYTE_ARRAY -> raw
+                    else -> null
+                }
             ColType.DECIMAL -> decodeDecimal(col, leaf, raw)
         }
 
-    private fun decodeTime(leaf: Leaf, raw: ByteArray): Long? {
-        val unit = (leaf.logical as? LogicalType.TimeType)?.unit()
-            ?: when (leaf.converted) {
-                ConvertedType.TIME_MICROS -> LogicalType.TimeUnit.MICROS
-                ConvertedType.TIME_MILLIS -> LogicalType.TimeUnit.MILLIS
-                else -> null
-            } ?: return null
+    private fun decodeTime(
+        leaf: Leaf,
+        raw: ByteArray,
+    ): Long? {
+        val unit =
+            (leaf.logical as? LogicalType.TimeType)?.unit()
+                ?: when (leaf.converted) {
+                    ConvertedType.TIME_MICROS -> LogicalType.TimeUnit.MICROS
+                    ConvertedType.TIME_MILLIS -> LogicalType.TimeUnit.MILLIS
+                    else -> null
+                } ?: return null
         return when (unit) {
             LogicalType.TimeUnit.MICROS ->
                 if (leaf.physical == PhysicalType.INT64) readLongLE(raw) else null
@@ -228,14 +244,19 @@ object FooterStats {
         }
     }
 
-    private fun decodeTimestamp(leaf: Leaf, raw: ByteArray, upper: Boolean): Long? {
+    private fun decodeTimestamp(
+        leaf: Leaf,
+        raw: ByteArray,
+        upper: Boolean,
+    ): Long? {
         if (leaf.physical != PhysicalType.INT64) return null
-        val unit = (leaf.logical as? LogicalType.TimestampType)?.unit()
-            ?: when (leaf.converted) {
-                ConvertedType.TIMESTAMP_MICROS -> LogicalType.TimeUnit.MICROS
-                ConvertedType.TIMESTAMP_MILLIS -> LogicalType.TimeUnit.MILLIS
-                else -> null
-            } ?: return null
+        val unit =
+            (leaf.logical as? LogicalType.TimestampType)?.unit()
+                ?: when (leaf.converted) {
+                    ConvertedType.TIMESTAMP_MICROS -> LogicalType.TimeUnit.MICROS
+                    ConvertedType.TIMESTAMP_MILLIS -> LogicalType.TimeUnit.MILLIS
+                    else -> null
+                } ?: return null
         val v = readLongLE(raw) ?: return null
         return when (unit) {
             LogicalType.TimeUnit.MICROS -> v
@@ -247,7 +268,11 @@ object FooterStats {
         }
     }
 
-    private fun decodeDecimal(col: CatalogColumn, leaf: Leaf, raw: ByteArray): BigInteger? {
+    private fun decodeDecimal(
+        col: CatalogColumn,
+        leaf: Leaf,
+        raw: ByteArray,
+    ): BigInteger? {
         val parquetScale = (leaf.logical as? LogicalType.DecimalType)?.scale() ?: leaf.scale ?: return null
         val catalogScale = col.decimalScale ?: return null
         if (parquetScale != catalogScale) {
@@ -265,17 +290,26 @@ object FooterStats {
         }
     }
 
-    private fun encodeBound(type: ColType, v: Any): ByteArray = when (type) {
-        ColType.STRING, ColType.UUID_T, ColType.BINARY -> (v as ByteArray).copyOf()
-        else -> IcebergSingleValue.encode(type, v)
-    }
+    private fun encodeBound(
+        type: ColType,
+        v: Any,
+    ): ByteArray =
+        when (type) {
+            ColType.STRING, ColType.UUID_T, ColType.BINARY -> (v as ByteArray).copyOf()
+            else -> IcebergSingleValue.encode(type, v)
+        }
 
     @Suppress("UNCHECKED_CAST")
-    private fun compare(type: ColType, a: Any, b: Any): Int = when (type) {
-        ColType.STRING, ColType.UUID_T, ColType.BINARY ->
-            java.util.Arrays.compareUnsigned(a as ByteArray, b as ByteArray)
-        else -> (a as Comparable<Any>).compareTo(b)
-    }
+    private fun compare(
+        type: ColType,
+        a: Any,
+        b: Any,
+    ): Int =
+        when (type) {
+            ColType.STRING, ColType.UUID_T, ColType.BINARY ->
+                java.util.Arrays.compareUnsigned(a as ByteArray, b as ByteArray)
+            else -> (a as Comparable<Any>).compareTo(b)
+        }
 
     private fun readIntLE(raw: ByteArray): Int? =
         if (raw.size == 4) ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).int else null

@@ -27,13 +27,15 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  */
 fun StatusPagesConfig.installErrorMapping() {
     exception<HoglakeException> { call, cause ->
-        val (status, code) = when (cause) {
-            is HoglakeException.NotFound -> HttpStatusCode.NotFound to "not_found"
-            is HoglakeException.AlreadyExists -> HttpStatusCode.Conflict to "already_exists"
-            is HoglakeException.CommitConflict -> HttpStatusCode.Conflict to "commit_conflict"
-            is HoglakeException.OffsetRegression -> HttpStatusCode.Conflict to "offset_regression"
-            is HoglakeException.Validation -> HttpStatusCode.UnprocessableEntity to "validation"
-        }
+        val (status, code) =
+            when (cause) {
+                is HoglakeException.NotFound -> HttpStatusCode.NotFound to "not_found"
+                is HoglakeException.AlreadyExists -> HttpStatusCode.Conflict to "already_exists"
+                is HoglakeException.CommitConflict -> HttpStatusCode.Conflict to "commit_conflict"
+                is HoglakeException.OffsetRegression -> HttpStatusCode.Conflict to "offset_regression"
+                is HoglakeException.Validation -> HttpStatusCode.UnprocessableEntity to "validation"
+                is HoglakeException.Expired -> HttpStatusCode.Gone to "expired"
+            }
         call.respond(status, ApiErrorDto(error = code, detail = cause.message))
     }
     // Ktor wraps request-body deserialization failures in BadRequestException;

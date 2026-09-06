@@ -24,7 +24,6 @@ import java.util.concurrent.TimeUnit
  */
 @Tag("integration")
 class CommitDeletesAndPartitionsTest {
-
     private val db = PgTestSupport.freshDatabase()
     private val jdbi: Jdbi get() = db.jdbi
     private val service = CommitService(db.jdbi)
@@ -48,58 +47,63 @@ class CommitDeletesAndPartitionsTest {
         namespace: String = "ns",
         tableNames: List<String> = listOf("events"),
         columnsPerTable: Int = 2,
-    ): Fixture = jdbi.withHandle<Fixture, Exception> { h ->
-        val catalogId = h.createQuery(
-            "INSERT INTO hog_catalog (name, data_path) VALUES (?, ?) RETURNING catalog_id",
-        ).bind(0, catalogName).bind(1, "s3://bucket/$catalogName").mapTo(Long::class.java).one()
+    ): Fixture =
+        jdbi.withHandle<Fixture, Exception> { h ->
+            val catalogId =
+                h.createQuery(
+                    "INSERT INTO hog_catalog (name, data_path) VALUES (?, ?) RETURNING catalog_id",
+                ).bind(0, catalogName).bind(1, "s3://bucket/$catalogName").mapTo(Long::class.java).one()
 
-        val namespaceId = h.createQuery(
-            """
+            val namespaceId =
+                h.createQuery(
+                    """
             UPDATE hog_catalog SET next_namespace_id = next_namespace_id + 1
              WHERE catalog_id = ? RETURNING next_namespace_id - 1
             """,
-        ).bind(0, catalogId).mapTo(Long::class.java).one()
-        h.createUpdate(
-            "INSERT INTO hog_namespace (catalog_id, namespace_id, name) VALUES (?, ?, ?)",
-        ).bind(0, catalogId).bind(1, namespaceId).bind(2, namespace).execute()
+                ).bind(0, catalogId).mapTo(Long::class.java).one()
+            h.createUpdate(
+                "INSERT INTO hog_namespace (catalog_id, namespace_id, name) VALUES (?, ?, ?)",
+            ).bind(0, catalogId).bind(1, namespaceId).bind(2, namespace).execute()
 
-        val tables = tableNames.associateWith { name ->
-            val tableId = h.createQuery(
-                """
+            val tables =
+                tableNames.associateWith { name ->
+                    val tableId =
+                        h.createQuery(
+                            """
                 UPDATE hog_catalog SET next_table_id = next_table_id + 1
                  WHERE catalog_id = ? RETURNING next_table_id - 1
                 """,
-            ).bind(0, catalogId).mapTo(Long::class.java).one()
-            h.createUpdate(
-                """
+                        ).bind(0, catalogId).mapTo(Long::class.java).one()
+                    h.createUpdate(
+                        """
                 INSERT INTO hog_table (catalog_id, table_id, created_snapshot, next_field_id)
                 VALUES (?, ?, 0, ?)
                 """,
-            ).bind(0, catalogId).bind(1, tableId).bind(2, columnsPerTable + 1L).execute()
-            h.createUpdate(
-                """
+                    ).bind(0, catalogId).bind(1, tableId).bind(2, columnsPerTable + 1L).execute()
+                    h.createUpdate(
+                        """
                 INSERT INTO hog_table_version (catalog_id, table_id, begin_snapshot, namespace_id, name)
                 VALUES (?, ?, 0, ?, ?)
                 """,
-            ).bind(0, catalogId).bind(1, tableId).bind(2, namespaceId).bind(3, name).execute()
-            for (ordinal in 0 until columnsPerTable) {
-                h.createUpdate(
-                    """
+                    ).bind(0, catalogId).bind(1, tableId).bind(2, namespaceId).bind(3, name).execute()
+                    for (ordinal in 0 until columnsPerTable) {
+                        h.createUpdate(
+                            """
                     INSERT INTO hog_column (catalog_id, table_id, field_id, begin_snapshot,
                                             name, col_type, ordinal)
                     VALUES (?, ?, ?, 0, ?, ?, ?)
                     """,
-                ).bind(0, catalogId).bind(1, tableId).bind(2, ordinal + 1L)
-                    .bind(3, "col${ordinal + 1}").bind(4, if (ordinal == 0) "long" else "string")
-                    .bind(5, ordinal).execute()
-            }
-            h.createUpdate(
-                "INSERT INTO hog_table_stats (catalog_id, table_id) VALUES (?, ?)",
-            ).bind(0, catalogId).bind(1, tableId).execute()
-            tableId
+                        ).bind(0, catalogId).bind(1, tableId).bind(2, ordinal + 1L)
+                            .bind(3, "col${ordinal + 1}").bind(4, if (ordinal == 0) "long" else "string")
+                            .bind(5, ordinal).execute()
+                    }
+                    h.createUpdate(
+                        "INSERT INTO hog_table_stats (catalog_id, table_id) VALUES (?, ?)",
+                    ).bind(0, catalogId).bind(1, tableId).execute()
+                    tableId
+                }
+            Fixture(catalogId, namespaceId, tables)
         }
-        Fixture(catalogId, namespaceId, tables)
-    }
 
     /** Live spec: fields are (source_field_id, transform) in key_index order. */
     private fun seedSpec(
@@ -127,14 +131,19 @@ class CommitDeletesAndPartitionsTest {
     }
 
     /** Mint a snapshot with one change row via direct SQL (DDL simulation). */
-    private fun seedChange(catalogId: Long, kind: String, objectId: Long): Long =
+    private fun seedChange(
+        catalogId: Long,
+        kind: String,
+        objectId: Long,
+    ): Long =
         jdbi.withHandle<Long, Exception> { h ->
-            val snapshotId = h.createQuery(
-                """
+            val snapshotId =
+                h.createQuery(
+                    """
                 UPDATE hog_catalog SET last_snapshot_id = last_snapshot_id + 1
                  WHERE catalog_id = ? RETURNING last_snapshot_id
                 """,
-            ).bind(0, catalogId).mapTo(Long::class.java).one()
+                ).bind(0, catalogId).mapTo(Long::class.java).one()
             h.createUpdate(
                 """
                 INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version)
@@ -156,14 +165,21 @@ class CommitDeletesAndPartitionsTest {
         partitionValues: List<String?>? = null,
     ) = FileRegistration(path, records, records * 100, 1234, null, partitionValues)
 
-    private fun del(dataFileId: Long, count: Long, path: String = "s3://b/dv-$dataFileId-$count.puffin") =
-        DeleteFileRegistration(dataFileId, path, count, 64)
+    private fun del(
+        dataFileId: Long,
+        count: Long,
+        path: String = "s3://b/dv-$dataFileId-$count.puffin",
+    ) = DeleteFileRegistration(dataFileId, path, count, 64)
 
-    private fun append(table: String, vararg files: FileRegistration) =
-        TableAppend("ns", table, files.toList())
+    private fun append(
+        table: String,
+        vararg files: FileRegistration,
+    ) = TableAppend("ns", table, files.toList())
 
-    private fun deletes(table: String, vararg files: DeleteFileRegistration) =
-        TableDeletes("ns", table, files.toList())
+    private fun deletes(
+        table: String,
+        vararg files: DeleteFileRegistration,
+    ) = TableDeletes("ns", table, files.toList())
 
     private data class DvRow(
         val deleteFileId: Long,
@@ -200,7 +216,10 @@ class CommitDeletesAndPartitionsTest {
                 .bind(0, catalogId).mapTo(Long::class.java).one()
         }
 
-    private fun tableStats(catalogId: Long, tableId: Long): Triple<Long, Long, Long> =
+    private fun tableStats(
+        catalogId: Long,
+        tableId: Long,
+    ): Triple<Long, Long, Long> =
         jdbi.withHandle<Triple<Long, Long, Long>, Exception> { h ->
             h.createQuery(
                 """
@@ -211,7 +230,10 @@ class CommitDeletesAndPartitionsTest {
                 .map { rs, _ -> Triple(rs.getLong(1), rs.getLong(2), rs.getLong(3)) }.one()
         }
 
-    private fun changeRows(catalogId: Long, snapshotId: Long): List<Pair<String, Long>> =
+    private fun changeRows(
+        catalogId: Long,
+        snapshotId: Long,
+    ): List<Pair<String, Long>> =
         jdbi.withHandle<List<Pair<String, Long>>, Exception> { h ->
             h.createQuery(
                 """
@@ -229,19 +251,24 @@ class CommitDeletesAndPartitionsTest {
             ).bind(0, catalogId).map { rs, _ -> rs.getLong(1) to rs.getLong(2) }.one()
         }
 
-    private fun specAndValues(catalogId: Long, dataFileId: Long): Pair<Long?, List<String?>> =
+    private fun specAndValues(
+        catalogId: Long,
+        dataFileId: Long,
+    ): Pair<Long?, List<String?>> =
         jdbi.withHandle<Pair<Long?, List<String?>>, Exception> { h ->
-            val specId = h.createQuery(
-                "SELECT spec_id FROM hog_data_file WHERE catalog_id = ? AND data_file_id = ?",
-            ).bind(0, catalogId).bind(1, dataFileId)
-                .map { rs, _ -> rs.getLong(1).let { if (rs.wasNull()) null else it } }.one()
-            val values = h.createQuery(
-                """
+            val specId =
+                h.createQuery(
+                    "SELECT spec_id FROM hog_data_file WHERE catalog_id = ? AND data_file_id = ?",
+                ).bind(0, catalogId).bind(1, dataFileId)
+                    .map { rs, _ -> rs.getLong(1).let { if (rs.wasNull()) null else it } }.one()
+            val values =
+                h.createQuery(
+                    """
                 SELECT value FROM hog_file_partition_value
                  WHERE catalog_id = ? AND data_file_id = ? ORDER BY key_index
                 """,
-            ).bind(0, catalogId).bind(1, dataFileId)
-                .map { rs, _ -> rs.getString(1) }.list()
+                ).bind(0, catalogId).bind(1, dataFileId)
+                    .map { rs, _ -> rs.getString(1) }.list()
             specId to values
         }
 
@@ -258,13 +285,14 @@ class CommitDeletesAndPartitionsTest {
         service.commit(
             "cat",
             CommitRequest(
-                appends = listOf(
-                    append(
-                        "events",
-                        file("s3://b/f1.parquet", 10, listOf("2026-01-01", "x")),
-                        file("s3://b/f2.parquet", 5, listOf("2026-01-02", null)),
+                appends =
+                    listOf(
+                        append(
+                            "events",
+                            file("s3://b/f1.parquet", 10, listOf("2026-01-01", "x")),
+                            file("s3://b/f2.parquet", 5, listOf("2026-01-02", null)),
+                        ),
                     ),
-                ),
             ),
         )
 
@@ -334,13 +362,14 @@ class CommitDeletesAndPartitionsTest {
         ) // snapshot 1, data file 1
         val statsBefore = tableStats(fx.catalogId, tableId)
 
-        val result = service.commit(
-            "cat",
-            CommitRequest(
-                readSnapshot = 1,
-                deletes = listOf(deletes("events", del(1, 3, "s3://b/dv1.puffin"))),
-            ),
-        )
+        val result =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = 1,
+                    deletes = listOf(deletes("events", del(1, 3, "s3://b/dv1.puffin"))),
+                ),
+            )
 
         assertThat(result.snapshotId).isEqualTo(2)
         assertThat(dvRows(fx.catalogId)).containsExactly(
@@ -552,14 +581,15 @@ class CommitDeletesAndPartitionsTest {
             CommitRequest(appends = listOf(append("events", file("s3://b/f1.parquet", 10)))),
         ) // snap 1, file 1
 
-        val result = service.commit(
-            "cat",
-            CommitRequest(
-                readSnapshot = 1,
-                appends = listOf(append("events", file("s3://b/f2.parquet", 4))),
-                deletes = listOf(deletes("events", del(1, 2, "s3://b/dv.puffin"))),
-            ),
-        ) // snap 2: data file 2, DV file 3 (shared allocator)
+        val result =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = 1,
+                    appends = listOf(append("events", file("s3://b/f2.parquet", 4))),
+                    deletes = listOf(deletes("events", del(1, 2, "s3://b/dv.puffin"))),
+                ),
+            ) // snap 2: data file 2, DV file 3 (shared allocator)
 
         assertThat(result.snapshotId).isEqualTo(2)
         assertThat(changeRows(fx.catalogId, 2)).containsExactly(
@@ -641,26 +671,28 @@ class CommitDeletesAndPartitionsTest {
         val start = CountDownLatch(1)
         val outcomes = java.util.concurrent.ConcurrentLinkedQueue<Any>()
         try {
-            val futures = (0 until 2).map { i ->
-                pool.submit {
-                    start.await()
-                    try {
-                        outcomes.add(
-                            service.commit(
-                                "cat",
-                                CommitRequest(
-                                    readSnapshot = 1,
-                                    deletes = listOf(
-                                        deletes("events", del(1, 10, "s3://b/dv-$i.puffin")),
+            val futures =
+                (0 until 2).map { i ->
+                    pool.submit {
+                        start.await()
+                        try {
+                            outcomes.add(
+                                service.commit(
+                                    "cat",
+                                    CommitRequest(
+                                        readSnapshot = 1,
+                                        deletes =
+                                            listOf(
+                                                deletes("events", del(1, 10, "s3://b/dv-$i.puffin")),
+                                            ),
                                     ),
                                 ),
-                            ),
-                        )
-                    } catch (e: Throwable) {
-                        outcomes.add(e)
+                            )
+                        } catch (e: Throwable) {
+                            outcomes.add(e)
+                        }
                     }
                 }
-            }
             start.countDown()
             futures.forEach { it.get(60, TimeUnit.SECONDS) }
         } finally {

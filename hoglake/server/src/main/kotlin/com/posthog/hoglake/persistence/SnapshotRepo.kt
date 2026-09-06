@@ -9,16 +9,16 @@ import java.time.OffsetDateTime
 
 /** hog_snapshot + hog_snapshot_change (the typed conflict vocabulary). */
 object SnapshotRepo {
-
-    private val snapshotMapper = RowMapper { rs, _ ->
-        Snapshot(
-            snapshotId = rs.getLong("snapshot_id"),
-            snapshotTime = rs.getObject("snapshot_time", OffsetDateTime::class.java).toInstant(),
-            schemaVersion = rs.getLong("schema_version"),
-            author = rs.getString("author"),
-            message = rs.getString("commit_message"),
-        )
-    }
+    private val snapshotMapper =
+        RowMapper { rs, _ ->
+            Snapshot(
+                snapshotId = rs.getLong("snapshot_id"),
+                snapshotTime = rs.getObject("snapshot_time", OffsetDateTime::class.java).toInstant(),
+                schemaVersion = rs.getLong("schema_version"),
+                author = rs.getString("author"),
+                message = rs.getString("commit_message"),
+            )
+        }
 
     fun insert(
         handle: Handle,
@@ -67,7 +67,12 @@ object SnapshotRepo {
      * change rows (see [changesFor]). [limit] is the raw SQL LIMIT — the
      * service passes limit+1 to detect hasMore.
      */
-    fun page(handle: Handle, catalogId: Long, after: Long, limit: Int): List<Snapshot> =
+    fun page(
+        handle: Handle,
+        catalogId: Long,
+        after: Long,
+        limit: Int,
+    ): List<Snapshot> =
         handle.createQuery(
             """
             SELECT snapshot_id, snapshot_time, schema_version, author, commit_message
@@ -106,10 +111,11 @@ object SnapshotRepo {
             .bind("fromId", fromId)
             .bind("toId", toId)
             .map { rs, _ ->
-                rs.getLong("snapshot_id") to SnapshotChange(
-                    kind = ChangeKind.fromWire(rs.getString("kind")),
-                    objectId = rs.getObject("object_id")?.let { (it as Number).toLong() },
-                )
+                rs.getLong("snapshot_id") to
+                    SnapshotChange(
+                        kind = ChangeKind.fromWire(rs.getString("kind")),
+                        objectId = rs.getObject("object_id")?.let { (it as Number).toLong() },
+                    )
             }
             .list()
             .groupBy({ it.first }, { it.second })

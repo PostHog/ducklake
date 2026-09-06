@@ -15,6 +15,8 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.put
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
+import java.time.Instant
+import java.time.format.DateTimeParseException
 import java.util.UUID
 
 /**
@@ -23,7 +25,10 @@ import java.util.UUID
  * validation, conflict detection) lives in CatalogService/CommitService,
  * whose HoglakeExceptions are mapped by ErrorMapping.
  */
-fun Application.installApiRoutes(catalogs: CatalogService, commits: CommitService) {
+fun Application.installApiRoutes(
+    catalogs: CatalogService,
+    commits: CommitService,
+) {
     routing {
         route("/v1/catalogs") {
             get {
@@ -51,6 +56,11 @@ fun Application.installApiRoutes(catalogs: CatalogService, commits: CommitServic
                         call.respond(
                             HttpStatusCode.Created,
                             catalogs.createNamespace(call.catalog(), req.name).toDto(),
+                        )
+                    }
+                    get("/{namespace}") {
+                        call.respond(
+                            catalogs.getNamespace(call.catalog(), call.namespace()).toDto(),
                         )
                     }
 
@@ -82,13 +92,16 @@ fun Application.installApiRoutes(catalogs: CatalogService, commits: CommitServic
                                         call.namespace(),
                                         call.table(),
                                         call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
                                     ).toDto(),
                                 )
                             }
                             delete {
                                 call.respond(
                                     catalogs.dropTable(
-                                        call.catalog(), call.namespace(), call.table(),
+                                        call.catalog(),
+                                        call.namespace(),
+                                        call.table(),
                                     ).toDto(),
                                 )
                             }
@@ -99,28 +112,24 @@ fun Application.installApiRoutes(catalogs: CatalogService, commits: CommitServic
                                         call.namespace(),
                                         call.table(),
                                         call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
                                     ).map { it.toDto() },
                                 )
                             }
                             get("/changes") {
-                                val from = call.longQuery("from_snapshot")
-                                    ?: throw BadRequestException(
-                                        "missing required query parameter 'from_snapshot'",
-                                    )
-                                val (tableUuid, range, files) = catalogs.changes(
-                                    call.catalog(),
-                                    call.namespace(),
-                                    call.table(),
-                                    from,
-                                    call.longQuery("to_snapshot"),
-                                )
+                                val from =
+                                    call.longQuery("from_snapshot")
+                                        ?: throw BadRequestException(
+                                            "missing required query parameter 'from_snapshot'",
+                                        )
                                 call.respond(
-                                    ChangePlanDto(
-                                        tableUuid = tableUuid,
-                                        fromSnapshot = range.first,
-                                        toSnapshot = range.last,
-                                        files = files.map { it.toDto() },
-                                    ),
+                                    catalogs.changes(
+                                        call.catalog(),
+                                        call.namespace(),
+                                        call.table(),
+                                        from,
+                                        call.longQuery("to_snapshot"),
+                                    ).toDto(),
                                 )
                             }
                         }
@@ -151,7 +160,10 @@ fun Application.installApiRoutes(catalogs: CatalogService, commits: CommitServic
                         val req = call.receive<CommitOffsetRequestDto>()
                         call.respond(
                             catalogs.commitOffset(
-                                call.catalog(), call.consumer(), tableUuid, req.snapshotId,
+                                call.catalog(),
+                                call.consumer(),
+                                tableUuid,
+                                req.snapshotId,
                             ).toDto(),
                         )
                     }
@@ -175,6 +187,7 @@ fun Application.installScanRoutes(scan: ScanService) {
                     call.namespace(),
                     call.table(),
                     call.longQuery("snapshot"),
+                    call.instantQuery("at_timestamp"),
                 ).map { it.toDto() },
             )
         }
@@ -182,13 +195,17 @@ fun Application.installScanRoutes(scan: ScanService) {
 }
 
 // ---- parameter helpers ---------------------------------------------------
+// internal (not private): ViewRoutes.kt shares them.
 
-private fun ApplicationCall.pathParam(name: String): String =
+internal fun ApplicationCall.pathParam(name: String): String =
     parameters[name] ?: throw BadRequestException("missing path parameter '$name'")
 
-private fun ApplicationCall.catalog() = pathParam("catalog")
-private fun ApplicationCall.namespace() = pathParam("namespace")
+internal fun ApplicationCall.catalog() = pathParam("catalog")
+
+internal fun ApplicationCall.namespace() = pathParam("namespace")
+
 private fun ApplicationCall.table() = pathParam("table")
+
 private fun ApplicationCall.consumer() = pathParam("consumer")
 
 private fun ApplicationCall.uuidPath(name: String): UUID {
@@ -210,4 +227,16 @@ private fun ApplicationCall.intQuery(name: String): Int? =
     request.queryParameters[name]?.let {
         it.toIntOrNull()
             ?: throw BadRequestException("query parameter '$name' must be an integer, got '$it'")
+    }
+
+/** ISO-8601 instant query parameter (e.g. 2026-09-04T12:00:00Z); unparseable -> 400. */
+private fun ApplicationCall.instantQuery(name: String): Instant? =
+    request.queryParameters[name]?.let {
+        try {
+            Instant.parse(it)
+        } catch (_: DateTimeParseException) {
+            throw BadRequestException(
+                "query parameter '$name' must be an ISO-8601 instant, got '$it'",
+            )
+        }
     }

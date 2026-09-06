@@ -5,7 +5,6 @@ import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 
 class ObjectStorePathTest {
-
     @Test
     fun `parses bucket and key`() {
         assertThat(ObjectStore.parse("s3://bucket/key"))

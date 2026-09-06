@@ -1,0 +1,503 @@
+{
+  "format": "hoglake-bounds-vectors",
+  "version": 1,
+  "description": "Cross-language differential vectors for the Iceberg single-value binary bounds codec. Each vector is (type, type_params, value, hex): hex is the lowercase hex of the exact encoding. Any implementation (Python, JVM, ...) must satisfy encode(value) == unhex(hex) and, unless verify == 'encode_only', decode(unhex(hex)) == value and encode(decode(unhex(hex))) == unhex(hex).",
+  "value_conventions": {
+    "boolean": "'true' | 'false'",
+    "int": "decimal integer string (int32 domain)",
+    "long": "decimal integer string (int64 domain)",
+    "float": "decimal string or 'NaN'/'Infinity'/'-Infinity'; for NaN the hex bytes are authoritative (payload NaNs share the 'NaN' value token)",
+    "double": "same conventions as float, 8-byte width",
+    "date": "days since 1970-01-01, decimal integer string",
+    "time": "microseconds since midnight, decimal integer string",
+    "timestamp": "microseconds since 1970-01-01T00:00:00, decimal integer string",
+    "timestamptz": "microseconds since 1970-01-01T00:00:00Z, decimal integer string",
+    "string": "the string itself (JSON string escapes apply)",
+    "uuid": "canonical 8-4-4-4-12 lowercase form",
+    "binary": "standard base64 of the raw bytes",
+    "decimal": "UNSCALED integer as decimal string; type_params.scale applies"
+  },
+  "generated_by": "pyhoglake 0.1.0 bounds codec via tests/qe_vectors.py conventions",
+  "vectors": [
+    {
+      "type": "boolean",
+      "type_params": null,
+      "value": "true",
+      "hex": "01",
+      "note": "canonical true = 0x01"
+    },
+    {
+      "type": "boolean",
+      "type_params": null,
+      "value": "false",
+      "hex": "00",
+      "note": "canonical false = 0x00"
+    },
+    {
+      "type": "int",
+      "type_params": null,
+      "value": "0",
+      "hex": "00000000",
+      "note": "zero"
+    },
+    {
+      "type": "int",
+      "type_params": null,
+      "value": "-1",
+      "hex": "ffffffff",
+      "note": "all-ones LE"
+    },
+    {
+      "type": "int",
+      "type_params": null,
+      "value": "2147483647",
+      "hex": "ffffff7f",
+      "note": "int32 max"
+    },
+    {
+      "type": "int",
+      "type_params": null,
+      "value": "-2147483648",
+      "hex": "00000080",
+      "note": "int32 min"
+    },
+    {
+      "type": "int",
+      "type_params": null,
+      "value": "305419896",
+      "hex": "78563412",
+      "note": "byte-order witness: LE 78 56 34 12"
+    },
+    {
+      "type": "long",
+      "type_params": null,
+      "value": "9223372036854775807",
+      "hex": "ffffffffffffff7f",
+      "note": "int64 max"
+    },
+    {
+      "type": "long",
+      "type_params": null,
+      "value": "-9223372036854775808",
+      "hex": "0000000000000080",
+      "note": "int64 min"
+    },
+    {
+      "type": "long",
+      "type_params": null,
+      "value": "4611686018427387904",
+      "hex": "0000000000000040",
+      "note": "2^62 (snapshot-id scale)"
+    },
+    {
+      "type": "long",
+      "type_params": null,
+      "value": "-1",
+      "hex": "ffffffffffffffff",
+      "note": "all-ones LE"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "0.0",
+      "hex": "00000000",
+      "note": "positive zero"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "-0.0",
+      "hex": "00000080",
+      "note": "negative zero: sign bit only"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "1.0",
+      "hex": "0000803f",
+      "note": "one"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "-2.5",
+      "hex": "000020c0",
+      "note": "exact binary fraction"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "3.4028235e38",
+      "hex": "ffff7f7f",
+      "note": "float32 max finite"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "1e-45",
+      "hex": "01000000",
+      "note": "float32 min subnormal"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "Infinity",
+      "hex": "0000807f",
+      "note": "+inf"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "-Infinity",
+      "hex": "000080ff",
+      "note": "-inf"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "NaN",
+      "hex": "0000c07f",
+      "note": "canonical quiet NaN (Python packs 7fc00000)"
+    },
+    {
+      "type": "float",
+      "type_params": null,
+      "value": "NaN",
+      "hex": "0100c07f",
+      "note": "NaN with payload 0x400001: codec preserves NaN bits verbatim"
+    },
+    {
+      "type": "double",
+      "type_params": null,
+      "value": "0.0",
+      "hex": "0000000000000000",
+      "note": "positive zero"
+    },
+    {
+      "type": "double",
+      "type_params": null,
+      "value": "-0.0",
+      "hex": "0000000000000080",
+      "note": "negative zero: sign bit only"
+    },
+    {
+      "type": "double",
+      "type_params": null,
+      "value": "1.0",
+      "hex": "000000000000f03f",
+      "note": "one"
+    },
+    {
+      "type": "double",
+      "type_params": null,
+      "value": "0.1",
+      "hex": "9a9999999999b93f",
+      "note": "classic non-representable decimal"
+    },
+    {
+      "type": "double",
+      "type_params": null,
+      "value": "1.7976931348623157e308",
+      "hex": "ffffffffffffef7f",
+      "note": "double max finite"
+    },
+    {
+      "type": "double",
+      "type_params": null,
+      "value": "5e-324",
+      "hex": "0100000000000000",
+      "note": "double min subnormal"
+    },
+    {
+      "type": "double",
+      "type_params": null,
+      "value": "Infinity",
+      "hex": "000000000000f07f",
+      "note": "+inf"
+    },
+    {
+      "type": "double",
+      "type_params": null,
+      "value": "NaN",
+      "hex": "000000000000f87f",
+      "note": "canonical quiet NaN (7ff8000000000000)"
+    },
+    {
+      "type": "double",
+      "type_params": null,
+      "value": "NaN",
+      "hex": "390500000000f87f",
+      "note": "NaN with payload: bits preserved bit-exactly"
+    },
+    {
+      "type": "date",
+      "type_params": null,
+      "value": "0",
+      "hex": "00000000",
+      "note": "1970-01-01"
+    },
+    {
+      "type": "date",
+      "type_params": null,
+      "value": "-1",
+      "hex": "ffffffff",
+      "note": "1969-12-31"
+    },
+    {
+      "type": "date",
+      "type_params": null,
+      "value": "-719162",
+      "hex": "c606f5ff",
+      "note": "date 0001-01-01 (python date.min)"
+    },
+    {
+      "type": "date",
+      "type_params": null,
+      "value": "2932896",
+      "hex": "a0c02c00",
+      "note": "date 9999-12-31 (python date.max)"
+    },
+    {
+      "type": "time",
+      "type_params": null,
+      "value": "0",
+      "hex": "0000000000000000",
+      "note": "midnight"
+    },
+    {
+      "type": "time",
+      "type_params": null,
+      "value": "86399999999",
+      "hex": "ff5fd71d14000000",
+      "note": "23:59:59.999999 - last legal micro"
+    },
+    {
+      "type": "time",
+      "type_params": null,
+      "value": "49062123456",
+      "hex": "c097546c0b000000",
+      "note": "13:37:42.123456"
+    },
+    {
+      "type": "timestamp",
+      "type_params": null,
+      "value": "0",
+      "hex": "0000000000000000",
+      "note": "1970-01-01T00:00:00"
+    },
+    {
+      "type": "timestamp",
+      "type_params": null,
+      "value": "-1",
+      "hex": "ffffffffffffffff",
+      "note": "one microsecond before epoch"
+    },
+    {
+      "type": "timestamp",
+      "type_params": null,
+      "value": "1788609600000500",
+      "hex": "f491d91fbb5a0600",
+      "note": "2026-09-04T12:00:00.000500"
+    },
+    {
+      "type": "timestamp",
+      "type_params": null,
+      "value": "-62135596800000000",
+      "hex": "0040d400014023ff",
+      "note": "0001-01-01T00:00:00 (decode floor)"
+    },
+    {
+      "type": "timestamptz",
+      "type_params": null,
+      "value": "1788609600000000",
+      "hex": "0090d91fbb5a0600",
+      "note": "2026-09-04T12:00:00Z; tz encodes identically to timestamp"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "",
+      "hex": "",
+      "note": "empty string - a legal empty payload"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "ab",
+      "hex": "6162",
+      "note": "plain ascii"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "h\u00e9llo",
+      "hex": "68c3a96c6c6f",
+      "note": "2-byte UTF-8 sequence"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "\u65e5\u672c\u8a9e",
+      "hex": "e697a5e69cace8aa9e",
+      "note": "3-byte UTF-8 sequences"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "\ud83e\udd94",
+      "hex": "f09fa694",
+      "note": "astral plane: HEDGEHOG emoji, 4-byte UTF-8"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "a\u0000b",
+      "hex": "610062",
+      "note": "embedded NUL survives"
+    },
+    {
+      "type": "uuid",
+      "type_params": null,
+      "value": "00000000-0000-0000-0000-000000000000",
+      "hex": "00000000000000000000000000000000",
+      "note": "all zeros"
+    },
+    {
+      "type": "uuid",
+      "type_params": null,
+      "value": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+      "hex": "ffffffffffffffffffffffffffffffff",
+      "note": "all ones"
+    },
+    {
+      "type": "uuid",
+      "type_params": null,
+      "value": "f79c3e09-677c-4bbd-a479-3f349cb785e7",
+      "hex": "f79c3e09677c4bbda4793f349cb785e7",
+      "note": "big-endian: first encoded byte is 0xf7"
+    },
+    {
+      "type": "uuid",
+      "type_params": null,
+      "value": "80000000-0000-0000-0000-000000000001",
+      "hex": "80000000000000000000000000000001",
+      "note": "MSB set: sign-bit trap for signed-byte JVM readers"
+    },
+    {
+      "type": "binary",
+      "type_params": null,
+      "value": "",
+      "hex": "",
+      "note": "empty payload"
+    },
+    {
+      "type": "binary",
+      "type_params": null,
+      "value": "AAH/",
+      "hex": "0001ff",
+      "note": "base64 of 00 01 ff"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 10,
+        "scale": 2
+      },
+      "value": "0",
+      "hex": "00",
+      "note": "zero is one 0x00 byte"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 10,
+        "scale": 2
+      },
+      "value": "127",
+      "hex": "7f",
+      "note": "max positive single byte"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 10,
+        "scale": 2
+      },
+      "value": "128",
+      "hex": "0080",
+      "note": "needs a leading sign byte: 00 80"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 10,
+        "scale": 2
+      },
+      "value": "-128",
+      "hex": "80",
+      "note": "min negative single byte: 80"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 10,
+        "scale": 2
+      },
+      "value": "-129",
+      "hex": "ff7f",
+      "note": "two bytes: ff 7f"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 10,
+        "scale": 2
+      },
+      "value": "1234",
+      "hex": "04d2",
+      "note": "12.34 at scale 2"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 10,
+        "scale": 2
+      },
+      "value": "-1234",
+      "hex": "fb2e",
+      "note": "-12.34 at scale 2"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 28,
+        "scale": 0
+      },
+      "value": "9999999999999999999999999999",
+      "hex": "204fce5e3e2502610fffffff",
+      "note": "28 digits: the largest width the Python decode context survives"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 38,
+        "scale": 0
+      },
+      "value": "99999999999999999999999999999999999999",
+      "hex": "4b3b4ca85a86c47a098a223fffffffff",
+      "note": "precision-38 max: 16 bytes. encode_only: pyhoglake decode_bound rounds >28-digit unscaled values (decimal-context bug)",
+      "verify": "encode_only"
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 38,
+        "scale": 0
+      },
+      "value": "-99999999999999999999999999999999999999",
+      "hex": "b4c4b357a5793b85f675ddc000000001",
+      "note": "precision-38 min. encode_only: same decode-context bug",
+      "verify": "encode_only"
+    }
+  ]
+}

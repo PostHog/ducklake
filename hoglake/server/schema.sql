@@ -16,8 +16,8 @@
 --    ids are dense and ordered with commit order.
 --  * Typed conflict vocabulary: hog_snapshot_change replaces DuckLake's
 --    comma-encoded changes_made string.
---  * No inlined data, no delete files (v1 is append-only), no macros,
---    views, or tags yet.
+--  * Row-level deletes are deletion vectors (one live DV per data file);
+--    no inlined data, macros, or tags — by design, not omission.
 
 CREATE TABLE hog_catalog (
     catalog_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -29,6 +29,11 @@ CREATE TABLE hog_catalog (
     next_table_id    bigint NOT NULL DEFAULT 1,
     next_file_id     bigint NOT NULL DEFAULT 1,
     next_namespace_id bigint NOT NULL DEFAULT 1,
+    snapshot_retention_seconds bigint
+        CHECK (snapshot_retention_seconds IS NULL OR snapshot_retention_seconds > 0),
+    consumer_floor   boolean NOT NULL DEFAULT true,
+    earliest_snapshot_id bigint NOT NULL DEFAULT 0,
+    next_view_id     bigint NOT NULL DEFAULT 1,
     created_at       timestamptz NOT NULL DEFAULT now()
 );
 
@@ -49,7 +54,8 @@ CREATE TABLE hog_snapshot_change (
     kind        text   NOT NULL CHECK (kind IN (
                     'namespace_created', 'namespace_dropped',
                     'table_created', 'table_dropped', 'table_altered',
-                    'table_inserted_into', 'table_deleted_from')),
+                    'table_inserted_into', 'table_deleted_from',
+                    'view_created', 'view_dropped')),
     object_id   bigint,  -- table_id or namespace_id; NULL only for catalog-level kinds
     FOREIGN KEY (catalog_id, snapshot_id)
         REFERENCES hog_snapshot ON DELETE CASCADE
@@ -138,13 +144,16 @@ CREATE TABLE hog_table_stats (
     table_id        bigint NOT NULL,
     record_count    bigint NOT NULL DEFAULT 0,
     file_size_bytes bigint NOT NULL DEFAULT 0,
-    next_row_id     bigint NOT NULL DEFAULT 0,
+    -- CHECK is the DB backstop against row-id allocator overflow: a
+    -- wrapped (negative) allocator would silently break the lineage
+    -- guarantee. CommitService rejects overflowing sums before this.
+    next_row_id     bigint NOT NULL DEFAULT 0 CHECK (next_row_id >= 0),
     PRIMARY KEY (catalog_id, table_id),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE
 );
 
--- The file manifest. Append-only v1: files are never end-snapshotted by
--- deletes, only (later) by compaction/expiry.
+-- The file manifest. Deletes never end-snapshot a data file (DVs mask
+-- rows); end_snapshot comes from drop, compaction, or expiry.
 CREATE TABLE hog_data_file (
     catalog_id      bigint NOT NULL,
     data_file_id    bigint NOT NULL,
@@ -275,3 +284,38 @@ CREATE UNIQUE INDEX hog_delete_file_one_live_per_data_file
     ON hog_delete_file (catalog_id, data_file_id) WHERE end_snapshot IS NULL;
 CREATE INDEX hog_delete_file_live
     ON hog_delete_file (catalog_id, table_id) WHERE end_snapshot IS NULL;
+
+-- Versioned views: SQL text stored with its dialect. Single versioned
+-- table (no identity split: views carry no lineage/state that must
+-- survive re-creation).
+CREATE TABLE hog_view (
+    catalog_id     bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
+    view_id        bigint NOT NULL,
+    view_uuid      uuid   NOT NULL DEFAULT gen_random_uuid(),
+    namespace_id   bigint NOT NULL,
+    name           text   NOT NULL,
+    dialect        text   NOT NULL DEFAULT 'trino',
+    sql            text   NOT NULL,
+    begin_snapshot bigint NOT NULL,
+    end_snapshot   bigint,
+    PRIMARY KEY (catalog_id, view_id),
+    FOREIGN KEY (catalog_id, namespace_id)
+        REFERENCES hog_namespace ON DELETE CASCADE,
+    CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
+);
+CREATE UNIQUE INDEX hog_view_live_name
+    ON hog_view (catalog_id, namespace_id, name) WHERE end_snapshot IS NULL;
+
+-- The file-removal queue. Physical deletion is decoupled from metadata
+-- deletion, batched, and ALWAYS liveness-checked at drain time — a
+-- queue entry is a suggestion, never an authorization (README.md §8).
+CREATE TABLE hog_file_removal (
+    removal_id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    catalog_id   bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
+    path         text   NOT NULL,
+    file_kind    text   NOT NULL CHECK (file_kind IN ('data', 'delete')),
+    reason       text   NOT NULL CHECK (reason IN ('snapshot_expiry', 'table_drop_gc')),
+    scheduled_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX hog_file_removal_drain
+    ON hog_file_removal (catalog_id, removal_id);

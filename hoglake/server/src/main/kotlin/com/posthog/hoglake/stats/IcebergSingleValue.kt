@@ -34,12 +34,9 @@ import java.util.UUID
  *  - decimal: unscaled value as minimal two's-complement big-endian
  */
 object IcebergSingleValue {
+    fun encodeBoolean(value: Boolean): ByteArray = byteArrayOf(if (value) 0x01 else 0x00)
 
-    fun encodeBoolean(value: Boolean): ByteArray =
-        byteArrayOf(if (value) 0x01 else 0x00)
-
-    fun encodeInt(value: Int): ByteArray =
-        ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array()
+    fun encodeInt(value: Int): ByteArray = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array()
 
     fun encodeLong(value: Long): ByteArray =
         ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(value).array()
@@ -54,27 +51,37 @@ object IcebergSingleValue {
     fun encodeDate(daysSinceEpoch: Int): ByteArray = encodeInt(daysSinceEpoch)
 
     fun encodeDate(value: LocalDate): ByteArray =
-        encodeDate(Math.toIntExact(value.toEpochDay()))
+        try {
+            encodeDate(Math.toIntExact(value.toEpochDay()))
+        } catch (_: ArithmeticException) {
+            throw IllegalArgumentException(
+                "date $value is outside the encodable range (int32 epoch days)",
+            )
+        }
 
     /** Time of day as microseconds since midnight. */
     fun encodeTimeMicros(microsSinceMidnight: Long): ByteArray = encodeLong(microsSinceMidnight)
 
-    fun encodeTime(value: LocalTime): ByteArray =
-        encodeTimeMicros(value.toNanoOfDay() / 1_000)
+    fun encodeTime(value: LocalTime): ByteArray = encodeTimeMicros(value.toNanoOfDay() / 1_000)
 
     /** Timestamp (with or without zone) as microseconds since the unix epoch. */
     fun encodeTimestampMicros(microsSinceEpoch: Long): ByteArray = encodeLong(microsSinceEpoch)
 
-    fun encodeTimestamp(value: LocalDateTime): ByteArray =
-        encodeTimestamptz(value.toInstant(ZoneOffset.UTC))
+    fun encodeTimestamp(value: LocalDateTime): ByteArray = encodeTimestamptz(value.toInstant(ZoneOffset.UTC))
 
     fun encodeTimestamptz(value: Instant): ByteArray =
-        encodeTimestampMicros(
-            Math.addExact(
-                Math.multiplyExact(value.epochSecond, 1_000_000L),
-                (value.nano / 1_000).toLong(),
-            ),
-        )
+        try {
+            encodeTimestampMicros(
+                Math.addExact(
+                    Math.multiplyExact(value.epochSecond, 1_000_000L),
+                    (value.nano / 1_000).toLong(),
+                ),
+            )
+        } catch (_: ArithmeticException) {
+            throw IllegalArgumentException(
+                "timestamp $value is outside the encodable range (int64 micros since epoch)",
+            )
+        }
 
     fun encodeString(value: String): ByteArray = value.toByteArray(Charsets.UTF_8)
 
@@ -103,50 +110,65 @@ object IcebergSingleValue {
      * java.math companions. Throws [IllegalArgumentException] on a
      * type/value mismatch — bounds must never be guessed.
      */
-    fun encode(type: ColType, value: Any): ByteArray = when (type) {
-        ColType.BOOLEAN -> encodeBoolean(expect(type, value))
-        ColType.INT -> encodeInt(expect(type, value))
-        ColType.LONG -> when (value) {
-            is Long -> encodeLong(value)
-            is Int -> encodeLong(value.toLong())
-            else -> mismatch(type, value)
+    fun encode(
+        type: ColType,
+        value: Any,
+    ): ByteArray =
+        when (type) {
+            ColType.BOOLEAN -> encodeBoolean(expect(type, value))
+            ColType.INT -> encodeInt(expect(type, value))
+            ColType.LONG ->
+                when (value) {
+                    is Long -> encodeLong(value)
+                    is Int -> encodeLong(value.toLong())
+                    else -> mismatch(type, value)
+                }
+            ColType.FLOAT -> encodeFloat(expect(type, value))
+            ColType.DOUBLE -> encodeDouble(expect(type, value))
+            ColType.DATE ->
+                when (value) {
+                    is Int -> encodeDate(value)
+                    is LocalDate -> encodeDate(value)
+                    else -> mismatch(type, value)
+                }
+            ColType.TIME ->
+                when (value) {
+                    is Long -> encodeTimeMicros(value)
+                    is LocalTime -> encodeTime(value)
+                    else -> mismatch(type, value)
+                }
+            ColType.TIMESTAMP ->
+                when (value) {
+                    is Long -> encodeTimestampMicros(value)
+                    is LocalDateTime -> encodeTimestamp(value)
+                    else -> mismatch(type, value)
+                }
+            ColType.TIMESTAMPTZ ->
+                when (value) {
+                    is Long -> encodeTimestampMicros(value)
+                    is Instant -> encodeTimestamptz(value)
+                    else -> mismatch(type, value)
+                }
+            ColType.STRING -> encodeString(expect(type, value))
+            ColType.UUID_T -> encodeUuid(expect(type, value))
+            ColType.BINARY -> encodeBinary(expect(type, value))
+            ColType.DECIMAL ->
+                when (value) {
+                    is BigDecimal -> encodeDecimal(value)
+                    is BigInteger -> encodeDecimalUnscaled(value)
+                    else -> mismatch(type, value)
+                }
         }
-        ColType.FLOAT -> encodeFloat(expect(type, value))
-        ColType.DOUBLE -> encodeDouble(expect(type, value))
-        ColType.DATE -> when (value) {
-            is Int -> encodeDate(value)
-            is LocalDate -> encodeDate(value)
-            else -> mismatch(type, value)
-        }
-        ColType.TIME -> when (value) {
-            is Long -> encodeTimeMicros(value)
-            is LocalTime -> encodeTime(value)
-            else -> mismatch(type, value)
-        }
-        ColType.TIMESTAMP -> when (value) {
-            is Long -> encodeTimestampMicros(value)
-            is LocalDateTime -> encodeTimestamp(value)
-            else -> mismatch(type, value)
-        }
-        ColType.TIMESTAMPTZ -> when (value) {
-            is Long -> encodeTimestampMicros(value)
-            is Instant -> encodeTimestamptz(value)
-            else -> mismatch(type, value)
-        }
-        ColType.STRING -> encodeString(expect(type, value))
-        ColType.UUID_T -> encodeUuid(expect(type, value))
-        ColType.BINARY -> encodeBinary(expect(type, value))
-        ColType.DECIMAL -> when (value) {
-            is BigDecimal -> encodeDecimal(value)
-            is BigInteger -> encodeDecimalUnscaled(value)
-            else -> mismatch(type, value)
-        }
-    }
 
-    private inline fun <reified T> expect(type: ColType, value: Any): T =
-        value as? T ?: mismatch(type, value)
+    private inline fun <reified T> expect(
+        type: ColType,
+        value: Any,
+    ): T = value as? T ?: mismatch(type, value)
 
-    private fun mismatch(type: ColType, value: Any): Nothing =
+    private fun mismatch(
+        type: ColType,
+        value: Any,
+    ): Nothing =
         throw IllegalArgumentException(
             "cannot encode ${value::class.qualifiedName} as Iceberg single-value for column type ${type.wire}",
         )

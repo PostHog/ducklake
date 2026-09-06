@@ -24,7 +24,6 @@ class ObjectStore(
     secretKey: String?,
     pathStyle: Boolean,
 ) : AutoCloseable {
-
     constructor(config: Config) : this(
         endpoint = config.s3Endpoint.ifBlank { null },
         region = config.s3Region,
@@ -33,18 +32,19 @@ class ObjectStore(
         pathStyle = config.s3PathStyle,
     )
 
-    private val s3: S3Client = S3Client.builder()
-        .region(Region.of(region))
-        .apply {
-            if (endpoint != null) endpointOverride(URI.create(endpoint))
-            if (accessKey != null && secretKey != null) {
-                credentialsProvider(
-                    StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)),
-                )
+    private val s3: S3Client =
+        S3Client.builder()
+            .region(Region.of(region))
+            .apply {
+                if (endpoint != null) endpointOverride(URI.create(endpoint))
+                if (accessKey != null && secretKey != null) {
+                    credentialsProvider(
+                        StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)),
+                    )
+                }
             }
-        }
-        .forcePathStyle(pathStyle)
-        .build()
+            .forcePathStyle(pathStyle)
+            .build()
 
     data class Location(val bucket: String, val key: String)
 
@@ -57,18 +57,27 @@ class ObjectStore(
     }
 
     /** Ranged read of the object's tail, from byte [startInclusive] to the end. */
-    fun getTail(pathUri: String, startInclusive: Long): ByteArray {
+    fun getTail(
+        pathUri: String,
+        startInclusive: Long,
+    ): ByteArray {
         require(startInclusive >= 0) { "negative range start $startInclusive for $pathUri" }
         return getRange(pathUri, "bytes=$startInclusive-")
     }
 
     /** Ranged read of the object's first [length] bytes. */
-    fun getPrefix(pathUri: String, length: Int): ByteArray {
+    fun getPrefix(
+        pathUri: String,
+        length: Int,
+    ): ByteArray {
         require(length > 0) { "non-positive prefix length $length for $pathUri" }
         return getRange(pathUri, "bytes=0-${length - 1}")
     }
 
-    private fun getRange(pathUri: String, range: String): ByteArray {
+    private fun getRange(
+        pathUri: String,
+        range: String,
+    ): ByteArray {
         val loc = parse(pathUri)
         return s3.getObjectAsBytes(
             GetObjectRequest.builder()
@@ -79,7 +88,10 @@ class ObjectStore(
         ).asByteArray()
     }
 
-    fun put(pathUri: String, bytes: ByteArray) {
+    fun put(
+        pathUri: String,
+        bytes: ByteArray,
+    ) {
         val loc = parse(pathUri)
         s3.putObject(
             PutObjectRequest.builder().bucket(loc.bucket).key(loc.key).build(),

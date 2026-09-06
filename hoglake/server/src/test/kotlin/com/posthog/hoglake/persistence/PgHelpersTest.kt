@@ -5,7 +5,6 @@ import org.junit.jupiter.api.Test
 
 /** Pure-logic unit tests for the persistence helpers (no database). */
 class PgHelpersTest {
-
     @Test
     fun `type params round-trip through jsonb serialization`() {
         val params: Map<String, Any?> = mapOf("precision" to 38, "scale" to 9, "note" to null)

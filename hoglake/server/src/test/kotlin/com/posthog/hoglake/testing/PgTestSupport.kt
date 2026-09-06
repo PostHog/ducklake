@@ -56,13 +56,16 @@ object PgTestSupport {
             conn.createStatement().use { it.execute("CREATE DATABASE $name") }
         }
         val url = container.jdbcUrl.replace("/${container.databaseName}", "/$name")
-        val ds = HikariDataSource(HikariConfig().apply {
-            jdbcUrl = url
-            username = container.username
-            password = container.password
-            maximumPoolSize = 8
-            poolName = name
-        })
+        val ds =
+            HikariDataSource(
+                HikariConfig().apply {
+                    jdbcUrl = url
+                    username = container.username
+                    password = container.password
+                    maximumPoolSize = 8
+                    poolName = name
+                },
+            )
         return TestDb(ds, Database.jdbi(ds), url)
     }
 }

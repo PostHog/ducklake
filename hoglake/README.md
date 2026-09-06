@@ -6,8 +6,26 @@ control plane. Companion docs in this directory:
 
 - [ducklake-api-map.md](ducklake-api-map.md) — every API the DuckLake extension + pyducklake
   expose today, what it does, what's wrong with it.
+- [iceberg-federation.md](iceberg-federation.md) — what v1 must get
+  right for the Iceberg REST facade to work (field IDs, transforms,
+  delete encoding, stats bounds, metadata artifacts).
+- [trino-integration.md](trino-integration.md) — Trino as the facade's
+  first consumer, and the commit-shape choices that keep append-only
+  Trino writes a translation away.
 - [metadata-schema.md](metadata-schema.md) — the current `ducklake_*` metadata schema, its
   invariants, and the migration story (current: none).
+- [fuzzing.md](fuzzing.md) — the property-testing/fuzzing strategy
+  (hypothesis + kotest-property + cross-language codec vectors).
+
+Implementation lives alongside the docs (`justfile` composes the
+per-component recipes; `just test-all`):
+
+- [server/](server/README.md) — the control plane (Kotlin/Ktor/PG).
+- [pyhoglake/](pyhoglake/README.md) — the Python client (the thin-API
+  successor to pyducklake; owns the parquet writer path).
+- [webui/](webui/README.md) — the management console.
+- [hedgerow/](hedgerow/) — the hoglake-native replication daemon
+  (viaduck's successor; append-only, single-destination v1).
 
 ## What hoglake is
 
@@ -32,6 +50,58 @@ kept intact, with three structural changes:
 
 Non-goals: DuckLake compatibility (wire, SQL, or metadata), multi-RDBMS
 backends, keeping the DuckDB extension alive.
+
+## Hoglake vs. DuckLake at a glance
+
+| | Hoglake | DuckLake |
+|---|---|---|
+| **Architecture** | Catalog as a service behind REST; clients never see the metadata DB | Client library: a DuckDB extension every process embeds |
+| **Metadata backend** | Postgres, exclusively — FKs with CASCADE, advisory locks, partial indexes are load-bearing | DuckDB/Postgres/SQLite (portability subset: no FKs, no locks, no indexes shipped) |
+| **Catalog implementations in the fleet** | Exactly one, deployed once | One per client build (fork vs upstream drift on the same catalog) |
+| **Commit cost** | Scoped to the write set; O(catalog) loads structurally impossible | Loads stats for the entire catalog per attempt (observed 5–7s at 59K tables, re-paid per OCC retry) |
+| **Conflict detection** | Typed change rows, one indexed anti-join; appends never conflict with appends | Comma-encoded string parsed client-side; retryability by error-message matching |
+| **Commit serialization** | Per-catalog advisory-lock tail (ms); dense snapshot ids | Snapshot-id PK collision as the conflict signal; retry re-pays the full commit |
+| **File registration** | Footer-shipping (writer sends stats; server never opens data files); deferred-stats mode with async hydration | Engine writes files and stats in-process |
+| **Row lineage** | Server-assigned contiguous ranges, never reused; `table_uuid` incarnation contract | Rowids reused on upsert-recreate; sorted compaction silently remaps them |
+| **Row-level deletes** | Deletion vectors: one live DV per file, growth-monotonic, stale-DV = typed 409 | Positional delete files (+ experimental DVs); delete-vs-delete races surface as generic conflicts |
+| **Time travel** | Snapshot id or timestamp; aggregates snapshot-scoped; 410 below the retention floor | Snapshot version or timestamp via ATTACH/AT |
+| **CDC / changefeed** | First-class plan API (files + DVs per range); expired ranges refuse loudly | `table_changes()` SQL macro (executor-stall wedge at scale; silent gaps possible) |
+| **Consumer offsets** | Catalog state: monotonic, `table_uuid`-keyed, retention-aware | Not a concept; every consumer builds its own cursor store |
+| **Retention/expiry** | Catalog property, continuous incremental sweeps, consumer-offset floor, range deletes | Client-invoked global procedure (~14ms/snapshot; ~50h at 15M snapshots); blind to consumers |
+| **Physical file deletion** | Queued + liveness-checked at drain; sub-batch commits; still-referenced = alert, never delete | Queue trusted absolutely (age filter only); one S3 5xx rolls back the catalog delete (phantom queues) |
+| **Maintenance ownership** | Service background jobs (expiry, cleanup live; compaction landing) | Client procedures, no advisory locks — concurrent runs corrupt shared state |
+| **Inlined data** | None (dropped by design; Arrow-blob design reserved if ever needed) | Dynamic per-schema-version tables in the catalog (unreachable-GC class) |
+| **Schema evolution** | Typed ops, atomic multi-op DDL commits, field-id-stable renames, strict promotion lattice | ALTER via engine; broader type lattice; struct field ops |
+| **Partition transforms** | identity, bucket(n) (Murmur3, Iceberg-bit-compatible), year/month/day/hour; files remember their spec vintage | identity, bucket(n) (murmur3; nested types hash a string repr), calendar + epoch date variants |
+| **Sort orders** | Landing with compaction (M4): versioned sort spec, applied on rewrite **with row ids preserved** | `SET SORTED BY` applied at insert/flush/compaction — but sorted compaction silently remaps rowids |
+| **Views** | SQL text + dialect, versioned | Yes, incl. macros |
+| **Encryption** | Not yet | Per-file parquet encryption |
+| **Readers** | REST + native Trino connector (read-only) + web console; Iceberg REST facade designed | DuckDB (only) |
+| **Observability** | `/metrics` (per-catalog health, outcome counters) + structured audit log, built in | External scripts/daemons querying the catalog |
+| **Migration story** | Flyway + canonical schema.sql with CI equivalence check | Imperative C++ string migrations; no ledger; partial migration representable |
+| **Integrity** | PKs, FKs+CASCADE, NOT NULL, CHECK vocabularies, partial unique indexes | 5 PKs total; zero FKs/indexes/constraints beyond them |
+
+## Measured (2026-09-05)
+
+The claims above are benchmarked, not asserted — `bench/` runs these as
+regression guards (`just bench quick`; results journal to JSONL).
+Numbers below are from `all --quick` on a dev laptop against the local
+compose stack; treat them as shape, not capacity planning:
+
+| Guard | Predecessor pathology | Hoglake, measured |
+|---|---|---|
+| Commit latency vs catalog size | 5–7s stats load per attempt at 59K tables; 190–264s single-table commits | **Flat**: p50 ratio ~1.0 with 10K preseeded snapshots (guard flags > 1.5×) |
+| Snapshot expiry | ~14ms/snapshot (~50h per 15M backlog) | **14,462 snapshots/s** (~200×), 14,885 files queued/s |
+| Concurrent appends | Superlinear collapse on busy catalogs; commit-storm convoys | 0 conflicts at K=1–8; per-writer p99 grows linearly (3.3→22.5ms); aggregate plateaus ~380 commits/s at the advisory-lock tail (~2.5ms hold) |
+| Delete races | Generic conflicts, lost-update risk | 0 lost updates under deliberate hot-file contention; retry-to-success p50 5.6ms |
+| Changefeed reads | Cost scaled with snapshot span/catalog | Latency correlates 0.998 with rows returned, not catalog size |
+| DDL churn | Dropped-table stats taxed every commit forever | Post-churn commit p50 ratio 0.64 — no residual tax |
+| Writer path (real parquet end-to-end) | — | 202K rows/s through `Table.append` |
+| Physical cleanup | Blind queue trust; all-or-nothing S3 | 100% liveness-checked, ~900 paths/s drained (the knob to watch at depth) |
+
+Every bench scenario asserts catalog invariants after load (dense
+snapshot ids, row-range tiling, DV accounting, `still_referenced == 0`)
+and exits loudly if the numbers can't be trusted.
 
 ## Why — the operating experience this encodes
 
@@ -221,6 +291,21 @@ Key moves:
   the service enforces continuously (incremental expiry, range
   deletes), floored — within a bound — at the min registered consumer
   offset, paging when a consumer pins it.
+- **CDC publications — the WAL tap (specified 2026-09-05, implement
+  later).** A catalog-managed publication tails a table's changefeed
+  and produces its rows directly to Kafka — the "inverse TableFlow /
+  Kafka fanout" sketch from the original architecture rationale, now an
+  API surface (see the publications section of openapi/hoglake.yaml;
+  endpoints 501 until built). Semantics locked in the spec: the
+  publisher is a service background worker whose progress is a
+  first-class consumer offset (`publication:{name}`) — so the retention
+  floor protects an unpublished range exactly as it protects any
+  lagging consumer, and publication lag is visible with the same
+  metrics; delivery is at-least-once, records keyed by
+  (table_uuid, row_id) so compacted topics converge; deletes emit from
+  DV diffs as tombstone-shaped records; incarnation change or a 410
+  halts the publication rather than skipping (the hedgerow rules).
+  Formats: Arrow IPC batches (the Arrow ground rule) or per-row JSON.
 - **Commit admission**: the service arbitrates catalog access —
   maintenance yields to foreground commits, per-tenant fair queuing,
   explicit backpressure responses. Observability data never rides the

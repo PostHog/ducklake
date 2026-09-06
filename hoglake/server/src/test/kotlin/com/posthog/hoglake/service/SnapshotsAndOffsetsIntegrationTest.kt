@@ -17,7 +17,6 @@ import java.util.UUID
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class SnapshotsAndOffsetsIntegrationTest {
-
     private val db = PgTestSupport.freshDatabase()
     private val svc = CatalogService(db.jdbi)
     private val idCol = ColumnDef("id", ColType.LONG, nullable = false)

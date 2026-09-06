@@ -5,16 +5,17 @@ import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.HoglakeException
-import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.model.canPromoteTo
+import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.SnapshotRepo
+import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -40,56 +41,77 @@ import org.jdbi.v3.core.kotlin.inTransactionUnchecked
  * snapshot, and end == begin would violate the schema CHECK.
  */
 class AlterService(private val jdbi: Jdbi) {
-
     fun alterTable(
         catalog: String,
         namespace: String,
         table: String,
         ops: List<AlterOp>,
-    ): TableInfo {
-        if (ops.isEmpty()) {
-            throw HoglakeException.Validation("ops must contain at least one operation")
-        }
-        return jdbi.inTransactionUnchecked { h ->
-            val cat = CatalogRepo.findByName(h, catalog)
-                ?: throw HoglakeException.NotFound("catalog '$catalog'")
-            Locks.acquireCatalogCommitLock(h, cat.catalogId)
-            val ns = NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)
-                ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
-            val t = TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
-                ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
-
-            val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-            SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
-            SnapshotRepo.insertChange(
-                h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_ALTERED, t.tableId,
-            )
-
-            // Live shape as of the pre-alter head (read under the lock).
-            val state = TableState(
-                cols = TableRepo.columnsAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1)
-                    .toMutableList(),
-                name = t.name,
-                spec = loadLiveSpec(h, cat.catalogId, t.tableId),
-            )
-            for (op in ops) {
-                applyOp(h, cat.catalogId, t.tableId, ns.namespaceId, namespace, alloc.snapshotId, state, op)
+    ): TableInfo =
+        Audit.audited(
+            "table_alter",
+            catalog,
+            "$namespace.$table",
+            detail = { "ops=${summarize(ops)}" },
+        ) {
+            if (ops.isEmpty()) {
+                throw HoglakeException.Validation("ops must contain at least one operation")
             }
+            jdbi.inTransactionUnchecked { h ->
+                val cat =
+                    CatalogRepo.findByName(h, catalog)
+                        ?: throw HoglakeException.NotFound("catalog '$catalog'")
+                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                val ns =
+                    NamespaceRepo.findLiveByName(h, cat.catalogId, namespace)
+                        ?: throw HoglakeException.NotFound("namespace '$namespace' in catalog '$catalog'")
+                val t =
+                    TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
+                        ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
 
-            val stats = TableRepo.stats(h, cat.catalogId, t.tableId)
-            TableInfo(
-                tableId = t.tableId,
-                tableUuid = t.tableUuid,
-                namespace = ns.name,
-                name = state.name,
-                columns = state.cols.sortedBy { it.ordinal },
-                recordCount = stats.recordCount,
-                fileCount = FileRepo.countAt(h, cat.catalogId, t.tableId, alloc.snapshotId),
-                fileSizeBytes = stats.fileSizeBytes,
-                partitionSpec = state.spec,
-            )
+                val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                SnapshotRepo.insertChange(
+                    h,
+                    cat.catalogId,
+                    alloc.snapshotId,
+                    ChangeKind.TABLE_ALTERED,
+                    t.tableId,
+                )
+
+                // Live shape as of the pre-alter head (read under the lock).
+                val state =
+                    TableState(
+                        cols =
+                            TableRepo.columnsAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1)
+                                .toMutableList(),
+                        name = t.name,
+                        spec = SpecRepo.specAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
+                    )
+                for (op in ops) {
+                    applyOp(h, cat.catalogId, t.tableId, ns.namespaceId, namespace, alloc.snapshotId, state, op)
+                }
+
+                val agg = FileRepo.aggregateAt(h, cat.catalogId, t.tableId, alloc.snapshotId)
+                TableInfo(
+                    tableId = t.tableId,
+                    tableUuid = t.tableUuid,
+                    namespace = ns.name,
+                    name = state.name,
+                    columns = state.cols.sortedBy { it.ordinal },
+                    recordCount = agg.recordCount,
+                    fileCount = agg.fileCount,
+                    fileSizeBytes = agg.fileSizeBytes,
+                    partitionSpec = state.spec,
+                )
+            }
         }
-    }
+
+    /** Audit-detail summary of an op list: op kinds with counts, in order of first appearance. */
+    private fun summarize(ops: List<AlterOp>): String =
+        ops.groupingBy { it::class.simpleName ?: "Op" }
+            .eachCount()
+            .entries
+            .joinToString(",") { (kind, n) -> if (n == 1) kind else "${kind}x$n" }
 
     // ---- op application --------------------------------------------------
 
@@ -131,11 +153,12 @@ class AlterService(private val jdbi: Jdbi) {
             throw HoglakeException.Validation("column '${op.def.name}' already exists")
         }
         val fieldId = TableRepo.allocateFieldIds(h, catalogId, tableId, 1)
-        val col = Column(
-            fieldId = fieldId,
-            ordinal = (state.cols.maxOfOrNull { it.ordinal } ?: -1) + 1,
-            def = op.def,
-        )
+        val col =
+            Column(
+                fieldId = fieldId,
+                ordinal = (state.cols.maxOfOrNull { it.ordinal } ?: -1) + 1,
+                def = op.def,
+            )
         TableRepo.insertColumns(h, catalogId, tableId, snapshot, listOf(col))
         state.cols += col
     }
@@ -233,10 +256,11 @@ class AlterService(private val jdbi: Jdbi) {
         op: AlterOp.SetPartitionSpec,
     ) {
         for (f in op.fields) {
-            val col = state.cols.find { it.fieldId == f.sourceFieldId }
-                ?: throw HoglakeException.Validation(
-                    "partition source field_id ${f.sourceFieldId} is not a live column",
-                )
+            val col =
+                state.cols.find { it.fieldId == f.sourceFieldId }
+                    ?: throw HoglakeException.Validation(
+                        "partition source field_id ${f.sourceFieldId} is not a live column",
+                    )
             when (f.transform) {
                 Transform.BUCKET ->
                     if (f.transformParam == null || f.transformParam < 1) {
@@ -263,16 +287,17 @@ class AlterService(private val jdbi: Jdbi) {
             state.spec = null
             return
         }
-        val specId = h.createQuery(
-            """
+        val specId =
+            h.createQuery(
+                """
             SELECT COALESCE(MAX(spec_id), 0) + 1 FROM hog_partition_spec
             WHERE catalog_id = :catalogId AND table_id = :tableId
             """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("tableId", tableId)
-            .mapTo(Long::class.javaObjectType)
-            .one()
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .mapTo(Long::class.javaObjectType)
+                .one()
         h.createUpdate(
             """
             INSERT INTO hog_partition_spec (catalog_id, table_id, spec_id, begin_snapshot)
@@ -284,13 +309,14 @@ class AlterService(private val jdbi: Jdbi) {
             .bind("specId", specId)
             .bind("beginSnapshot", snapshot)
             .execute()
-        val batch = h.prepareBatch(
-            """
+        val batch =
+            h.prepareBatch(
+                """
             INSERT INTO hog_partition_field
                 (catalog_id, table_id, spec_id, key_index, source_field_id, transform, transform_param)
             VALUES (:catalogId, :tableId, :specId, :keyIndex, :sourceFieldId, :transform, :transformParam)
             """,
-        )
+            )
         op.fields.forEachIndexed { i, f ->
             batch
                 .bind("catalogId", catalogId)
@@ -308,7 +334,10 @@ class AlterService(private val jdbi: Jdbi) {
 
     // ---- row lifecycle helpers -------------------------------------------
 
-    private fun requireColumn(state: TableState, name: String): Column =
+    private fun requireColumn(
+        state: TableState,
+        name: String,
+    ): Column =
         state.cols.find { it.def.name == name }
             ?: throw HoglakeException.Validation("column '$name' does not exist")
 
@@ -324,18 +353,19 @@ class AlterService(private val jdbi: Jdbi) {
         fieldId: Long,
         snapshot: Long,
     ) {
-        val deleted = h.createUpdate(
-            """
+        val deleted =
+            h.createUpdate(
+                """
             DELETE FROM hog_column
             WHERE catalog_id = :catalogId AND table_id = :tableId
               AND field_id = :fieldId AND begin_snapshot = :snapshot
             """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("tableId", tableId)
-            .bind("fieldId", fieldId)
-            .bind("snapshot", snapshot)
-            .execute()
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("fieldId", fieldId)
+                .bind("snapshot", snapshot)
+                .execute()
         if (deleted == 0) {
             h.createUpdate(
                 """
@@ -353,17 +383,23 @@ class AlterService(private val jdbi: Jdbi) {
     }
 
     /** Same delete-if-created-here-else-end rule for hog_table_version. */
-    private fun endOrDeleteVersionRow(h: Handle, catalogId: Long, tableId: Long, snapshot: Long) {
-        val deleted = h.createUpdate(
-            """
+    private fun endOrDeleteVersionRow(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ) {
+        val deleted =
+            h.createUpdate(
+                """
             DELETE FROM hog_table_version
             WHERE catalog_id = :catalogId AND table_id = :tableId AND begin_snapshot = :snapshot
             """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("tableId", tableId)
-            .bind("snapshot", snapshot)
-            .execute()
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("snapshot", snapshot)
+                .execute()
         if (deleted == 0) {
             h.createUpdate(
                 """
@@ -382,18 +418,24 @@ class AlterService(private val jdbi: Jdbi) {
      * Retire the live partition spec (if any): delete it (fields cascade)
      * when this request created it, else end-snapshot it.
      */
-    private fun endOrDeleteSpec(h: Handle, catalogId: Long, tableId: Long, snapshot: Long) {
-        val deleted = h.createUpdate(
-            """
+    private fun endOrDeleteSpec(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ) {
+        val deleted =
+            h.createUpdate(
+                """
             DELETE FROM hog_partition_spec
             WHERE catalog_id = :catalogId AND table_id = :tableId
               AND end_snapshot IS NULL AND begin_snapshot = :snapshot
             """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("tableId", tableId)
-            .bind("snapshot", snapshot)
-            .execute()
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("snapshot", snapshot)
+                .execute()
         if (deleted == 0) {
             h.createUpdate(
                 """
@@ -406,42 +448,6 @@ class AlterService(private val jdbi: Jdbi) {
                 .bind("snapshot", snapshot)
                 .execute()
         }
-    }
-
-    // ---- reads -----------------------------------------------------------
-
-    private fun loadLiveSpec(h: Handle, catalogId: Long, tableId: Long): PartitionSpec? {
-        val specId = h.createQuery(
-            """
-            SELECT spec_id FROM hog_partition_spec
-            WHERE catalog_id = :catalogId AND table_id = :tableId AND end_snapshot IS NULL
-            """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("tableId", tableId)
-            .mapTo(Long::class.javaObjectType)
-            .findOne()
-            .orElse(null) ?: return null
-        val fields = h.createQuery(
-            """
-            SELECT source_field_id, transform, transform_param
-            FROM hog_partition_field
-            WHERE catalog_id = :catalogId AND table_id = :tableId AND spec_id = :specId
-            ORDER BY key_index
-            """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("tableId", tableId)
-            .bind("specId", specId)
-            .map { rs, _ ->
-                PartitionFieldDef(
-                    sourceFieldId = rs.getLong("source_field_id"),
-                    transform = Transform.fromWire(rs.getString("transform")),
-                    transformParam = rs.getObject("transform_param")?.let { (it as Number).toInt() },
-                )
-            }
-            .list()
-        return PartitionSpec(specId, fields)
     }
 
     private companion object {
