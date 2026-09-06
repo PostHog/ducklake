@@ -1,0 +1,43 @@
+[project]
+name = "pyhoglake"
+version = "0.1.0"
+description = "Python client for hoglake, the Postgres-native lakehouse-catalog control plane"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pyarrow>=17.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-httpx>=0.30",
+    "hypothesis>=6.100",
+    # Pinned: an unpinned ruff resolves a different rule set per machine
+    # (and silently ignored the per-file-ignores below).
+    "ruff==0.16.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyhoglake"]
+
+[tool.ruff.lint.per-file-ignores]
+# Default rule selection applies; src/ stays strict.
+"tests/**" = [
+    "PLC3002", # table-driven lambda-call test style is deliberate
+    "DTZ001",  # tests exercise naive datetimes on purpose
+    "BLE001",  # conftest server-probe catch is deliberate
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that require a live hoglake server (HOGLAKE_URL)",
+]
+testpaths = ["tests"]
+# qe_*.py: QE/property-based fuzzing suites live alongside test_*.py
+python_files = ["test_*.py", "qe_*.py"]

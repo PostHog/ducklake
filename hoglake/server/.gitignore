@@ -1,0 +1,12 @@
+build/
+.gradle/
+.kotlin/
+# jazzer's growing generated corpus (the fuzz task); committed seeds live
+# in src/test/resources/com/posthog/hoglake/fuzz instead.
+.cifuzz-corpus/
+*.log
+.flox/run/
+.flox/cache/
+.flox/lib/
+.flox/log/
+.flox/telemetry_id

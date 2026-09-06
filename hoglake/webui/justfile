@@ -1,0 +1,20 @@
+# hoglake webui. Node toolchain from the flox env.
+
+_npm := "flox activate -- npm"
+
+default:
+    @just --list
+
+install:
+    {{_npm}} install
+
+# Vitest suite (mocked fetch; no server needed)
+test:
+    {{_npm}} test
+
+# Dev server on :5173, proxying /v1 to HOGLAKE_API (default :8080)
+dev:
+    {{_npm}} run dev
+
+build:
+    {{_npm}} run build

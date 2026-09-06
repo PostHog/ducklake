@@ -9,6 +9,35 @@ Companions: [README.md](README.md) (decisions),
 [iceberg-federation.md](iceberg-federation.md) (the facade's design
 obligations — all of which are prerequisites here).
 
+## 0. Native connector read contract (interim, until the facade lands)
+
+A native connector exists today (`server/trino/`) and commits to:
+
+- **One query, one snapshot.** `getTableHandle` resolves the catalog
+  head once and pins snapshot id, `table_uuid`, and the column list
+  into the handle; later metadata calls serve from the handle and
+  split planning scans at the pinned snapshot. Concurrent commits —
+  including DROP+CREATE incarnation changes — can never rebind an
+  in-flight query: it reads the analyzed incarnation's consistent data
+  or fails typed.
+- **Typed failures.** Control-plane unreachability/5xx are EXTERNAL
+  (`HOGLAKE_CATALOG_UNAVAILABLE`); a 410 below the expiry floor is
+  `HOGLAKE_SNAPSHOT_EXPIRED` ("snapshot expired during query" — the
+  expiry invariant's engine-side face: reconcile by re-running, never
+  silently skip); vanished tables/schemas are the SPI's typed
+  not-founds; a missing configured catalog is a USER_ERROR; malformed
+  responses are coded, never bare exceptions.
+- **DV refusal at planning.** A scan pairing any data file with a live
+  deletion vector is refused in split generation, before any split
+  reaches the engine — no partial results precede the failure.
+- **Config fails at load.** `hoglake.uri` validated and
+  slash-normalized, empty `hoglake.catalog` rejected, request timeout
+  configurable (`hoglake.client.request-timeout`, default 2m).
+- **Id-authoritative column binding stays.** The
+  rename-vs-id-less-files hazard is closed catalog-side: field ids are
+  a registration contract and the server refuses renames while id-less
+  files are live.
+
 ## 1. Reads: everything rides the Iceberg connector
 
 No custom Trino plugin. Trino's stock Iceberg connector pointed at the

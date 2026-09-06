@@ -1,0 +1,34 @@
+# hedgerow replication daemon. Python toolchain from the flox env.
+
+_uv := "flox activate -- uv"
+
+# Default recipe: list all available recipes
+default:
+    @just --list
+
+sync:
+    {{_uv}} sync
+
+# Entire suite; integration hits HOGLAKE_URL and skips cleanly when down
+test:
+    {{_uv}} run pytest
+
+unit:
+    {{_uv}} run pytest -m "not integration"
+
+integration:
+    {{_uv}} run pytest -m integration
+
+lint:
+    {{_uv}} run ruff check .
+    {{_uv}} run ruff format --check .
+
+fmt:
+    {{_uv}} run ruff format .
+
+# One replication cycle against a config, then exit
+once config:
+    {{_uv}} run hedgerow --config {{config}} --once
+
+run config:
+    {{_uv}} run hedgerow --config {{config}}

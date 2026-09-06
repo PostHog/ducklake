@@ -1,0 +1,56 @@
+# hoglake-bench: stress/benchmark harness. Python toolchain from the flox env.
+
+_uv := "flox activate -- uv"
+
+# Default recipe: list all available recipes
+default:
+    @just --list
+
+sync:
+    {{_uv}} sync
+
+# Fast smoke profile of every scenario (~2-3 min; needs a live server)
+quick:
+    {{_uv}} run hoglake-bench all --quick
+
+# Full-size runs — the real numbers (tens of minutes)
+full:
+    {{_uv}} run hoglake-bench all --full
+
+# Individual scenarios; extra flags pass through, e.g.
+#   just commit-throughput --preseed-snapshots 0,100000 --ops 500
+commit-throughput *args:
+    {{_uv}} run hoglake-bench commit-throughput {{args}}
+
+commit-contention *args:
+    {{_uv}} run hoglake-bench commit-contention {{args}}
+
+delete-contention *args:
+    {{_uv}} run hoglake-bench delete-contention {{args}}
+
+changefeed-scan *args:
+    {{_uv}} run hoglake-bench changefeed-scan {{args}}
+
+expiry-throughput *args:
+    {{_uv}} run hoglake-bench expiry-throughput {{args}}
+
+ddl-churn *args:
+    {{_uv}} run hoglake-bench ddl-churn {{args}}
+
+end-to-end-writer *args:
+    {{_uv}} run hoglake-bench end-to-end-writer {{args}}
+
+# Populate a catalog with a realistic fake warehouse, sized in GB, e.g.
+#   just bench seed --gb 2.5 --catalog seed-warehouse
+seed *args:
+    {{_uv}} run hoglake-bench seed {{args}}
+
+# Entire suite; the integration smoke hits HOGLAKE_URL and skips when down
+test:
+    {{_uv}} run pytest
+
+unit:
+    {{_uv}} run pytest -m "not integration"
+
+integration:
+    {{_uv}} run pytest -m integration

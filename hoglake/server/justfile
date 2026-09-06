@@ -1,0 +1,63 @@
+# hoglake server. All JVM work runs inside the flox env (JDK 21),
+# through the checked-in Gradle wrapper (pinned in
+# gradle/wrapper/gradle-wrapper.properties).
+
+_gradle := "flox activate -- ./gradlew"
+
+# Default recipe: list all available recipes
+default:
+    @just --list
+
+build:
+    {{_gradle}} build --console=plain
+
+# ktlint check (no changes)
+lint:
+    {{_gradle}} ktlintCheck --console=plain
+
+# ktlint auto-format
+fmt:
+    {{_gradle}} ktlintFormat --console=plain
+
+# Entire suite: unit + Testcontainers integration
+test:
+    {{_gradle}} test --console=plain
+
+# Unit tests only (no Docker needed)
+unit:
+    {{_gradle}} test -PunitOnly --console=plain
+
+# One test class/pattern, e.g. `just one 'com.posthog.hoglake.commit.*'`
+one pattern:
+    {{_gradle}} test --tests '{{pattern}}' --rerun --console=plain
+
+# The migrations-vs-schema.sql equivalence gate on its own
+schema-check:
+    {{_gradle}} test --tests 'com.posthog.hoglake.SchemaEquivalenceIntegrationTest' --rerun --console=plain
+
+# Local dev stack (Postgres 16 + MinIO). Ports overridable:
+# HOGLAKE_PG_PORT / HOGLAKE_MINIO_PORT / HOGLAKE_MINIO_CONSOLE_PORT
+compose-up:
+    docker compose up -d
+
+compose-down:
+    docker compose down
+
+# Run the server against the compose stack (MinIO on the default 9000;
+# export HOGLAKE_S3_ENDPOINT etc. to point elsewhere)
+run:
+    {{_gradle}} run --console=plain
+
+clean:
+    {{_gradle}} clean --console=plain
+
+# Swagger UI over the OpenAPI spec, live-reloading on file edits
+# (volume mount). http://localhost:8090 — HOGLAKE_SWAGGER_PORT overrides.
+docs:
+    docker run --rm -p ${HOGLAKE_SWAGGER_PORT:-8090}:8080 \
+        -e SWAGGER_JSON=/spec/hoglake.yaml \
+        -v {{justfile_directory()}}/src/main/resources/openapi:/spec:ro \
+        --name hoglake-swagger swaggerapi/swagger-ui
+
+docs-down:
+    docker rm -f hoglake-swagger

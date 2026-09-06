@@ -1,0 +1,1696 @@
+openapi: 3.0.3
+info:
+  title: hoglake
+  version: 0.1.0
+  description: |
+    The hoglake control plane: a Postgres-native lakehouse catalog.
+    Clients never touch the backing Postgres; parquet lives in object
+    storage and is written by clients, registered here via
+    footer-shipping commits. Row-level deletes are deletion vectors
+    (client-written puffin DVs, registered like files). Retention is a
+    catalog property with a consumer-offset floor. Auth is out of scope
+    for v1.
+
+    Malformed bodies/params and unknown request fields are 400
+    bad_request; semantic failures are 422.
+servers:
+  - url: /v1
+paths:
+  /catalogs:
+    get:
+      operationId: listCatalogs
+      summary: List catalogs
+      responses:
+        "200":
+          description: Catalogs
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Catalog" }
+    post:
+      operationId: createCatalog
+      summary: Create a catalog
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateCatalogRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Catalog" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Validation failure (bad name, blank data_path)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}:
+    get:
+      operationId: getCatalog
+      summary: Catalog info (head snapshot, schema version, data path)
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Catalog
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Catalog" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/namespaces:
+    get:
+      operationId: listNamespaces
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Namespaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Namespace" }
+    post:
+      operationId: createNamespace
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Name fails the identifier pattern.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/namespaces/{namespace}:
+    get:
+      operationId: getNamespace
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: Namespace
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Namespace" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables:
+    get:
+      operationId: listTables
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: Tables (live at head)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TableSummary" }
+    post:
+      operationId: createTable
+      summary: Create a table (DDL commit; produces a snapshot)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTableRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Table" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Validation failure (bad name, no columns,
+            duplicate/unknown column types)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}:
+    get:
+      operationId: getTable
+      summary: Table schema, identity, and stats (optionally at a snapshot)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
+      responses:
+        "200":
+          description: Table
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Table" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+    delete:
+      operationId: dropTable
+      summary: Drop a table (DDL commit; produces a snapshot)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+      responses:
+        "200":
+          description: Dropped; returns the snapshot that recorded it
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter:
+    post:
+      operationId: alterTable
+      summary: >
+        Schema evolution as one DDL commit: typed ops applied atomically
+        in order (add/drop/rename/promote column, rename table, set
+        partition spec, set sort order). Produces a snapshot with a
+        table_altered change.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ops]
+              properties:
+                ops:
+                  type: array
+                  minItems: 1
+                  items: { $ref: "#/components/schemas/AlterOp" }
+      responses:
+        "200":
+          description: Applied; the table after evolution
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Table" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: >
+            Conflict. rename_column additionally fails with error
+            `idless_files_present` while any LIVE data file of the table
+            is flagged missing_field_ids (its parquet schema carries no
+            field ids): such files bind columns by name, so the rename
+            would silently NULL their history in readers. Rewrite
+            (compact) or retire the id-less files first. rename_table is
+            unaffected.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "422":
+          description: Invalid op (unknown column, illegal promotion,
+            duplicate name, bad spec)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan:
+    get:
+      operationId: planScan
+      summary: >
+        Read planning: data files paired with their live deletion
+        vectors at a snapshot.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
+      responses:
+        "200":
+          description: Scan plan
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ScanFile" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
+    get:
+      operationId: listFiles
+      summary: Physical files backing the table at a snapshot (read planning)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
+      responses:
+        "200":
+          description: Files
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DataFile" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/changes:
+    get:
+      operationId: getChanges
+      summary: >
+        Changefeed plan: files + row-id ranges for rows appended in
+        (from_snapshot, to_snapshot]. Metadata only; the client reads the
+        parquet itself. Append-only v1: insertions only.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - name: from_snapshot
+          in: query
+          required: true
+          schema: { type: integer, format: int64 }
+        - name: to_snapshot
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Change plan
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChangePlan" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410":
+          description: >
+            from_snapshot falls below the catalog's expiry floor
+            (earliest_snapshot_id): part of the range is gone. The
+            consumer must reconcile (re-read from a full scan) rather
+            than silently skip.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/options:
+    get:
+      operationId: getCatalogOptions
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Options
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogOptions" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: patchCatalogOptions
+      summary: >
+        Update retention options. snapshot_retention_seconds null
+        disables expiry; consumer_floor controls whether expiry stops at
+        the min consumer offset.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                snapshot_retention_seconds:
+                  type: integer
+                  format: int64
+                  nullable: true
+                consumer_floor: { type: boolean }
+      responses:
+        "200":
+          description: Updated options
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CatalogOptions" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: Invalid values
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/maintenance/expire:
+    post:
+      operationId: runExpiry
+      summary: >
+        Run one incremental expiry sweep now (the background loop calls
+        the same path). Bounded per run; never expires head; respects
+        the consumer floor when enabled.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/maintenanceBatch" }
+      responses:
+        "200":
+          description: Sweep result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExpiryResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/maintenance/compact:
+    post:
+      operationId: runCompaction
+      summary: >
+        Run one compaction sweep now (the background loop calls the same
+        path; batch = groups rewritten this run, default 1 — tiny bites
+        by construction). Merges live small files (same partition spec +
+        values, no live deletion vector) into one file per group whose
+        rows carry their hoglake row ids in an explicit _hog_row_id
+        column (data_file.explicit_row_ids), sorted by the table's live
+        sort order when one exists. Inputs are end-snapshotted (time
+        travel keeps them; expiry reclaims them later); compacted
+        outputs never appear in the changefeed.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/maintenanceBatch" }
+      responses:
+        "200":
+          description: Sweep result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CompactionResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/maintenance/verify:
+    post:
+      operationId: runVerify
+      summary: >
+        Metadata-only invariant scan, on demand: the QE suite's global
+        invariants promoted to a production endpoint. Read-only (one
+        REPEATABLE READ MVCC snapshot, no catalog lock — never blocks
+        writers). Checks row-id tiling (no positional overlap;
+        compaction outputs with explicit_row_ids are exempt by design),
+        deletion-vector uniqueness/monotonicity/bounds, orphaned live
+        child rows on dropped tables, still-referenced removal-queue
+        entries, true snapshot density (count(*) equals
+        head - earliest + 1), and next_row_id allocator consistency.
+        NOT covered: the field-id contract for inline-stats files
+        (needs S3 footer reads; out of scope for a metadata-only scan).
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+      responses:
+        "200":
+          description: >
+            Verification report. status "pass" only when every check
+            passed; per-check violation counts with sample details
+            capped at 20 per check.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VerifyReport" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/maintenance/rehydrate:
+    post:
+      operationId: runRehydrate
+      summary: >
+        Requeue structurally-failed stats hydrations: flips
+        stats_state 'failed' back to 'pending' so the hydrator sweep
+        retries them — the operator recovery path after the cause is
+        fixed (object re-uploaded, registration corrected, whole-object
+        cap raised). Whole catalog by default; scope to one table by
+        supplying BOTH namespace and table (supplying only one is a
+        422). Transient object-store failures never need this: they
+        leave files 'pending' and retry on their own.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: namespace
+          in: query
+          required: false
+          description: Table scope, with `table`. Both or neither.
+          schema: { type: string }
+        - name: table
+          in: query
+          required: false
+          description: Table scope, with `namespace`. Both or neither.
+          schema: { type: string }
+      responses:
+        "200":
+          description: How many failed files were requeued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RehydrateResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: namespace/table supplied without the other
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/maintenance/cleanup:
+    post:
+      operationId: runCleanup
+      summary: >
+        Drain one batch of the file-removal queue. Every entry is
+        liveness-checked against live references before physical
+        deletion; still-referenced entries are skipped and counted (an
+        invariant violation, never a deletion).
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/maintenanceBatch" }
+      responses:
+        "200":
+          description: Drain result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CleanupResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/stats/partitions:
+    get:
+      operationId: getPartitionStats
+      summary: >
+        Leaf partitions ranked by compaction debt — the operator answer
+        to "how un-compacted is each partition" under the coarse
+        (months x team) partitioning model. Aggregates LIVE
+        (visible-at-head) data files grouped by (table, spec_id,
+        partition value tuple); an unpartitioned table (or the pre-spec
+        vintage of a later-partitioned one) is one row with empty
+        partition_values and no spec_id, and files written under an
+        older spec than the table's current one group under THEIR
+        spec_id. "Small" means under the compaction target size
+        (HOGLAKE_COMPACTION_TARGET_BYTES, strict less-than — the same
+        threshold the compaction planner applies to candidate inputs),
+        so debt_score (= small_file_count) is exactly the files a sweep
+        would try to merge. Ordered by debt_score desc, ties by
+        small_file_bytes desc. Read-only metadata aggregation (one
+        REPEATABLE READ MVCC snapshot, no locks) — never blocks
+        writers.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: namespace
+          in: query
+          required: false
+          description: Restrict to one namespace's tables.
+          schema: { type: string }
+        - name: table
+          in: query
+          required: false
+          description: >
+            Restrict to one table; requires `namespace` (422 without
+            it).
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: >
+            Max partitions returned (default 50, capped at 500);
+            truncated reports whether more groups existed.
+          schema: { type: integer, default: 50, maximum: 500 }
+      responses:
+        "200":
+          description: Partitions ranked by compaction debt.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartitionStatsReport" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: table supplied without namespace, or limit < 1
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/views:
+    get:
+      operationId: listViews
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: Views live at head
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/View" }
+    post:
+      operationId: createView
+      summary: Create a view (DDL commit; view SQL is stored verbatim with its dialect)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, sql]
+              properties:
+                name:
+                  type: string
+                  pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+                sql: { type: string }
+                dialect: { type: string, default: trino }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/View" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/views/{view}:
+    get:
+      operationId: getView
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - name: view
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: View
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/View" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: dropView
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - name: view
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Dropped; the snapshot that recorded it
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/snapshots:
+    get:
+      operationId: listSnapshots
+      summary: Snapshots, paginated (never the full catalog in one response)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: after
+          in: query
+          description: Return snapshots with id > after, ascending.
+          schema: { type: integer, format: int64, default: 0 }
+        - name: before
+          in: query
+          description: >
+            Return snapshots with id < before, DESCENDING (newest
+            first): a UI walks from head + 1 and pages down with the
+            last id of each page. Mutually exclusive with a non-zero
+            `after` (422 if both cursors are supplied).
+          schema: { type: integer, format: int64 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 1000, maximum: 10000 }
+      responses:
+        "200":
+          description: Snapshot page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SnapshotPage" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: Both `before` and a non-zero `after` supplied.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/commit:
+    post:
+      operationId: commit
+      summary: >
+        The append commit: register client-written parquet files with
+        footer-derived stats. record_count is mandatory per file (row-id
+        range assignment); column stats may be omitted (stats_mode=deferred)
+        and are then hydrated asynchronously.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CommitRequest" }
+      responses:
+        "200":
+          description: Committed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "409":
+          description: >
+            Commit conflict (concurrent DDL on a touched table). The
+            client refreshes its read snapshot and retries.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "422":
+          description: Validation failure (unknown table, bad stats shape,
+            unknown field ids)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: >
+            Commit admission timed out: the commit transaction's
+            lock_timeout (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS, default 30s,
+            0 disables) expired while queuing on the per-catalog commit
+            lock. Error code `commit_queue_timeout`. Explicit, retryable
+            backpressure — never a generic 500; back off per the
+            Retry-After header and retry the identical commit.
+          headers:
+            Retry-After:
+              description: Seconds to back off before retrying.
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  # ---- CDC publications (SPECIFIED, NOT YET IMPLEMENTED: all return 501) ----
+  # The WAL tap: a catalog-managed publication tails a table's changefeed
+  # and produces its rows directly to Kafka. The publisher's progress is a
+  # first-class consumer offset (consumer_id "publication:{name}"), so the
+  # retention floor protects an unpublished range exactly as it protects
+  # any lagging consumer. Delivery is at-least-once; records are keyed by
+  # (table_uuid, row_id) so compacted topics converge. Deletes are emitted
+  # from deletion-vector diffs as tombstone-shaped records.
+  /catalogs/{catalog}/publications:
+    get:
+      operationId: listPublications
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Publications
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Publication" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+    post:
+      operationId: createPublication
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePublicationRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Publication" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /catalogs/{catalog}/publications/{publication}:
+    get:
+      operationId: getPublication
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: publication
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Publication with live status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Publication" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+    delete:
+      operationId: dropPublication
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: publication
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Removed (its consumer offset is released) }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  # ---- DR / export (SPECIFIED, NOT YET IMPLEMENTED: returns 501) ----
+  # The consistent-export half of the DR story (README "PITR + consistent
+  # export"): one response proving what the object store must contain for
+  # the catalog to be whole. Everything is read at ONE snapshot (head at
+  # request time), so a PITR-restored catalog can be diffed against the
+  # bucket: every listed path must exist; anything else is orphaned.
+  /catalogs/{catalog}/export:
+    get:
+      operationId: exportCatalog
+      summary: >
+        Consistent catalog export manifest: the snapshot range
+        (earliest..head, with the floor time), the live-file manifest
+        (data files + live deletion vectors per table, read at head),
+        and every consumer offset. JSON in v1; an Arrow variant may
+        follow.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Export manifest, consistent at head_snapshot_id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExportManifest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
+  /info:
+    get:
+      operationId: getInstanceInfo
+      summary: >
+        Identity of this hoglake instance: the operator-configured
+        display name (HOGLAKE_INSTANCE_NAME, e.g. "GigaHog") the webui
+        shows so deployments are tellable apart. Name omitted when
+        unset.
+      responses:
+        "200":
+          description: Instance info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+
+  /catalogs/{catalog}/consumers:
+    get:
+      operationId: listConsumers
+      summary: >
+        Every consumer in the catalog with its per-table offsets, table
+        names resolved (a dropped table keeps its last name and is
+        flagged — offsets outlive drops so consumers see incarnation
+        changes). Ordered by consumer id, then namespace.table.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+      responses:
+        "200":
+          description: Consumers and their offsets
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsumerList" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/consumers/{consumer}/offsets:
+    get:
+      operationId: listConsumerOffsets
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/consumer" }
+      responses:
+        "200":
+          description: Offsets for this consumer
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ConsumerOffset" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/consumers/{consumer}/offsets/{tableUuid}:
+    get:
+      operationId: getConsumerOffset
+      summary: One (consumer, table_uuid) offset; 404 when none is stored.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/consumer" }
+        - name: tableUuid
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Stored offset
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsumerOffset" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      operationId: commitConsumerOffset
+      summary: >
+        Commit a consumer offset. Monotonic: a snapshot below the stored
+        offset is rejected with 409.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/consumer" }
+        - name: tableUuid
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [snapshot_id]
+              properties:
+                snapshot_id: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsumerOffset" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+components:
+  parameters:
+    catalog:
+      name: catalog
+      in: path
+      required: true
+      schema: { type: string }
+    namespace:
+      name: namespace
+      in: path
+      required: true
+      schema: { type: string }
+    table:
+      name: table
+      in: path
+      required: true
+      schema: { type: string }
+    consumer:
+      name: consumer
+      in: path
+      required: true
+      schema: { type: string }
+    snapshot:
+      name: snapshot
+      in: query
+      required: false
+      description: Time travel; defaults to head. Mutually exclusive
+        with at_timestamp.
+      schema: { type: integer, format: int64 }
+    atTimestamp:
+      name: at_timestamp
+      in: query
+      required: false
+      description: >
+        Time travel by timestamp (ISO-8601 instant WITH a UTC offset,
+        e.g. 2026-09-05T00:00:00Z; an offset-less local datetime is a
+        400 bad_request): resolves to the largest snapshot with
+        snapshot_time <= at_timestamp. Mutually exclusive with snapshot
+        (422 if both). Before the earliest retained snapshot -> 410;
+        after head -> head.
+      schema: { type: string, format: date-time }
+    maintenanceBatch:
+      name: batch
+      in: query
+      required: false
+      description: Per-run bound override (expire default 10000
+        snapshots, cleanup default 2000 queue entries, compact
+        default 1 group).
+      schema: { type: integer }
+
+  responses:
+    NotImplemented:
+      description: Specified but not yet implemented.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    Gone:
+      description: >
+        The requested snapshot (or resolved timestamp) is below the
+        expiry floor — that history has been expired. Re-read at a
+        retained snapshot. The detail names the floor and, once expiry
+        has advanced it, the time the floor was reached
+        (Catalog.earliest_snapshot_time).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+    Conflict:
+      description: Conflict
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ApiError" }
+
+  schemas:
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        detail: { type: string }
+
+    Catalog:
+      type: object
+      required: [name, data_path, head_snapshot_id, schema_version]
+      properties:
+        name: { type: string }
+        data_path: { type: string }
+        head_snapshot_id: { type: integer, format: int64 }
+        schema_version: { type: integer, format: int64 }
+        earliest_snapshot_time:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            snapshot_time of the expiry-floor snapshot
+            (earliest_snapshot_id), captured when expiry advanced the
+            floor. Absent/null until expiry has ever advanced it. 410
+            responses below the floor cite this time so consumers know
+            WHEN their range was lost.
+
+    CreateCatalogRequest:
+      type: object
+      required: [name, data_path]
+      properties:
+        name: { type: string }
+        data_path: { type: string }
+
+    Namespace:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+
+    ColumnDef:
+      type: object
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+          description: >
+            Identifier policy (shared by namespace/table/view/column
+            names): letter or underscore start, then letters, digits,
+            underscore, hyphen; max 128 chars. Violations are 422.
+        type:
+          type: string
+          enum: [boolean, int, long, float, double, decimal, date, time,
+                 timestamp, timestamptz, string, uuid, binary]
+        type_params:
+          type: object
+          additionalProperties: true
+        nullable: { type: boolean, default: true }
+
+    Column:
+      allOf:
+        - $ref: "#/components/schemas/ColumnDef"
+        - type: object
+          required: [field_id, ordinal]
+          properties:
+            field_id: { type: integer, format: int64 }
+            ordinal: { type: integer }
+
+    CreateTableRequest:
+      type: object
+      required: [name, columns]
+      properties:
+        name:
+          type: string
+          pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+        columns:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/ColumnDef" }
+
+    TableSummary:
+      type: object
+      required: [name, table_uuid]
+      properties:
+        name: { type: string }
+        table_uuid: { type: string, format: uuid }
+
+    Table:
+      type: object
+      required: [name, namespace, table_uuid, columns, record_count,
+                 file_count, file_size_bytes]
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        table_uuid: { type: string, format: uuid }
+        columns:
+          type: array
+          items: { $ref: "#/components/schemas/Column" }
+        record_count: { type: integer, format: int64 }
+        file_count: { type: integer, format: int64 }
+        file_size_bytes: { type: integer, format: int64 }
+        partition_spec: { $ref: "#/components/schemas/PartitionSpec" }
+        sort_spec: { $ref: "#/components/schemas/SortSpec" }
+
+    ColumnStats:
+      type: object
+      required: [field_id, value_count, null_count]
+      properties:
+        field_id: { type: integer, format: int64 }
+        value_count: { type: integer, format: int64 }
+        null_count: { type: integer, format: int64 }
+        nan_count: { type: integer, format: int64 }
+        size_bytes: { type: integer, format: int64 }
+        lower_bound:
+          type: string
+          format: byte
+          description: Iceberg single-value binary serialization, base64.
+        upper_bound:
+          type: string
+          format: byte
+
+    FileRegistration:
+      type: object
+      required: [path, record_count, file_size_bytes]
+      properties:
+        path: { type: string, description: Absolute object-store URI }
+        record_count: { type: integer, format: int64 }
+        file_size_bytes: { type: integer, format: int64 }
+        footer_size: { type: integer, format: int64 }
+        column_stats:
+          type: array
+          description: Omit for deferred stats (file registers as pending).
+          items: { $ref: "#/components/schemas/ColumnStats" }
+        partition_values:
+          type: array
+          description: >
+            Transformed partition values by key_index of the table's live
+            spec. Required with matching arity when the table is
+            partitioned; forbidden when not.
+          items: { type: string, nullable: true }
+
+    TableAppend:
+      type: object
+      required: [namespace, table, files]
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        expected_table_uuid:
+          type: string
+          format: uuid
+          description: >
+            Optional incarnation guard. When present, the commit fails
+            with 409 commit_conflict if the live table resolved by name
+            carries a different table_uuid — i.e. the table was dropped
+            and recreated since the writer read it. Absent = today's
+            name-only resolution.
+        files:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/FileRegistration" }
+
+    CommitRequest:
+      type: object
+      description: At least one of appends/deletes must be non-empty.
+      properties:
+        read_snapshot:
+          type: integer
+          format: int64
+          description: >
+            The snapshot the writer planned against. Conflicts are
+            evaluated against changes after this point. Defaults to head
+            (no conflict window) for blind appends. REQUIRED when
+            deletes are present (deletes always conflict-check).
+        appends:
+          type: array
+          items: { $ref: "#/components/schemas/TableAppend" }
+        deletes:
+          type: array
+          items: { $ref: "#/components/schemas/TableDeletes" }
+        author: { type: string }
+        message: { type: string }
+
+    DeleteFileRegistration:
+      type: object
+      required: [data_file_id, path, delete_count, file_size_bytes]
+      properties:
+        data_file_id: { type: integer, format: int64 }
+        path: { type: string, description: Puffin deletion-vector file URI }
+        delete_count:
+          type: integer
+          format: int64
+          description: >
+            Total deleted positions in the DV. Must be >= the superseded
+            DV's count (vectors only grow) and <= the data file's
+            record_count.
+        file_size_bytes: { type: integer, format: int64 }
+
+    TableDeletes:
+      type: object
+      required: [namespace, table, files]
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        expected_table_uuid:
+          type: string
+          format: uuid
+          description: >
+            Optional incarnation guard; same semantics as
+            TableAppend.expected_table_uuid (mismatch -> 409).
+        files:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/DeleteFileRegistration" }
+
+    DeleteFile:
+      type: object
+      required: [delete_file_id, data_file_id, path, file_format,
+                 delete_count, file_size_bytes, begin_snapshot]
+      properties:
+        delete_file_id: { type: integer, format: int64 }
+        data_file_id: { type: integer, format: int64 }
+        path: { type: string }
+        file_format: { type: string, enum: [puffin-dv] }
+        delete_count: { type: integer, format: int64 }
+        file_size_bytes: { type: integer, format: int64 }
+        begin_snapshot: { type: integer, format: int64 }
+
+    ScanFile:
+      type: object
+      required: [data_file]
+      properties:
+        data_file: { $ref: "#/components/schemas/DataFile" }
+        delete_file: { $ref: "#/components/schemas/DeleteFile" }
+
+    PartitionField:
+      type: object
+      required: [source_field_id, transform]
+      properties:
+        source_field_id: { type: integer, format: int64 }
+        transform:
+          type: string
+          enum: [identity, bucket, year, month, day, hour]
+        transform_param:
+          type: integer
+          description: bucket(n) only.
+
+    PartitionSpec:
+      type: object
+      required: [spec_id, fields]
+      properties:
+        spec_id: { type: integer, format: int64 }
+        fields:
+          type: array
+          items: { $ref: "#/components/schemas/PartitionField" }
+
+    SortField:
+      type: object
+      required: [source_field_id, direction, null_order]
+      properties:
+        source_field_id: { type: integer, format: int64 }
+        direction:
+          type: string
+          enum: [asc, desc]
+        null_order:
+          type: string
+          enum: [nulls_first, nulls_last]
+
+    SortSpec:
+      type: object
+      description: >
+        The table's versioned sort order. ADVISORY for writers — the
+        server never verifies that registered files are actually sorted —
+        and BINDING for compaction rewrites, which sort merged rows by
+        the live spec (safe because compaction outputs carry explicit
+        row ids; see DataFile.explicit_row_ids).
+      required: [sort_id, fields]
+      properties:
+        sort_id: { type: integer, format: int64 }
+        fields:
+          type: array
+          items: { $ref: "#/components/schemas/SortField" }
+
+    AlterOp:
+      type: object
+      required: [op]
+      description: Discriminated by `op`.
+      properties:
+        op:
+          type: string
+          enum: [add_column, drop_column, rename_column, promote_column,
+                 rename_table, set_partition_spec, set_sort_order]
+        column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
+        name: { type: string }        # drop_column, promote_column
+        from: { type: string }        # rename_column
+        # rename_column target (must satisfy the ColumnDef.name identifier
+        # pattern); promote_column target type
+        to: { type: string }
+        new_name:                     # rename_table
+          type: string
+          pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+        fields:                       # set_partition_spec ([] = unpartitioned)
+          type: array
+          items: { $ref: "#/components/schemas/PartitionField" }
+        sort_fields:                  # set_sort_order ([] = unsorted)
+          type: array
+          items: { $ref: "#/components/schemas/SortField" }
+
+    CommitResult:
+      type: object
+      required: [snapshot_id]
+      properties:
+        snapshot_id: { type: integer, format: int64 }
+        schema_version: { type: integer, format: int64 }
+
+    DataFile:
+      type: object
+      required: [data_file_id, path, file_format, record_count,
+                 file_size_bytes, row_id_start, stats_state, begin_snapshot]
+      properties:
+        data_file_id: { type: integer, format: int64 }
+        path: { type: string }
+        file_format: { type: string }
+        record_count: { type: integer, format: int64 }
+        file_size_bytes: { type: integer, format: int64 }
+        footer_size: { type: integer, format: int64 }
+        row_id_start: { type: integer, format: int64 }
+        stats_state: { type: string, enum: [provided, pending, failed] }
+        begin_snapshot: { type: integer, format: int64 }
+        spec_id: { type: integer, format: int64 }
+        partition_values:
+          type: array
+          items: { type: string, nullable: true }
+        explicit_row_ids:
+          type: boolean
+          default: false
+          description: >
+            True for compaction outputs: the file's hoglake row ids ride
+            an explicit physical int64 column `_hog_row_id` (reserved
+            parquet field id 2147483646) because merged inputs need not
+            be row-id-contiguous. When true, row_id_start is
+            min(input row ids) and has no positional meaning; readers
+            needing row identity must read the column.
+
+    ChangePlan:
+      type: object
+      required: [table_uuid, from_snapshot, to_snapshot, files, delete_files]
+      properties:
+        table_uuid: { type: string, format: uuid }
+        from_snapshot: { type: integer, format: int64 }
+        to_snapshot: { type: integer, format: int64 }
+        files:
+          type: array
+          items: { $ref: "#/components/schemas/DataFile" }
+        delete_files:
+          type: array
+          description: DVs registered in (from, to] — the deletions feed.
+          items: { $ref: "#/components/schemas/DeleteFile" }
+
+    View:
+      type: object
+      required: [name, namespace, view_uuid, dialect, sql]
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        view_uuid: { type: string, format: uuid }
+        dialect: { type: string }
+        sql: { type: string }
+
+    CatalogOptions:
+      type: object
+      required: [consumer_floor, earliest_snapshot_id]
+      properties:
+        snapshot_retention_seconds:
+          type: integer
+          format: int64
+          nullable: true
+        consumer_floor: { type: boolean }
+        earliest_snapshot_id: { type: integer, format: int64 }
+
+    ExpiryResult:
+      type: object
+      required: [snapshots_expired, data_files_queued, delete_files_queued,
+                 new_earliest_snapshot_id]
+      properties:
+        snapshots_expired: { type: integer, format: int64 }
+        data_files_queued: { type: integer, format: int64 }
+        delete_files_queued: { type: integer, format: int64 }
+        new_earliest_snapshot_id: { type: integer, format: int64 }
+        floored_by_consumer:
+          type: string
+          description: Consumer id pinning the floor, when the sweep was capped.
+
+    CleanupResult:
+      type: object
+      required: [removed, missing, still_referenced]
+      properties:
+        removed: { type: integer, format: int64 }
+        missing: { type: integer, format: int64 }
+        still_referenced: { type: integer, format: int64 }
+
+    RehydrateResult:
+      type: object
+      required: [requeued]
+      properties:
+        requeued:
+          type: integer
+          format: int64
+          description: Failed files flipped back to pending.
+
+    VerifyCheck:
+      type: object
+      required: [check, status, violations, samples]
+      properties:
+        check:
+          type: string
+          description: >
+            One of row_id_tiling, delete_vectors, orphans,
+            removal_queue, snapshot_density, next_row_id.
+        status:
+          type: string
+          enum: [pass, fail]
+        violations:
+          type: integer
+          format: int64
+          description: True violation count (not capped).
+        samples:
+          type: array
+          description: Human-readable violation details, capped at 20.
+          items: { type: string }
+
+    VerifyReport:
+      type: object
+      required: [catalog, status, checks]
+      properties:
+        catalog: { type: string }
+        status:
+          type: string
+          enum: [pass, fail]
+          description: pass iff every check passed.
+        checks:
+          type: array
+          items: { $ref: "#/components/schemas/VerifyCheck" }
+
+    ExportTableManifest:
+      type: object
+      required: [namespace, table, table_uuid, files, delete_files]
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        table_uuid: { type: string, format: uuid }
+        files:
+          type: array
+          description: Data files live at head_snapshot_id.
+          items: { $ref: "#/components/schemas/DataFile" }
+        delete_files:
+          type: array
+          description: Live deletion vectors at head_snapshot_id.
+          items: { $ref: "#/components/schemas/DeleteFile" }
+
+    ExportManifest:
+      type: object
+      description: >
+        Everything read consistently at head_snapshot_id: restore the
+        catalog via PITR, fetch this manifest, and every listed path
+        must exist in the object store — that is the "and we can prove
+        the object store matches" half of DR.
+      required: [catalog, data_path, head_snapshot_id,
+                 earliest_snapshot_id, tables, consumer_offsets]
+      properties:
+        catalog: { type: string }
+        data_path: { type: string }
+        head_snapshot_id:
+          type: integer
+          format: int64
+          description: The snapshot the whole manifest was read at.
+        earliest_snapshot_id: { type: integer, format: int64 }
+        earliest_snapshot_time:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the expiry floor was reached (null = never advanced).
+        tables:
+          type: array
+          description: Live tables with their live files + DVs.
+          items: { $ref: "#/components/schemas/ExportTableManifest" }
+        consumer_offsets:
+          type: array
+          description: All stored offsets (replication resume points).
+          items: { $ref: "#/components/schemas/ConsumerOffset" }
+
+    CompactionResult:
+      type: object
+      required: [groups_compacted, files_in, files_out, bytes_in,
+                 bytes_out, skipped_conflicts, dv_superseded,
+                 unconvertible_schema]
+      properties:
+        groups_compacted: { type: integer, format: int64 }
+        files_in: { type: integer, format: int64 }
+        files_out: { type: integer, format: int64 }
+        bytes_in: { type: integer, format: int64 }
+        bytes_out: { type: integer, format: int64 }
+        skipped_conflicts:
+          type: integer
+          format: int64
+          description: >
+            Groups aborted at commit time because an input file was no
+            longer live, or because the compactor's staged output claim
+            was reclaimed by a concurrent cleanup drain; re-planned on
+            the next run.
+        dv_superseded:
+          type: integer
+          format: int64
+          description: >
+            Groups aborted at commit time because an input's deletion
+            vector changed since planning (one appeared, or the planned
+            one was superseded by a grown vector). The rewrite applied
+            the planned vectors, so committing would resurrect rows
+            deleted after the plan's read; the group re-plans instead.
+        unconvertible_schema:
+          type: integer
+          format: int64
+          description: >
+            Groups skipped because a live column's type cannot be
+            produced from an input file's parquet type (outside identity
+            and the int->long / float->double promotions).
+
+    PartitionValue:
+      type: object
+      required: [field, value]
+      properties:
+        field:
+          type: string
+          description: >
+            Partition field display name: the source column's name for
+            identity transforms, "<column>_<transform>" otherwise
+            (e.g. ts_month).
+        value:
+          type: string
+          nullable: true
+          description: >
+            Transformed partition value; explicit null for a null
+            partition value.
+
+    PartitionDebt:
+      type: object
+      required: [namespace, table, table_uuid, partition_values,
+                 file_count, small_file_count, total_bytes,
+                 small_file_bytes, avg_file_bytes, dv_count, debt_score]
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        table_uuid: { type: string, format: uuid }
+        partition_values:
+          type: array
+          description: Empty for an unpartitioned vintage.
+          items: { $ref: "#/components/schemas/PartitionValue" }
+        spec_id:
+          type: integer
+          format: int64
+          description: >
+            Spec the group's files were written under (not necessarily
+            the table's current one). Omitted for an unpartitioned
+            vintage.
+        file_count: { type: integer, format: int64 }
+        small_file_count:
+          type: integer
+          format: int64
+          description: Files under the compaction target size (strict <).
+        total_bytes: { type: integer, format: int64 }
+        small_file_bytes: { type: integer, format: int64 }
+        avg_file_bytes:
+          type: integer
+          format: int64
+          description: total_bytes / file_count, floored.
+        dv_count:
+          type: integer
+          format: int64
+          description: Live deletion vectors over the partition's files.
+        debt_score:
+          type: integer
+          format: int64
+          description: >
+            = small_file_count — the files a compaction sweep would try
+            to merge. The ranking key (desc, ties by small_file_bytes
+            desc).
+
+    PartitionStatsReport:
+      type: object
+      required: [partitions, truncated, stale_spec_groups]
+      properties:
+        partitions:
+          type: array
+          items: { $ref: "#/components/schemas/PartitionDebt" }
+        truncated:
+          type: boolean
+          description: More groups existed than the requested limit.
+        stale_spec_groups:
+          type: integer
+          format: int64
+          description: >
+            Groups (across the whole result set, not just this page)
+            whose spec vintage is not the table's current live spec —
+            partitions a spec change left behind.
+
+    Snapshot:
+      type: object
+      required: [snapshot_id, snapshot_time, schema_version]
+      properties:
+        snapshot_id: { type: integer, format: int64 }
+        snapshot_time: { type: string, format: date-time }
+        schema_version: { type: integer, format: int64 }
+        author: { type: string }
+        message: { type: string }
+        changes:
+          type: array
+          description: >
+            Typed change rows. kind is the closed conflict vocabulary:
+            namespace_created/dropped, table_created/dropped/altered,
+            table_inserted_into, table_deleted_from, table_compacted
+            (a maintenance rewrite — object_id is the table; never a
+            conflict for appenders and its files never enter the
+            changefeed), view_created/dropped.
+          items:
+            type: object
+            required: [kind, object_id]
+            properties:
+              kind: { type: string }
+              object_id:
+                type: integer
+                format: int64
+                description: >
+                  The changed object (table_id, namespace_id, or
+                  view_id). Every change kind names an object — never
+                  null.
+
+    SnapshotPage:
+      type: object
+      required: [snapshots, has_more]
+      properties:
+        snapshots:
+          type: array
+          items: { $ref: "#/components/schemas/Snapshot" }
+        has_more: { type: boolean }
+
+    KafkaSink:
+      type: object
+      required: [type, bootstrap_servers, topic]
+      properties:
+        type: { type: string, enum: [kafka] }
+        bootstrap_servers: { type: string }
+        topic: { type: string }
+        format:
+          type: string
+          enum: [arrow_ipc, json]
+          default: arrow_ipc
+          description: >
+            arrow_ipc: one record per Arrow IPC batch (efficient, typed).
+            json: one record per row (envelope
+            {op, snapshot_id, row_id, columns...}; deletes carry op +
+            row_id only).
+
+    CreatePublicationRequest:
+      type: object
+      required: [name, namespace, table, sink]
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        table: { type: string }
+        sink: { $ref: "#/components/schemas/KafkaSink" }
+        from_snapshot:
+          type: integer
+          format: int64
+          description: Start point; defaults to head at creation time.
+
+    Publication:
+      type: object
+      required: [name, table_uuid, sink, state, committed_snapshot]
+      properties:
+        name: { type: string }
+        table_uuid: { type: string, format: uuid }
+        sink: { $ref: "#/components/schemas/KafkaSink" }
+        state:
+          type: string
+          enum: [pending, active, halted]
+        committed_snapshot: { type: integer, format: int64 }
+        lag_snapshots: { type: integer, format: int64 }
+        last_error: { type: string }
+
+    ConsumerOffset:
+      type: object
+      required: [consumer_id, table_uuid, committed_snapshot, updated_at]
+      properties:
+        consumer_id: { type: string }
+        table_uuid: { type: string, format: uuid }
+        committed_snapshot: { type: integer, format: int64 }
+        updated_at: { type: string, format: date-time }
+
+    ConsumerTableOffset:
+      type: object
+      required: [table_uuid, committed_snapshot, updated_at, table_dropped]
+      properties:
+        table_uuid: { type: string, format: uuid }
+        committed_snapshot: { type: integer, format: int64 }
+        updated_at: { type: string, format: date-time }
+        namespace:
+          type: string
+          description: Omitted only for a uuid no table incarnation ever carried.
+        table_name:
+          type: string
+          description: Live name, or the last name before the drop.
+        table_dropped: { type: boolean }
+
+    ConsumerSummary:
+      type: object
+      required: [consumer_id, offsets]
+      properties:
+        consumer_id: { type: string }
+        offsets:
+          type: array
+          items: { $ref: "#/components/schemas/ConsumerTableOffset" }
+
+    ConsumerList:
+      type: object
+      required: [consumers]
+      properties:
+        consumers:
+          type: array
+          items: { $ref: "#/components/schemas/ConsumerSummary" }

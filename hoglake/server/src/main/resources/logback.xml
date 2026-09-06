@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logging assembly. Two streams to stdout:
+   - CONSOLE: the app's human-readable log, mirroring logback's
+     unconfigured default (BasicConfigurator: root DEBUG, same pattern)
+     so adding this file changes nothing for existing loggers.
+   - AUDIT: the first-class audit log (observability/Audit.kt) — one
+     JSON line per event via LogstashEncoder on the dedicated
+     "hoglake.audit" logger, additivity off so audit events never leak
+     into the pattern console and vice versa.
+-->
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} -- %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <appender name="AUDIT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!-- request_id is emitted as a structured argument by
+                 Audit.kt; MDC inclusion would duplicate the key. -->
+            <includeMdc>false</includeMdc>
+        </encoder>
+    </appender>
+
+    <logger name="hoglake.audit" level="INFO" additivity="false">
+        <appender-ref ref="AUDIT"/>
+    </logger>
+
+    <root level="DEBUG">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

@@ -1,0 +1,7 @@
+{"read_snapshot":7,"appends":[{"namespace":"ns","table":"t","files":[
+                       {"path":"s3://b/f.parquet","record_count":10,"file_size_bytes":1024,
+                        "footer_size":256,"column_stats":[{"field_id":1,"value_count":10,
+                        "null_count":0,"lower_bound":"AAAAAA==","upper_bound":"/////w=="}],
+                        "partition_values":["2026-01-01",null]}],
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174000"}],
+                       "deletes":[],"author":"fuzz","message":"seed"}

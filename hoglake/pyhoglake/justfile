@@ -1,0 +1,30 @@
+# pyhoglake client library. All Python work runs inside the flox env.
+
+_uv := "flox activate -- uv"
+
+default:
+    @just --list
+
+sync:
+    {{_uv}} sync
+
+# Entire suite; integration tests hit HOGLAKE_URL (default
+# http://localhost:8080) and skip cleanly when it's down
+test:
+    {{_uv}} run pytest
+
+unit:
+    {{_uv}} run pytest -m "not integration"
+
+integration:
+    {{_uv}} run pytest -m integration
+
+lint:
+    {{_uv}} run ruff check .
+    {{_uv}} run ruff format --check .
+
+fmt:
+    {{_uv}} run ruff format .
+
+lock:
+    {{_uv}} lock

@@ -1,0 +1,51 @@
+[project]
+name = "hedgerow"
+version = "0.1.0"
+description = "hoglake-native replication daemon: one source table -> one destination table, append-only, at-least-once"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pyhoglake",
+    "pyarrow>=17.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+metrics = ["prometheus-client>=0.20"]
+
+[project.scripts]
+hedgerow = "hedgerow.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-httpx>=0.30",
+    "prometheus-client>=0.20",
+    # Pinned: see pyhoglake's note — an unpinned ruff resolves a
+    # different rule set per machine.
+    "ruff==0.16.6",
+]
+
+[tool.uv.sources]
+pyhoglake = { path = "../pyhoglake", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hedgerow"]
+
+[tool.ruff.lint.per-file-ignores]
+# Default rule selection applies; src/ stays strict.
+"tests/**" = [
+    "PLC3002", # table-driven lambda-call test style is deliberate
+    "DTZ001",  # tests exercise naive datetimes on purpose
+    "BLE001",  # conftest server-probe catch is deliberate
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that require a live hoglake server (HOGLAKE_URL)",
+]
+testpaths = ["tests"]
