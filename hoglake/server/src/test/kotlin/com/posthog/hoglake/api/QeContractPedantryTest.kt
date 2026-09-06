@@ -620,6 +620,110 @@ class QeContractPedantryTest {
     }
 
     @Test
+    fun `hostile identifier names draw 422 on the wire`() {
+        // POLICY CHANGE (2026-09-05): namespace/table/view/column names
+        // must match ^[A-Za-z_][A-Za-z0-9_-]{0,127}$. This pins the wire
+        // status for the shapes the server previously stored verbatim.
+        ensureFixture()
+        api { client ->
+            expectError(
+                client.postJson("/v1/catalogs/pedantry/namespaces", """{"name":"a/b"}"""),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            expectError(
+                client.postJson(
+                    "/v1/catalogs/pedantry/namespaces/ns/tables",
+                    """{"name":"<script>","columns":[{"name":"id","type":"long"}]}""",
+                ),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            expectError(
+                client.postJson(
+                    "/v1/catalogs/pedantry/namespaces/ns/tables",
+                    """{"name":"ok_name","columns":[{"name":"id col","type":"long"}]}""",
+                ),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            expectError(
+                client.postJson(
+                    "/v1/catalogs/pedantry/namespaces/ns/views",
+                    """{"name":"v/w","sql":"SELECT 1"}""",
+                ),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+        }
+    }
+
+    @Test
+    fun `single-offset GET returns the row or a clean 404`() {
+        ensureFixture()
+        api { client ->
+            val got = body(client.get("/v1/catalogs/pedantry/consumers/c1/offsets/$tableUuid"))
+            assertSnakeCase(got)
+            assertRequired(
+                got,
+                "ConsumerOffset",
+                "consumer_id",
+                "table_uuid",
+                "committed_snapshot",
+                "updated_at",
+            )
+            assertThat(got["table_uuid"].asText()).isEqualTo(tableUuid)
+            // Garbage-but-well-formed uuid: clean 404, never a 500 or an
+            // empty 200 (offsets-on-garbage-uuid is validated at PUT; the
+            // GET simply has nothing stored).
+            expectError(
+                client.get(
+                    "/v1/catalogs/pedantry/consumers/c1/offsets/00000000-0000-4000-8000-00000000dead",
+                ),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+            // Unknown consumer -> 404 too.
+            expectError(
+                client.get("/v1/catalogs/pedantry/consumers/never-seen/offsets/$tableUuid"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+            // Malformed uuid -> 400 (path param parse).
+            expectError(
+                client.get("/v1/catalogs/pedantry/consumers/c1/offsets/not-a-uuid"),
+                HttpStatusCode.BadRequest,
+                "bad_request",
+            )
+        }
+    }
+
+    @Test
+    fun `snapshots before cursor - descending page and cursor exclusivity`() {
+        ensureFixture()
+        api { client ->
+            val head = body(client.get("/v1/catalogs/pedantry"))["head_snapshot_id"].asLong()
+            val page = body(client.get("/v1/catalogs/pedantry/snapshots?before=${head + 1}&limit=3"))
+            assertSnakeCase(page)
+            val ids = page["snapshots"].map { it["snapshot_id"].asLong() }
+            assertThat(ids).isEqualTo(ids.sortedDescending())
+            assertThat(ids.first()).isEqualTo(head)
+            // before=1 yields exactly snapshot 0.
+            val bottom = body(client.get("/v1/catalogs/pedantry/snapshots?before=1"))
+            assertThat(bottom["snapshots"].map { it["snapshot_id"].asLong() }).containsExactly(0L)
+            assertThat(bottom["has_more"].asBoolean()).isFalse()
+            // A non-zero after alongside before is 422; after=0 is legal.
+            expectError(
+                client.get("/v1/catalogs/pedantry/snapshots?after=2&before=5"),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            assertThat(client.get("/v1/catalogs/pedantry/snapshots?after=0&before=5").status)
+                .isEqualTo(HttpStatusCode.OK)
+        }
+    }
+
+    @Test
     fun `negative read_snapshot is rejected 422`() {
         ensureFixture()
         api { client ->

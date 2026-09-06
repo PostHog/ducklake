@@ -2,13 +2,14 @@ package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
-import dev.hardwood.OutputFile
-import dev.hardwood.metadata.LogicalType
-import dev.hardwood.metadata.PhysicalType
-import dev.hardwood.metadata.RepetitionType
-import dev.hardwood.schema.FileSchema
-import dev.hardwood.writer.ParquetFileWriter
-import dev.hardwood.writer.WriterConfig
+import org.apache.parquet.example.data.simple.SimpleGroupFactory
+import org.apache.parquet.hadoop.example.ExampleParquetWriter
+import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.io.LocalOutputFile
+import org.apache.parquet.schema.LogicalTypeAnnotation
+import org.apache.parquet.schema.MessageType
+import org.apache.parquet.schema.PrimitiveType
+import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
 import org.awaitility.Awaitility.await
 import org.junit.jupiter.api.Tag
@@ -18,16 +19,14 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
 import java.time.Duration
-import java.time.Instant
 
 /**
- * End-to-end hydrator test: a real parquet file written with Hardwood,
- * uploaded to MinIO, registered as a 'pending' hog_data_file, hydrated,
- * and verified against the known column statistics.
- *
- * Hardwood 1.1.0.Beta1 does not write PARQUET:field_id, so these files
- * exercise the name-matching fallback; the field-id path is covered by
- * [FooterStatsTest] against hand-built footers.
+ * End-to-end hydrator test: real parquet files written with parquet-java
+ * (field ids included — the registration contract), uploaded to MinIO,
+ * registered as 'pending' hog_data_file rows, hydrated, and verified
+ * against the known column statistics. Also the field-id contract: a
+ * file whose schema lacks ids hydrates via name fallback but is flagged
+ * missing_field_ids; the reserved `_hog_row_id` id never trips it.
  */
 @Tag("integration")
 class HydratorIntegrationTest {
@@ -37,16 +36,17 @@ class HydratorIntegrationTest {
 
     // ---- known file content ------------------------------------------------
     //
-    // 25 rows, row groups of <= 10 rows (so >= 3 groups):
-    //   id    (long, required): 0..24
-    //   score (double)        : null when i % 5 == 0 (5 nulls), else i * 1.5
-    //   name  (string)        : null when i == 13 (1 null), else "row-%02d"
-    //   ts    (timestamptz)   : epoch second 1_700_000_000 + i, micros precision
+    // 25 rows:
+    //   id    (long, required, field id 1): 0..24
+    //   score (double, id 2)              : null when i % 5 == 0 (5 nulls), else i * 1.5
+    //   name  (string, id 3)              : null when i == 13 (1 null), else "row-%02d"
+    //   ts    (timestamptz, id 4)         : epoch second 1_700_000_000 + i, micros
 
     private companion object {
         const val ROWS = 25
         const val BUCKET = "hoglake-test"
         const val EPOCH0 = 1_700_000_000L
+        const val ROW_ID_FIELD_ID = 2147483646
 
         val minio: MinIOContainer by lazy {
             MinIOContainer("minio/minio:RELEASE.2023-09-04T19-57-37Z").also { it.start() }
@@ -62,59 +62,69 @@ class HydratorIntegrationTest {
             ).also { it.createBucket(BUCKET) }
         }
 
-        val parquetBytes: ByteArray by lazy { writeSampleParquet() }
+        /** The sample schema; [withIds] false drops every field id. */
+        fun sampleSchema(withIds: Boolean): MessageType {
+            fun Types.PrimitiveBuilder<PrimitiveType>.maybeId(id: Int) = if (withIds) id(id) else this
 
-        /** Thrift footer length, from the 4 LE bytes before the trailing magic. */
-        val footerSize: Long by lazy {
-            ByteBuffer.wrap(parquetBytes, parquetBytes.size - 8, 4)
-                .order(ByteOrder.LITTLE_ENDIAN).int.toLong()
+            return MessageType(
+                "hoglake_test",
+                Types.required(PrimitiveType.PrimitiveTypeName.INT64).maybeId(1).named("id"),
+                Types.optional(PrimitiveType.PrimitiveTypeName.DOUBLE).maybeId(2).named("score"),
+                Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                    .`as`(LogicalTypeAnnotation.stringType()).maybeId(3).named("name"),
+                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                    .`as`(LogicalTypeAnnotation.timestampType(true, LogicalTypeAnnotation.TimeUnit.MICROS))
+                    .maybeId(4)
+                    .named("ts"),
+            )
         }
 
-        fun writeSampleParquet(): ByteArray {
-            val schema =
-                FileSchema.builder("hoglake_test")
-                    .addColumn("id", PhysicalType.INT64, RepetitionType.REQUIRED)
-                    .addColumn("score", PhysicalType.DOUBLE, RepetitionType.OPTIONAL)
-                    .addColumn("name", PhysicalType.BYTE_ARRAY, RepetitionType.OPTIONAL, LogicalType.StringType())
-                    .addColumn(
-                        "ts",
-                        PhysicalType.INT64,
-                        RepetitionType.OPTIONAL,
-                        LogicalType.TimestampType(true, LogicalType.TimeUnit.MICROS),
-                    )
-                    .build()
+        fun writeSampleParquet(schema: MessageType): ByteArray {
             val tmp = Files.createTempFile("hoglake-hydrator", ".parquet")
             try {
-                ParquetFileWriter.create(
-                    OutputFile.of(tmp),
-                    schema,
-                    WriterConfig.builder().rowGroupTargetRows(10).build(),
-                ).use { writer ->
-                    val rows = writer.rowWriter()
-                    for (i in 0 until ROWS) {
-                        rows.writeRow { r ->
-                            r.setLong("id", i.toLong())
-                            if (i % 5 == 0) r.setNull("score") else r.setDouble("score", i * 1.5)
-                            if (i == 13) r.setNull("name") else r.setString("name", "row-%02d".format(i))
-                            r.setTimestamp("ts", Instant.ofEpochSecond(EPOCH0 + i))
+                Files.deleteIfExists(tmp)
+                val factory = SimpleGroupFactory(schema)
+                ExampleParquetWriter.builder(LocalOutputFile(tmp))
+                    .withType(schema)
+                    .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+                    .build()
+                    .use { writer ->
+                        for (i in 0 until ROWS) {
+                            val g = factory.newGroup()
+                            g.add("id", i.toLong())
+                            if (i % 5 != 0) g.add("score", i * 1.5)
+                            if (i != 13) g.add("name", "row-%02d".format(i))
+                            g.add("ts", (EPOCH0 + i) * 1_000_000L)
+                            writer.write(g)
                         }
                     }
-                }
                 return Files.readAllBytes(tmp)
             } finally {
                 Files.deleteIfExists(tmp)
             }
         }
+
+        val parquetBytes: ByteArray by lazy { writeSampleParquet(sampleSchema(withIds = true)) }
+
+        /** Thrift footer length, from the 4 LE bytes before the trailing magic. */
+        fun footerSizeOf(bytes: ByteArray): Long =
+            ByteBuffer.wrap(bytes, bytes.size - 8, 4)
+                .order(ByteOrder.LITTLE_ENDIAN).int.toLong()
+
+        val footerSize: Long by lazy { footerSizeOf(parquetBytes) }
     }
 
     // ---- catalog seeding ---------------------------------------------------
 
+    private var catalogSeq = 0
+
     private fun seedCatalogAndTable(): Long {
+        val name = "cat${catalogSeq++}"
         val catalogId =
             jdbi.withHandle<Long, Exception> { h ->
                 h.createQuery(
-                    "INSERT INTO hog_catalog (name, data_path) VALUES ('cat', 's3://$BUCKET/') RETURNING catalog_id",
-                ).mapTo(Long::class.java).one()
+                    "INSERT INTO hog_catalog (name, data_path) VALUES (:n, 's3://$BUCKET/') RETURNING catalog_id",
+                ).bind("n", name).mapTo(Long::class.java).one()
             }
         jdbi.useHandle<Exception> { h ->
             h.execute(
@@ -185,6 +195,16 @@ class HydratorIntegrationTest {
             ).bind(0, catalogId).bind(1, dataFileId).mapTo(String::class.java).one()
         }
 
+    private fun missingFieldIds(
+        catalogId: Long,
+        dataFileId: Long,
+    ): Boolean =
+        jdbi.withHandle<Boolean, Exception> { h ->
+            h.createQuery(
+                "SELECT missing_field_ids FROM hog_data_file WHERE catalog_id = ? AND data_file_id = ?",
+            ).bind(0, catalogId).bind(1, dataFileId).mapTo(Boolean::class.java).one()
+        }
+
     private data class StatsRow(
         val valueCount: Long,
         val nullCount: Long,
@@ -221,20 +241,11 @@ class HydratorIntegrationTest {
                 .list().toMap()
         }
 
-    // ---- tests -------------------------------------------------------------
-
-    @Test
-    fun `hydrates a pending file end to end`() {
-        val catalogId = seedCatalogAndTable()
-        val path = "s3://$BUCKET/t1/good.parquet"
-        store.put(path, parquetBytes)
-        // footer_size seeded -> exercises the ranged tail read.
-        seedDataFile(catalogId, 1, path, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
-
-        assertThat(hydrator.runOnce()).isEqualTo(1)
-        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
-
-        val stats = statsRows(catalogId, 1)
+    private fun assertSampleStats(
+        catalogId: Long,
+        dataFileId: Long,
+    ) {
+        val stats = statsRows(catalogId, dataFileId)
         assertThat(stats).containsOnlyKeys(1L, 2L, 3L, 4L)
 
         with(stats[1L]!!) { // id: 0..24, no nulls
@@ -262,9 +273,83 @@ class HydratorIntegrationTest {
             assertThat(lower).isEqualTo(IcebergSingleValue.encodeTimestampMicros(EPOCH0 * 1_000_000L))
             assertThat(upper).isEqualTo(IcebergSingleValue.encodeTimestampMicros((EPOCH0 + 24) * 1_000_000L))
         }
+    }
+
+    // ---- tests -------------------------------------------------------------
+
+    @Test
+    fun `hydrates a pending file end to end - field ids present so the flag stays false`() {
+        val catalogId = seedCatalogAndTable()
+        val path = "s3://$BUCKET/t1/good.parquet"
+        store.put(path, parquetBytes)
+        // footer_size seeded -> exercises the ranged tail read.
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        assertThat(missingFieldIds(catalogId, 1)).isFalse()
+        assertSampleStats(catalogId, 1)
 
         // Nothing left pending.
         assertThat(hydrator.runOnce()).isEqualTo(0)
+    }
+
+    @Test
+    fun `a file without field ids hydrates by name fallback but is flagged`() {
+        val catalogId = seedCatalogAndTable()
+        val idless = writeSampleParquet(sampleSchema(withIds = false))
+        val path = "s3://$BUCKET/t1/idless.parquet"
+        store.put(path, idless)
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), idless.size.toLong(), footerSizeOf(idless))
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        assertThat(missingFieldIds(catalogId, 1)).isTrue()
+        // Name fallback still produced honest stats.
+        assertSampleStats(catalogId, 1)
+    }
+
+    @Test
+    fun `the reserved _hog_row_id field id does not trip the flag`() {
+        val catalogId = seedCatalogAndTable()
+        // A compacted-style file: the sample schema (with ids) plus the
+        // explicit row-id column under the reserved id.
+        val schema =
+            MessageType(
+                "hoglake_test",
+                sampleSchema(withIds = true).fields +
+                    Types.required(PrimitiveType.PrimitiveTypeName.INT64)
+                        .id(ROW_ID_FIELD_ID)
+                        .named("_hog_row_id"),
+            )
+        val factory = SimpleGroupFactory(schema)
+        val tmp = Files.createTempFile("hoglake-rowid", ".parquet")
+        Files.deleteIfExists(tmp)
+        ExampleParquetWriter.builder(LocalOutputFile(tmp))
+            .withType(schema)
+            .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+            .build()
+            .use { writer ->
+                for (i in 0 until ROWS) {
+                    val g = factory.newGroup()
+                    g.add("id", i.toLong())
+                    if (i % 5 != 0) g.add("score", i * 1.5)
+                    if (i != 13) g.add("name", "row-%02d".format(i))
+                    g.add("ts", (EPOCH0 + i) * 1_000_000L)
+                    g.add("_hog_row_id", 1000L + i)
+                    writer.write(g)
+                }
+            }
+        val bytes = Files.readAllBytes(tmp)
+        Files.deleteIfExists(tmp)
+
+        val path = "s3://$BUCKET/t1/compacted.parquet"
+        store.put(path, bytes)
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), bytes.size.toLong(), footerSizeOf(bytes))
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        assertThat(missingFieldIds(catalogId, 1)).isFalse()
     }
 
     @Test
@@ -298,16 +383,17 @@ class HydratorIntegrationTest {
 
     @Test
     fun `background loop hydrates and a non-positive interval is a no-op`() {
-        // interval <= 0: nothing starts, close is safe.
-        hydrator.startLoop(0).close()
-        hydrator.startLoop(-1).close()
+        // interval <= 0: nothing registers, close is safe.
+        com.posthog.hoglake.BackgroundLoops().use { it.register("hydrator", 0) { hydrator.runOnce() } }
+        com.posthog.hoglake.BackgroundLoops().use { it.register("hydrator", -1) { hydrator.runOnce() } }
 
         val catalogId = seedCatalogAndTable()
         val path = "s3://$BUCKET/t1/loop.parquet"
         store.put(path, parquetBytes)
         seedDataFile(catalogId, 1, path, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
 
-        hydrator.startLoop(50).use {
+        com.posthog.hoglake.BackgroundLoops().use { loops ->
+            loops.register("hydrator", 50) { hydrator.runOnce() }
             await().atMost(Duration.ofSeconds(30)).untilAsserted {
                 assertThat(statsState(catalogId, 1)).isEqualTo("provided")
             }

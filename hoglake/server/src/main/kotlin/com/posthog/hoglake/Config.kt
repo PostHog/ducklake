@@ -23,8 +23,33 @@ data class Config(
     val cleanupIntervalMs: Long = env("HOGLAKE_CLEANUP_INTERVAL_MS", "60000").toLong(),
     /** Queue entries drained per cleanup run; S3 deletes sub-batch at 500. */
     val cleanupBatchSize: Int = env("HOGLAKE_CLEANUP_BATCH", "2000").toInt(),
+    /**
+     * How long drained hog_file_removal rows (the soft-deleted cleanup
+     * ledger) are kept before the sweep purges them. Default 30 days.
+     */
+    val removalLedgerRetentionSeconds: Long =
+        env("HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS", "${30L * 24 * 60 * 60}").toLong(),
     /** Catalog-health gauge sample interval; <= 0 disables the sampler loop. */
     val metricsIntervalMs: Long = env("HOGLAKE_METRICS_INTERVAL_MS", "15000").toLong(),
+    /**
+     * Commit admission bound (B2): lock_timeout on the commit
+     * transaction while it queues on the per-catalog advisory commit
+     * lock. Expiry -> typed CommitQueueTimeout -> HTTP 503 with
+     * Retry-After (retryable backpressure). 0 disables (unbounded wait).
+     */
+    val commitLockTimeoutMs: Long = env("HOGLAKE_COMMIT_LOCK_TIMEOUT_MS", "30000").toLong(),
+    /**
+     * Compaction sweep interval; default 0 = OFF for now (the manual
+     * /maintenance/compact trigger still works). Rate-awareness is by
+     * construction: tiny bites (see the batch knobs), never a storm.
+     */
+    val compactionIntervalMs: Long = env("HOGLAKE_COMPACTION_INTERVAL_MS", "0").toLong(),
+    /** Compaction output target size; also the "small file" threshold for inputs. */
+    val compactionTargetBytes: Long = env("HOGLAKE_COMPACTION_TARGET_BYTES", "${512L * 1024 * 1024}").toLong(),
+    /** Minimum input files before a group is worth rewriting. */
+    val compactionMinInputFiles: Int = env("HOGLAKE_COMPACTION_MIN_INPUT_FILES", "4").toInt(),
+    /** Groups rewritten per run per catalog — the commit-storm guard. */
+    val compactionMaxGroupsPerRun: Int = env("HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN", "1").toInt(),
 ) {
     companion object {
         private fun env(

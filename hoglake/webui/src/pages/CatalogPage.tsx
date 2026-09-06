@@ -12,10 +12,12 @@ import {
   listNamespaces,
   listSnapshots,
 } from "../api/client";
+import { addInt64, compareInt64 } from "../api/int64";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { ChangeBadge } from "../components/badges";
 import { formatTime } from "../lib/format";
+import { identifierError } from "../lib/names";
 
 const SNAPSHOT_PAGE_SIZE = 50;
 
@@ -47,6 +49,7 @@ function CatalogHeader({ catalog }: { catalog: string }) {
 function CreateNamespaceForm({ catalog }: { catalog: string }) {
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
+  const nameError = identifierError(name);
   const mutation = useMutation({
     mutationFn: () => createNamespace(catalog, name),
     onSuccess: () => {
@@ -59,6 +62,7 @@ function CreateNamespaceForm({ catalog }: { catalog: string }) {
       className="inline-form"
       onSubmit={(e) => {
         e.preventDefault();
+        if (nameError) return;
         mutation.mutate();
       }}
     >
@@ -71,12 +75,14 @@ function CreateNamespaceForm({ catalog }: { catalog: string }) {
             onChange={(e) => setName(e.target.value)}
             required
             placeholder="events"
+            aria-invalid={nameError !== null}
           />
         </label>
-        <button type="submit" disabled={mutation.isPending}>
+        <button type="submit" disabled={mutation.isPending || nameError !== null}>
           {mutation.isPending ? "Creating…" : "Create"}
         </button>
       </div>
+      {nameError && <p className="field-error">{nameError}</p>}
       {mutation.isError && <ErrorBox error={mutation.error} />}
     </form>
   );
@@ -129,29 +135,40 @@ function NamespacesPanel({ catalog }: { catalog: string }) {
 }
 
 function SnapshotsPanel({ catalog }: { catalog: string }) {
+  // The timeline is newest-first: walk DOWN from head+1 with the `before`
+  // cursor (descending pages); "Load more" pages older. `after` (ascending)
+  // is never combined with `before` — the server 422s that pair.
+  const headQuery = useQuery({
+    queryKey: ["catalog", catalog],
+    queryFn: () => getCatalog(catalog),
+  });
+  const head = headQuery.data?.head_snapshot_id;
   const query = useInfiniteQuery({
-    queryKey: ["snapshots", catalog],
+    queryKey: ["snapshots", catalog, head],
+    enabled: head !== undefined,
     queryFn: ({ pageParam }) =>
-      listSnapshots(catalog, { after: pageParam, limit: SNAPSHOT_PAGE_SIZE }),
-    initialPageParam: 0,
+      listSnapshots(catalog, { before: pageParam, limit: SNAPSHOT_PAGE_SIZE }),
+    // head+1 in exact int64 arithmetic: head itself must be included.
+    initialPageParam: addInt64(head ?? "0", 1),
     getNextPageParam: (lastPage) => {
       if (!lastPage.has_more || lastPage.snapshots.length === 0) return undefined;
+      // Pages are descending; the last row is the oldest id fetched so far.
       return lastPage.snapshots[lastPage.snapshots.length - 1].snapshot_id;
     },
   });
 
-  if (query.isError) {
+  if (headQuery.isError || query.isError) {
     return (
       <section className="panel">
         <h2>Snapshots</h2>
-        <ErrorBox error={query.error} />
+        <ErrorBox error={headQuery.isError ? headQuery.error : query.error} />
       </section>
     );
   }
 
   const snapshots = (query.data?.pages ?? [])
     .flatMap((p) => p.snapshots)
-    .sort((a, b) => b.snapshot_id - a.snapshot_id);
+    .sort((a, b) => compareInt64(b.snapshot_id, a.snapshot_id));
 
   return (
     <section className="panel">
@@ -166,7 +183,7 @@ function SnapshotsPanel({ catalog }: { catalog: string }) {
             <th>changes</th>
           </tr>
         </thead>
-        {query.isPending ? (
+        {headQuery.isPending || query.isPending ? (
           <SkeletonRows rows={5} cols={5} />
         ) : (
           <tbody>

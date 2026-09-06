@@ -15,8 +15,8 @@ precise per-column diff, and the daemon refuses to start.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 from pyhoglake import Column
 
@@ -74,9 +74,7 @@ def validate_projection(
             )
 
     if filter_column is not None and filter_column not in src_by_name:
-        problems.append(
-            f"  - filter column {filter_column!r}: missing from source"
-        )
+        problems.append(f"  - filter column {filter_column!r}: missing from source")
 
     if problems:
         raise SchemaMismatchError(
@@ -84,9 +82,7 @@ def validate_projection(
             f"({len(problems)} problem(s)):\n" + "\n".join(problems)
         )
 
-    dest_names = tuple(
-        c.name for c in sorted(dest_columns, key=lambda c: c.ordinal)
-    )
+    dest_names = tuple(c.name for c in sorted(dest_columns, key=lambda c: c.ordinal))
     read = list(dest_names)
     if filter_column is not None and filter_column not in read:
         read.append(filter_column)

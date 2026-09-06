@@ -74,13 +74,29 @@ class Bench:
     # -- results -----------------------------------------------------------
 
     def append_result(
-        self, scenario: str, params: dict[str, Any], metrics: list[Any]
+        self,
+        scenario: str,
+        params: dict[str, Any],
+        metrics: list[Any],
+        *,
+        status: str = "ok",
+        flags: list[str] | None = None,
+        error: str | None = None,
+        config: dict[str, Any] | None = None,
     ) -> None:
+        """One JSONL line per completed-OR-failed scenario. Stable
+        schema: status is always present ('ok', 'regression', 'aborted',
+        'invariant_violation', 'error'); flags/error/config are always
+        present (empty list / null / {})."""
         record = {
             "ts": time.time(),
             "run_id": self.cfg.run_id,
             "scenario": scenario,
+            "status": status,
             "params": params,
+            "config": config or {},
+            "flags": flags or [],
+            "error": error,
             "metrics": [m.to_json() for m in metrics],
         }
         with open(self.cfg.results_path, "a", encoding="utf-8") as f:

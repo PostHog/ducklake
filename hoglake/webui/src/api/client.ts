@@ -8,12 +8,14 @@ import type {
   CreateCatalogRequest,
   CreateTableRequest,
   DataFile,
+  Int64,
   Namespace,
   ScanFile,
   SnapshotPage,
   Table,
   TableSummary,
 } from "./types";
+import { parseInt64Json } from "./int64";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -72,7 +74,9 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!res.ok) throw await parseError(res);
-  return (await res.json()) as T;
+  // Parse from the raw text so int64 fields survive exactly (never rounded
+  // through a double). See src/api/int64.ts.
+  return parseInt64Json(await res.text()) as T;
 }
 
 // -- catalogs ---------------------------------------------------------------
@@ -134,7 +138,7 @@ export function getTable(
   catalog: string,
   namespace: string,
   table: string,
-  snapshot?: number,
+  snapshot?: Int64,
 ): Promise<Table> {
   return request(
     buildUrl(
@@ -148,7 +152,7 @@ export function listFiles(
   catalog: string,
   namespace: string,
   table: string,
-  snapshot?: number,
+  snapshot?: Int64,
 ): Promise<DataFile[]> {
   return request(
     buildUrl(
@@ -162,7 +166,7 @@ export function planScan(
   catalog: string,
   namespace: string,
   table: string,
-  snapshot?: number,
+  snapshot?: Int64,
 ): Promise<ScanFile[]> {
   return request(
     buildUrl(
@@ -176,11 +180,23 @@ export function planScan(
 
 export function listSnapshots(
   catalog: string,
-  opts?: { after?: number; limit?: number },
+  opts?: { after?: Int64; before?: Int64; limit?: number },
 ): Promise<SnapshotPage> {
+  // The spec makes `before` (descending pagination) mutually exclusive with
+  // a non-zero `after` (server answers 422). Refuse to build such a request.
+  if (
+    opts?.before !== undefined &&
+    opts?.after !== undefined &&
+    opts.after !== "0"
+  ) {
+    throw new Error(
+      "listSnapshots: `before` and a non-zero `after` are mutually exclusive",
+    );
+  }
   return request(
     buildUrl(`/catalogs/${seg(catalog)}/snapshots`, {
       after: opts?.after,
+      before: opts?.before,
       limit: opts?.limit,
     }),
   );

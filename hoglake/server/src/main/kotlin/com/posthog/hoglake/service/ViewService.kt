@@ -41,7 +41,7 @@ class ViewService(private val jdbi: Jdbi) {
             "$namespace.$name",
             detail = { "dialect=$dialect" },
         ) {
-            if (name.isBlank()) throw HoglakeException.Validation("view name must not be blank")
+            Identifiers.validate("view", name)
             if (sql.isBlank()) throw HoglakeException.Validation("view sql must not be blank")
             if (dialect.isBlank()) throw HoglakeException.Validation("view dialect must not be blank")
             jdbi.inTransactionUnchecked { h ->

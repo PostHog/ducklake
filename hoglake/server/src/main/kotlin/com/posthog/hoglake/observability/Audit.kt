@@ -30,10 +30,17 @@ object Audit {
     // reach the LogstashEncoder as event arguments.
     private val log = LoggerFactory.getLogger(LOGGER_NAME)
 
+    /** Application logger for audit-emission failures (never the audit stream itself). */
+    private val appLog = LoggerFactory.getLogger(Audit::class.java)
+
     /**
      * Emit one audit event. [obj] is the acted-on object (namespace,
      * namespace.table, consumer/table pair, ...); null for catalog-level
      * actions. [requestId] defaults to the request MDC when present.
+     *
+     * NEVER propagates: audit emission is telemetry, and a broken
+     * appender/encoder must not fail the (already-finished) action it
+     * describes. Failures go to the application logger.
      */
     fun event(
         action: String,
@@ -43,17 +50,30 @@ object Audit {
         detail: String? = null,
         requestId: String? = null,
     ) {
-        val args =
-            mutableListOf<StructuredArgument>(
-                kv("action", action),
-                kv("actor", "anonymous"),
-                kv("outcome", outcome),
-            )
-        catalog?.let { args += kv("catalog", it) }
-        obj?.let { args += kv("object", it) }
-        detail?.let { args += kv("detail", it) }
-        (requestId ?: MDC.get(REQUEST_ID_MDC))?.let { args += kv("request_id", it) }
-        log.info("$action $outcome", *args.toTypedArray())
+        try {
+            val args =
+                mutableListOf<StructuredArgument>(
+                    kv("action", action),
+                    kv("actor", "anonymous"),
+                    kv("outcome", outcome),
+                )
+            catalog?.let { args += kv("catalog", it) }
+            obj?.let { args += kv("object", it) }
+            detail?.let { args += kv("detail", it) }
+            (requestId ?: MDC.get(REQUEST_ID_MDC))?.let { args += kv("request_id", it) }
+            log.info("$action $outcome", *args.toTypedArray())
+        } catch (t: Throwable) {
+            appLog.error("audit event emission failed for action '{}'", action, t)
+        }
+    }
+
+    /** [audited]'s success-path escape hatch; @PublishedApi so the inline body can call it. */
+    @PublishedApi
+    internal fun decorationFailed(
+        action: String,
+        t: Throwable,
+    ) {
+        appLog.error("audit decoration failed for action '{}'", action, t)
     }
 
     /**
@@ -61,6 +81,12 @@ object Audit {
      * one audit event AFTER it returns or throws — the event always
      * describes a finished (committed or rolled-back) action, never one
      * in flight.
+     *
+     * Emission isolation: a committed block is NEVER failed by its own
+     * audit decoration — a success-path decoration failure ([detail] /
+     * [successOutcome] throwing) is logged and swallowed; a failure-path
+     * decoration failure rides the original exception as a suppressed
+     * throwable instead of masking it.
      */
     inline fun <T> audited(
         action: String,
@@ -74,10 +100,18 @@ object Audit {
             try {
                 block()
             } catch (e: Throwable) {
-                event(action, catalog, obj, failureOutcome(e), e.message)
+                try {
+                    event(action, catalog, obj, failureOutcome(e), e.message)
+                } catch (t: Throwable) {
+                    e.addSuppressed(t)
+                }
                 throw e
             }
-        event(action, catalog, obj, successOutcome(result), detail(result))
+        try {
+            event(action, catalog, obj, successOutcome(result), detail(result))
+        } catch (t: Throwable) {
+            decorationFailed(action, t)
+        }
         return result
     }
 
@@ -87,6 +121,7 @@ object Audit {
             is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.AlreadyExists -> "conflict"
             is HoglakeException.OffsetRegression -> "regression"
+            is HoglakeException.CommitQueueTimeout -> "timeout"
             is HoglakeException.Validation -> "validation"
             is HoglakeException.NotFound -> "not_found"
             else -> "error"

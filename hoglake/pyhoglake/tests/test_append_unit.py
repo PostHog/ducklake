@@ -1,16 +1,26 @@
 """Unit tests for the append writer path: parquet bytes written through a
-fake filesystem, commit body shape, field ids, deferred stats."""
+fake filesystem, commit body shape, field ids, deferred stats, and the
+name-rebind incarnation guard (BUG-1, 2026-09-05 adversarial review; now
+atomic server-side — the commit ships ``expected_table_uuid`` and the
+server 409s a mismatch with zero writes, the client keeping only one
+cheap pre-flight re-resolve as an upload-saving fast-fail)."""
 
 import base64
 import io
 import json
 import struct
+import uuid
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from pyhoglake import HoglakeClient, HoglakeError, ValidationError
+from pyhoglake import (
+    HoglakeClient,
+    HoglakeError,
+    IncarnationChangedError,
+    ValidationError,
+)
 from pyhoglake.client import Namespace
 
 BASE = "http://hog.test"
@@ -28,7 +38,13 @@ TABLE_WIRE = {
     "table_uuid": "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
     "columns": [
         {"name": "id", "type": "long", "field_id": 1, "ordinal": 0, "nullable": False},
-        {"name": "name", "type": "string", "field_id": 2, "ordinal": 1, "nullable": True},
+        {
+            "name": "name",
+            "type": "string",
+            "field_id": 2,
+            "ordinal": 1,
+            "nullable": True,
+        },
     ],
     "record_count": 0,
     "file_count": 0,
@@ -85,6 +101,10 @@ def table(httpx_mock, fake_s3):
 
 
 def _mock_refresh_and_commit(httpx_mock):
+    # append re-resolves the table by name exactly ONCE (the pre-flight
+    # fast-fail before the upload; the server-side expected_table_uuid
+    # commit guard replaced the old second, post-upload re-resolve).
+    # Non-reusable on purpose: a second GET would fail the mock.
     httpx_mock.add_response(
         method="GET",
         url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
@@ -100,9 +120,7 @@ def _mock_refresh_and_commit(httpx_mock):
 def test_append_full(table, httpx_mock, fake_s3):
     _mock_refresh_and_commit(httpx_mock)
     data = pa.table({"id": [1, 2, 3], "name": ["a", "b", None]})
-    res = table.append(
-        data, read_snapshot=5, author="tester", message="first"
-    )
+    res = table.append(data, read_snapshot=5, author="tester", message="first")
     assert res.snapshot_id == 6
 
     body = json.loads(httpx_mock.get_requests()[-1].content)
@@ -112,6 +130,8 @@ def test_append_full(table, httpx_mock, fake_s3):
     (append,) = body["appends"]
     assert append["namespace"] == "ns1"
     assert append["table"] == "events"
+    # the atomic guard rides the wire: default = the pinned table_uuid
+    assert append["expected_table_uuid"] == TABLE_WIRE["table_uuid"]
     (file_reg,) = append["files"]
 
     # exactly one file written, under the data path with the missing '/' fixed
@@ -145,6 +165,16 @@ def test_append_full(table, httpx_mock, fake_s3):
     assert got.column("name").to_pylist() == ["a", "b", None]
     meta = pf.schema_arrow
     assert meta.field("id").metadata[b"PARQUET:field_id"] == b"1"
+
+    # single pre-flight shape: exactly ONE re-resolve during the append
+    # (plus the fixture's initial resolve) — the old post-upload second
+    # re-resolve is gone, superseded by the server-side commit guard
+    table_gets = [
+        r
+        for r in httpx_mock.get_requests()
+        if r.method == "GET" and str(r.url).endswith("/tables/events")
+    ]
+    assert len(table_gets) == 2
 
 
 def test_append_deferred_stats(table, httpx_mock, fake_s3):
@@ -207,6 +237,142 @@ def test_append_partitioned_table_rejected(table, httpx_mock):
     )
     with pytest.raises(HoglakeError, match="partitioned"):
         table.append(pa.table({"id": [1], "name": ["a"]}))
+
+
+# -- incarnation guard (BUG-1 regression: name-rebind race; the guard is
+# -- now ATOMIC at commit — expected_table_uuid on the commit body, 409
+# -- with zero writes on mismatch — with one pre-flight kept as an
+# -- upload-saving fast-fail) ------------------------------------------------
+
+REBOUND_WIRE = dict(TABLE_WIRE, table_uuid="9d1c2f34-0000-4000-8000-000000000bad")
+_TABLES_URL = f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events"
+_COMMIT_URL = f"{BASE}/v1/catalogs/cat/commit"
+
+RECREATED_409 = {
+    "error": "commit_conflict",
+    "detail": (
+        "expected_table_uuid mismatch: the table was recreated "
+        f"(expected {TABLE_WIRE['table_uuid']})"
+    ),
+}
+
+
+def test_append_rebind_detected_before_upload(table, httpx_mock, fake_s3):
+    # the pre-flight fast-fail sees the new incarnation: no S3 write
+    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=REBOUND_WIRE)
+    with pytest.raises(IncarnationChangedError, match="recreated"):
+        table.append(pa.table({"id": [1], "name": ["a"]}))
+    assert fake_s3.files == {}  # nothing uploaded
+    assert not [r for r in httpx_mock.get_requests() if r.method == "POST"]
+
+
+def test_append_rebind_after_preflight_is_409d_by_the_server(
+    table, httpx_mock, fake_s3
+):
+    # THE previously-racy half: the pre-flight passes, the table is
+    # recreated before the commit lands, and the SERVER's atomic
+    # expected_table_uuid guard 409s the commit ("the table was
+    # recreated") with zero writes. The client maps it to
+    # IncarnationChangedError.
+    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=TABLE_WIRE)
+    httpx_mock.add_response(
+        method="POST", url=_COMMIT_URL, json=RECREATED_409, status_code=409
+    )
+    with pytest.raises(IncarnationChangedError, match="commit_conflict") as ei:
+        table.append(pa.table({"id": [1], "name": ["a"]}))
+    assert ei.value.status_code == 409
+    assert "the table was recreated" in (ei.value.detail or "")
+    assert not ei.value.retryable
+    assert len(fake_s3.files) == 1  # parquet orphaned in the bucket
+
+
+def test_append_ordinary_commit_conflict_stays_retryable(table, httpx_mock, fake_s3):
+    # a 409 that does NOT indicate recreation keeps the existing
+    # taxonomy: CommitConflictError, retryable
+    from pyhoglake import CommitConflictError
+
+    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=TABLE_WIRE)
+    httpx_mock.add_response(
+        method="POST",
+        url=_COMMIT_URL,
+        json={"error": "commit conflict", "detail": "concurrent DDL"},
+        status_code=409,
+    )
+    with pytest.raises(CommitConflictError) as ei:
+        table.append(pa.table({"id": [1], "name": ["a"]}))
+    assert ei.value.retryable
+
+
+def test_append_server_refusal_does_not_rebase_pinned_identity(
+    table, httpx_mock, fake_s3
+):
+    # a server-side guard refusal must leave the Table pinned to the
+    # ORIGINAL uuid (the pre-flight saw the old incarnation and adopted
+    # nothing new)
+    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=TABLE_WIRE)
+    httpx_mock.add_response(
+        method="POST", url=_COMMIT_URL, json=RECREATED_409, status_code=409
+    )
+    with pytest.raises(IncarnationChangedError):
+        table.append(pa.table({"id": [1], "name": ["a"]}))
+    assert table.table_uuid == TABLE_WIRE["table_uuid"]
+
+
+def test_append_rebind_does_not_rebase_pinned_identity(table, httpx_mock, fake_s3):
+    # after a refused append, the Table object still pins the ORIGINAL
+    # uuid — a naive retry must trip the guard again, not silently adopt
+    # the new incarnation.
+    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=REBOUND_WIRE)
+    with pytest.raises(IncarnationChangedError):
+        table.append(pa.table({"id": [1], "name": ["a"]}))
+    assert table.table_uuid == TABLE_WIRE["table_uuid"]
+    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=REBOUND_WIRE)
+    with pytest.raises(IncarnationChangedError):
+        table.append(pa.table({"id": [1], "name": ["a"]}))
+
+
+def test_append_explicit_expected_table_uuid(table, httpx_mock, fake_s3):
+    # an explicit pin (uuid.UUID accepted) overrides the object's own
+    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=TABLE_WIRE)
+    with pytest.raises(IncarnationChangedError, match="recreated"):
+        table.append(
+            pa.table({"id": [1], "name": ["a"]}),
+            expected_table_uuid=uuid.UUID("9d1c2f34-0000-4000-8000-000000000bad"),
+        )
+    assert fake_s3.files == {}
+
+
+def test_append_explicit_expected_table_uuid_match_commits(table, httpx_mock, fake_s3):
+    _mock_refresh_and_commit(httpx_mock)
+    res = table.append(
+        pa.table({"id": [1], "name": ["a"]}),
+        expected_table_uuid=uuid.UUID(TABLE_WIRE["table_uuid"]),
+    )
+    assert res.snapshot_id == 6
+    assert len(fake_s3.files) == 1
+    body = json.loads(httpx_mock.get_requests()[-1].content)
+    (append,) = body["appends"]
+    # an explicit pin is what goes on the wire
+    assert append["expected_table_uuid"] == TABLE_WIRE["table_uuid"]
+
+
+def test_append_unguarded_sends_no_field_and_skips_the_guard(
+    table, httpx_mock, fake_s3
+):
+    # opt-out: name-only resolution. Even a rebound name commits (the
+    # caller asked for exactly that), and no expected_table_uuid field
+    # rides the commit body.
+    from pyhoglake import UNGUARDED
+
+    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=REBOUND_WIRE)
+    httpx_mock.add_response(method="POST", url=_COMMIT_URL, json={"snapshot_id": 6})
+    res = table.append(
+        pa.table({"id": [1], "name": ["a"]}), expected_table_uuid=UNGUARDED
+    )
+    assert res.snapshot_id == 6
+    body = json.loads(httpx_mock.get_requests()[-1].content)
+    (append,) = body["appends"]
+    assert "expected_table_uuid" not in append
 
 
 def test_append_without_s3_config(httpx_mock):

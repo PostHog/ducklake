@@ -32,7 +32,13 @@ TABLE_WIRE = {
     "table_uuid": "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",
     "columns": [
         {"name": "id", "type": "long", "field_id": 1, "ordinal": 0, "nullable": False},
-        {"name": "name", "type": "string", "field_id": 2, "ordinal": 1, "nullable": True},
+        {
+            "name": "name",
+            "type": "string",
+            "field_id": 2,
+            "ordinal": 1,
+            "nullable": True,
+        },
     ],
     "record_count": 0,
     "file_count": 0,
@@ -292,7 +298,13 @@ def test_alter_wire_shape_and_errors(client, httpx_mock):
     url = f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter"
     altered = dict(TABLE_WIRE)
     altered["columns"] = TABLE_WIRE["columns"] + [
-        {"name": "score", "type": "double", "field_id": 3, "ordinal": 2, "nullable": True}
+        {
+            "name": "score",
+            "type": "double",
+            "field_id": 3,
+            "ordinal": 2,
+            "nullable": True,
+        }
     ]
     httpx_mock.add_response(method="POST", url=url, json=altered)
     info = t.alter(
@@ -431,6 +443,51 @@ def test_snapshots_pagination(client, httpx_mock):
     assert got[0].snapshot_time.year == 2026
 
 
+def test_snapshots_before_pagination_descending(client, httpx_mock):
+    cat = _catalog(client, httpx_mock)
+
+    def snap(i):
+        return {
+            "snapshot_id": i,
+            "snapshot_time": "2026-09-04T12:00:00Z",
+            "schema_version": 1,
+        }
+
+    # descending walk from head+1: newest first, cursor = last (lowest)
+    # id of each page
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/snapshots?before=6&limit=2",
+        json={"snapshots": [snap(5), snap(4)], "has_more": True},
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/snapshots?before=4&limit=2",
+        json={"snapshots": [snap(3)], "has_more": False},
+    )
+    got = list(cat.snapshots(before=6, limit=2))
+    assert [s.snapshot_id for s in got] == [5, 4, 3]
+    # descending requests never carry the 'after' cursor
+    for r in httpx_mock.get_requests()[-2:]:
+        assert "after" not in dict(r.url.params)
+
+
+def test_snapshots_before_and_after_mutually_exclusive(client, httpx_mock):
+    cat = _catalog(client, httpx_mock)
+    n_before = len(httpx_mock.get_requests())
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cat.snapshots(after=3, before=9)  # eager: no iteration needed
+    # enforced client-side: no request ever left the building
+    assert len(httpx_mock.get_requests()) == n_before
+    # after=0 (the ascending default) is NOT a cursor: before alone is fine
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/snapshots?before=1&limit=1000",
+        json={"snapshots": [], "has_more": False},
+    )
+    assert list(cat.snapshots(before=1)) == []
+
+
 # -- options / maintenance --------------------------------------------------
 
 
@@ -529,6 +586,39 @@ def test_offsets(client, httpx_mock):
     assert cat.offsets("cdc-1")[0].table_uuid == uuid
 
 
+def test_single_offset_get(client, httpx_mock):
+    cat = _catalog(client, httpx_mock)
+    uuid = TABLE_WIRE["table_uuid"]
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/consumers/cdc-1/offsets/{uuid}",
+        json={
+            "consumer_id": "cdc-1",
+            "table_uuid": uuid,
+            "committed_snapshot": 7,
+            "updated_at": "2026-09-04T12:00:00Z",
+        },
+    )
+    off = cat.offset("cdc-1", uuid)
+    assert off is not None
+    assert off.committed_snapshot == 7
+    assert off.table_uuid == uuid
+
+
+def test_single_offset_get_absent_returns_none(client, httpx_mock):
+    # absence is a routine consumer state: None, not NotFoundError (a
+    # deliberate divergence from the raise-on-404 idiom)
+    cat = _catalog(client, httpx_mock)
+    uuid = TABLE_WIRE["table_uuid"]
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/consumers/cdc-1/offsets/{uuid}",
+        json={"error": "no offset stored"},
+        status_code=404,
+    )
+    assert cat.offset("cdc-1", uuid) is None
+
+
 # -- commit conflict on the append path ------------------------------------
 
 
@@ -543,6 +633,33 @@ def test_commit_conflict_is_retryable(client, httpx_mock):
     with pytest.raises(CommitConflictError) as ei:
         cat._commit({"appends": []})
     assert ei.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "commit_conflict: the table was recreated"},
+        {"error": "commit_conflict", "detail": "The Table Was Recreated (uuid x != y)"},
+    ],
+    ids=["marker-in-error", "marker-in-detail-case-insensitive"],
+)
+def test_commit_409_recreation_maps_to_incarnation_changed(client, httpx_mock, body):
+    # the 409 discriminator: "the table was recreated" in message or
+    # detail (case-insensitive) -> IncarnationChangedError (never
+    # retryable); any other 409 stays CommitConflictError (see above)
+    from pyhoglake import IncarnationChangedError
+
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json=body,
+        status_code=409,
+    )
+    with pytest.raises(IncarnationChangedError) as ei:
+        cat._commit({"appends": []})
+    assert ei.value.status_code == 409
+    assert ei.value.retryable is False
 
 
 def test_non_json_error_body(client, httpx_mock):

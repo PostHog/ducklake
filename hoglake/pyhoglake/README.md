@@ -48,11 +48,13 @@ ns = catalog.create_namespace("analytics")
 
 table = ns.create_table(
     "events",
-    pa.schema([
-        pa.field("id", pa.int64(), nullable=False),
-        pa.field("name", pa.string()),
-        pa.field("amount", pa.decimal128(10, 2)),
-    ]),
+    pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("name", pa.string()),
+            pa.field("amount", pa.decimal128(10, 2)),
+        ]
+    ),
 )
 
 # THE writer path: writes one parquet file (with catalog field ids
@@ -75,6 +77,7 @@ for f in table.files():
 # changefeed + consumer offsets
 plan = table.changes(from_snapshot=0)
 catalog.commit_offset("my-consumer", table.table_uuid, plan.to_snapshot)
+catalog.offset("my-consumer", table.table_uuid)  # one offset; None if unset
 ```
 
 More surface:
@@ -82,14 +85,20 @@ More surface:
 ```python
 from pyhoglake import ops
 
-table.alter([ops.add_column("score", pa.float64())])   # schema evolution
-table.info(snapshot=5)                                  # time travel
-table.files(at_timestamp=some_datetime)                 # by timestamp
-table.append(big_table, deferred_stats=True)            # register as pending
-catalog.set_retention(7 * 86400, consumer_floor=True)   # retention policy
-catalog.expire(); catalog.cleanup()                     # maintenance sweeps
+table.alter([ops.add_column("score", pa.float64())])  # schema evolution
+table.info(snapshot=5)  # time travel
+table.files(at_timestamp=some_datetime)  # by timestamp
+table.append(big_table, deferred_stats=True)  # register as pending
+catalog.set_retention(7 * 86400, consumer_floor=True)  # retention policy
+catalog.expire()
+catalog.cleanup()  # maintenance sweeps
 ns.create_view("v", "SELECT 1", dialect="trino")
-for s in catalog.snapshots(limit=1000): ...             # auto-paginated
+for s in catalog.snapshots(limit=1000):
+    ...  # auto-paginated
+for s in catalog.snapshots(before=head + 1):
+    ...  # descending walk
+    # (mutually exclusive
+    # with non-zero after)
 ```
 
 ## Configuration
@@ -98,7 +107,7 @@ for s in catalog.snapshots(limit=1000): ...             # auto-paginated
 |---|---|
 | Server | `HoglakeClient(base_url, timeout=30.0)` — `/v1` is appended |
 | Object store | `S3Config(access_key, secret_key, endpoint_override, region, allow_bucket_creation)`; the write path uses `pyarrow.fs.S3FileSystem` (path-style with an endpoint override) |
-| Errors | Typed: `NotFoundError`, `AlreadyExistsError`, `CommitConflictError` (`retryable=True` — refresh read snapshot and retry), `ValidationError`, `OffsetRegressionError`, `ExpiredError` (410 — reconcile from a full scan), all under `HoglakeError` |
+| Errors | Typed: `NotFoundError`, `AlreadyExistsError`, `CommitConflictError` (`retryable=True` — refresh read snapshot and retry), `ValidationError`, `OffsetRegressionError`, `ExpiredError` (410 — reconcile from a full scan), `IncarnationChangedError` (the append incarnation guard, enforced server-side at commit, see below), all under `HoglakeError` |
 
 ## Type mapping
 
@@ -116,6 +125,37 @@ for s in catalog.snapshots(limit=1000): ...             # auto-paginated
 | `binary(16)` (fixed) or `pa.uuid()` | `uuid` — 16 big-endian bytes, i.e. `uuid.UUID(...).bytes` |
 
 Anything else is rejected with an error listing the supported set.
+
+## The append incarnation guard — atomic at commit
+
+Commit payloads are addressed by **(namespace, table) name**, so an
+append lands on whatever table currently holds that name. If the table
+is dropped and recreated (a new `table_uuid`) between your resolve and
+your append, a naive client would write into the new incarnation's
+history without noticing.
+
+`Table.append(..., expected_table_uuid=...)` guards against this
+**atomically, at commit time**. Every commit carries an
+`expected_table_uuid` field (default: the `table_uuid` the `Table`
+object was resolved as; pass one explicitly to pin a specific
+incarnation), and the server rejects the whole commit with 409 — zero
+writes — when the live table's uuid differs. The client maps that 409
+(its message says "the table was recreated") to
+`IncarnationChangedError`; ordinary commit conflicts remain
+`CommitConflictError` (retryable). There is no window in which a
+recreated table can accept rows from a guarded append.
+
+The client also keeps **one** cheap pre-flight re-resolve before the
+parquet upload. That is purely an optimization — it fast-fails an
+already-dead incarnation before paying for the S3 write — not the
+safety mechanism. A commit-time refusal orphans the uploaded parquet
+(cleanup's problem, never the catalog's). A refused append never
+rebases the `Table` object's pinned identity, so a blind retry trips
+the guard again rather than silently adopting the new incarnation.
+
+To opt out entirely (name-only resolution), pass
+`expected_table_uuid=pyhoglake.UNGUARDED`; the commit then carries no
+`expected_table_uuid` field and no pre-flight check runs.
 
 ## Not in 0.1
 

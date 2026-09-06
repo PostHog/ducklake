@@ -26,33 +26,69 @@ The viaduck lessons this encodes (each is a requirement, not a style):
    prometheus metrics — passive reporting only, never control flow.
 8. Deletes in the plan HALT loudly: append-only mode cannot represent
    them (v1 contract).
+
+The 2026-09-05 adversarial review added four requirements on top:
+
+9.  The incarnation guard extends to the WRITE path: every append ships
+    ``expected_table_uuid`` on the commit body, and the SERVER enforces
+    it atomically at commit time (409, zero writes, on mismatch) — so a
+    destination recreate mid-window halts instead of splitting appends
+    across incarnations (BUG-1). The old resolve->POST residual race is
+    closed; pyhoglake's pre-flight re-resolve remains only as an
+    upload-saving fast-fail.
+10. Rows read per file are reconciled against the plan's record_count;
+    a short read HALTS (DataIntegrityError) before any offset commit
+    (BUG-2).
+11. Transient retries are bounded: at most max_window_replays window
+    replays (each loudly logged — duplicates possible), then a
+    PersistentFailureError HALT; permanent 4xx client errors halt
+    immediately (BUG-3).
+12. An offset regression on commit is split-brain evidence (foreign
+    writer on our consumer_id) and HALTS as SplitBrainError; the
+    foreign offset is never adopted (BUG-4).
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Callable, Iterator, Sequence
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-from pyhoglake import ExpiredError, HoglakeClient, NotFoundError
+from pyhoglake import (
+    AlreadyExistsError,
+    ExpiredError,
+    HoglakeClient,
+    NotFoundError,
+    OffsetRegressionError,
+    ValidationError,
+)
+from pyhoglake import IncarnationChangedError as ClientIncarnationChangedError
+from pyhoglake.types import columns_to_arrow_schema
 
 from .config import HedgerowConfig
 from .filtering import RowFilter, build_filter
 from .halts import (
+    DataIntegrityError,
     DeletesPresentError,
     FeedExpiredError,
     HaltError,
     IncarnationChangedError,
+    PersistentFailureError,
+    SplitBrainError,
 )
 from .metrics import NullMetrics, build_metrics
 from .projection import ProjectionPlan, validate_projection
 from .window import Window, plan_window
 
 log = logging.getLogger("hedgerow")
+
+# pyhoglake 4xx classes that a retry can never fix: replaying the window
+# hits the identical refusal, so run_forever halts immediately instead of
+# burning the replay budget (and duplicating rows) on them.
+PERMANENT_CLIENT_ERRORS = (ValidationError, NotFoundError, AlreadyExistsError)
 
 # reader(path, columns, batch_size) -> iterator of record batches
 BatchReader = Callable[[str, Sequence[str], int], Iterator[pa.RecordBatch]]
@@ -91,12 +127,10 @@ def make_s3_batch_reader(fs) -> BatchReader:
     ) -> Iterator[pa.RecordBatch]:
         if not path.startswith("s3://"):
             raise ValueError(f"unsupported data file scheme: {path!r}")
-        key = path[len("s3://"):]
+        key = path[len("s3://") :]
         with fs.open_input_file(key) as fh:
             pf = pq.ParquetFile(fh)
-            yield from pf.iter_batches(
-                batch_size=batch_size, columns=list(columns)
-            )
+            yield from pf.iter_batches(batch_size=batch_size, columns=list(columns))
 
     return read
 
@@ -133,6 +167,7 @@ class Hedgerow:
         self.source_uuid: str | None = None  # pinned at startup (lesson #3)
         self.dest_uuid: str | None = None
         self._projection: ProjectionPlan | None = None
+        self._append_schema: pa.Schema | None = None
         self._filter: RowFilter | None = None
 
     # -- startup (fail-fast, lesson #6) ------------------------------------
@@ -169,6 +204,14 @@ class Hedgerow:
         self._projection = validate_projection(
             source_table.columns, dest_table.columns, filter_col
         )
+        # The append schema is derived from the DESTINATION's catalog
+        # columns (the projection truth), never from whichever file's
+        # batch happened to come first — files in one window can disagree
+        # on arrow-level nullability (BUG-6).
+        dest_by_name = {c.name: c for c in dest_table.columns}
+        self._append_schema = columns_to_arrow_schema(
+            [dest_by_name[n] for n in self._projection.dest_columns]
+        )
         self._filter = build_filter(cfg.filter, source_table.columns)
 
         if self._batch_reader is None:
@@ -181,10 +224,14 @@ class Hedgerow:
         log.info(
             "started source=%s/%s.%s uuid=%s dest=%s/%s.%s uuid=%s "
             "consumer_id=%s columns=%s filter=%s",
-            cfg.source.catalog, cfg.source.namespace, cfg.source.table,
+            cfg.source.catalog,
+            cfg.source.namespace,
+            cfg.source.table,
             self.source_uuid,
-            cfg.destination.catalog, cfg.destination.namespace,
-            cfg.destination.table, self.dest_uuid,
+            cfg.destination.catalog,
+            cfg.destination.namespace,
+            cfg.destination.table,
+            self.dest_uuid,
             cfg.source.consumer_id,
             ",".join(self._projection.dest_columns),
             f"{cfg.filter.column}=={cfg.filter.equals!r}" if cfg.filter else "none",
@@ -233,15 +280,13 @@ class Hedgerow:
     # -- offsets -----------------------------------------------------------
 
     def _read_offset(self) -> int:
+        # single-offset GET: the server answers for exactly
+        # (consumer_id, table_uuid); None means no offset stored yet
         cfg = self.config.source
-        try:
-            offsets = self._source_catalog.offsets(cfg.consumer_id)
-        except NotFoundError:
+        off = self._source_catalog.offset(cfg.consumer_id, self.source_uuid)
+        if off is None:
             return cfg.start_snapshot
-        for off in offsets:
-            if off.table_uuid == self.source_uuid:
-                return off.committed_snapshot
-        return cfg.start_snapshot
+        return off.committed_snapshot
 
     # -- one cycle ---------------------------------------------------------
 
@@ -311,20 +356,54 @@ class Hedgerow:
         buffer: list[pa.RecordBatch] = []
         buffered = 0
 
+        append_schema = self._append_schema
+
         def flush() -> None:
             nonlocal buffer, buffered, rows_appended, appends
             if buffered == 0:
                 return
-            table = pa.Table.from_batches(buffer, schema=buffer[0].schema)
-            dest_table.append(
-                table,
-                author=f"hedgerow/{cfg.source.consumer_id}",
-                message=(
-                    f"replicated from {cfg.source.catalog}/"
-                    f"{cfg.source.namespace}.{cfg.source.table} "
-                    f"window=({plan.from_snapshot},{plan.to_snapshot}]"
-                ),
+            # Normalize every batch to the destination projection schema
+            # (BUG-6): files in one window can carry differing arrow-level
+            # nullability (or field metadata) for the same column, and
+            # from_batches with an explicit schema raises on ANY mismatch.
+            # safe=True: only metadata/nullability-level diffs cast
+            # silently; a lossy value cast still fails loudly.
+            table = pa.Table.from_batches(
+                [b.cast(append_schema, safe=True) for b in buffer],
+                schema=append_schema,
             )
+            try:
+                dest_table.append(
+                    table,
+                    expected_table_uuid=self.dest_uuid,
+                    author=f"hedgerow/{cfg.source.consumer_id}",
+                    message=(
+                        f"replicated from {cfg.source.catalog}/"
+                        f"{cfg.source.namespace}.{cfg.source.table} "
+                        f"window=({plan.from_snapshot},{plan.to_snapshot}]"
+                    ),
+                )
+            except ClientIncarnationChangedError as e:
+                # BUG-1: the destination was dropped/recreated mid-window.
+                # The guard is atomic at commit time — the server 409s a
+                # mismatched expected_table_uuid with ZERO writes (and
+                # pyhoglake's pre-flight may fast-fail even earlier). HALT
+                # — never split appends across incarnations, never commit
+                # the offset over them.
+                raise IncarnationChangedError(
+                    f"destination table {cfg.destination.catalog}/"
+                    f"{cfg.destination.namespace}.{cfg.destination.table} "
+                    f"changed incarnation mid-window: {e}. HALT: the offset "
+                    "was not committed; rows appended to the dropped "
+                    "incarnation are gone with it and will be replayed."
+                ) from e
+            except NotFoundError as e:
+                raise IncarnationChangedError(
+                    f"destination table {cfg.destination.catalog}/"
+                    f"{cfg.destination.namespace}.{cfg.destination.table} "
+                    f"disappeared mid-window (pinned uuid {self.dest_uuid}): "
+                    f"{e}. HALT."
+                ) from e
             rows_appended += buffered
             appends += 1
             buffer = []
@@ -333,9 +412,11 @@ class Hedgerow:
         # Files sequentially, batches streamed: at most max_rows_per_append
         # rows are ever materialized (lesson #5).
         for f in plan.files:
+            file_rows = 0
             for batch in self._batch_reader(
                 f.path, self._projection.read_columns, batch_size
             ):
+                file_rows += batch.num_rows
                 rows_read += batch.num_rows
                 if self._filter is not None:
                     batch = self._filter.apply(batch)
@@ -346,15 +427,42 @@ class Hedgerow:
                     flush()
                 buffer.append(batch)
                 buffered += batch.num_rows
+            if file_rows != f.record_count:
+                # BUG-2: reconcile rows actually read against the change
+                # plan's server-side record_count. A short (or long) read
+                # means the offset would cover rows never appended. HALT
+                # before any offset movement.
+                raise DataIntegrityError(
+                    f"data file {f.path} delivered {file_rows} row(s) but "
+                    f"the change plan records record_count="
+                    f"{f.record_count}. HALT: committing the offset would "
+                    "cover rows that were never read/appended (short read "
+                    "or object-store misbehavior)."
+                )
         flush()
 
         # Lesson #2: the offset moves ONLY after every row of the window
         # is durably appended, and only to the fully applied
         # plan.to_snapshot. Rows-then-offset; crash in between -> the
         # window replays -> duplicates possible (at-least-once).
-        self._source_catalog.commit_offset(
-            cfg.source.consumer_id, self.source_uuid, plan.to_snapshot
-        )
+        try:
+            self._source_catalog.commit_offset(
+                cfg.source.consumer_id, self.source_uuid, plan.to_snapshot
+            )
+        except OffsetRegressionError as e:
+            # BUG-4: a 409 here means a FOREIGN writer sharing our
+            # consumer_id advanced the offset past this window —
+            # split-brain evidence, never a transient. Adopting the
+            # foreign offset would silently skip rows this destination
+            # never received.
+            raise SplitBrainError(
+                f"offset commit for consumer {cfg.source.consumer_id!r} "
+                f"(table {self.source_uuid}) to snapshot {plan.to_snapshot} "
+                f"was rejected as a regression: {e}. Another writer shares "
+                "this consumer_id. HALT: never adopt a foreign offset — "
+                "fix the consumer_id collision, then decide the correct "
+                "offset deliberately."
+            ) from e
 
         result = CycleResult(
             idle=False,
@@ -399,29 +507,80 @@ class Hedgerow:
     def run_forever(self) -> None:
         """Poll -> write -> commit offset -> repeat. Backlog is drained
         immediately; only a caught-up (or failed) cycle sleeps. Halt
-        conditions propagate — the process must die loudly."""
+        conditions propagate — the process must die loudly.
+
+        Failure taxonomy (BUG-3 + the permanent/transient split):
+
+        - ``HaltError`` propagates immediately.
+        - Permanent client errors (:data:`PERMANENT_CLIENT_ERRORS`) halt
+          immediately as :class:`PersistentFailureError` — a retry
+          replays the window and fails identically, so retrying only
+          manufactures duplicates. They are counted separately from the
+          replay budget and the halt reason names the error.
+        - Anything else is transient: the next cycle re-reads the
+          committed consumer offset from the source catalog (the
+          authoritative restart point — ``run_once`` always starts
+          there) and replays the window. Each replay can duplicate every
+          row appended before the failure, so replays are capped at
+          ``replication.max_window_replays`` consecutive failures; the
+          cap exhausting halts as :class:`PersistentFailureError`. The
+          counter resets on any successful cycle.
+        """
         self.start()
         poll = self.config.replication.poll_interval_s
+        max_replays = self.config.replication.max_window_replays
+        replays = 0  # consecutive failed cycles = window replays burned
         while True:
             try:
                 result = self.run_once()
             except HaltError:
                 raise
-            except Exception as e:  # transient: log, count, retry
-                try:
-                    (self._metrics or NullMetrics()).observe_error()
-                except Exception:
-                    log.exception("metrics observation failed (ignored)")
-                log.error("cycle failed (will retry in %.1fs): %s", poll, e)
+            except PERMANENT_CLIENT_ERRORS as e:
+                self._observe_error()
+                raise PersistentFailureError(
+                    f"permanent client error {type(e).__name__}: {e}. "
+                    "HALT: a retry replays the window and fails "
+                    "identically — retrying cannot succeed and would only "
+                    "duplicate already-appended rows."
+                ) from e
+            except Exception as e:  # transient: bounded replay, then halt
+                self._observe_error()
+                replays += 1
+                if replays > max_replays:
+                    raise PersistentFailureError(
+                        f"window replay budget exhausted: the initial "
+                        f"attempt and {max_replays} replay(s) "
+                        f"(replication.max_window_replays={max_replays}) "
+                        f"all failed; last error: {type(e).__name__}: {e}. "
+                        "HALT: treating as persistent — every further "
+                        "retry replays the whole window and can duplicate "
+                        "all of its rows."
+                    ) from e
+                log.warning(
+                    "window replay %d/%d: duplicates possible — rows "
+                    "appended before the failure will be appended again "
+                    "(at-least-once); the committed offset is re-read "
+                    "from the source catalog before the retry. error: %s",
+                    replays,
+                    max_replays,
+                    e,
+                )
                 self._sleep(poll)
                 continue
+            replays = 0
             if not result.backlog_remains:
                 self._sleep(poll)
+
+    def _observe_error(self) -> None:
+        try:
+            (self._metrics or NullMetrics()).observe_error()
+        except Exception:  # passive reporting (lesson #7)
+            log.exception("metrics observation failed (ignored)")
 
     def close(self) -> None:
         for client in (self._source_client, self._dest_client):
             try:
                 if client is not None and hasattr(client, "close"):
                     client.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110  # best-effort close during shutdown
                 pass

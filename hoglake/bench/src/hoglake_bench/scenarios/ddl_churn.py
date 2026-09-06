@@ -16,9 +16,14 @@ from pyhoglake import Catalog, Namespace
 
 from ..context import Bench
 from ..fabricate import BENCH_SCHEMA, append_payload
-from ..runner import FailureGuard, run_loop
+from ..runner import FailureGuard, InsufficientSamples, run_loop
 from ..stats import Metric
-from .common import ScenarioReport, check
+from .common import (
+    THERMAL_WARM_OPS,
+    ScenarioReport,
+    check,
+    require_samples,
+)
 
 RECORD_COUNT = 100
 
@@ -37,8 +42,14 @@ def _probe_commit_p50(
     def op(_: int) -> None:
         catalog._commit(append_payload(catalog, table, 1, RECORD_COUNT))
 
-    loop = run_loop(op, ops=ops, warmup=warmup, guard=guard)
+    # both probes get the same fixed warm phase so before/after compare
+    # at the same thermal state (a cold "before" probe hides real churn
+    # tax behind cold-cache inflation)
+    loop = run_loop(
+        op, ops=ops, warmup=max(warmup, THERMAL_WARM_OPS), guard=guard
+    )
     check(loop.errors == 0, f"probe {name}: {loop.errors} failed commits")
+    require_samples(loop.recorder.count, f"ddl-churn probe {name}")
     m = report.add(
         Metric.from_recorder(f"probe.{name}", loop.recorder, loop.wall_s)
     )
@@ -48,7 +59,13 @@ def _probe_commit_p50(
 def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
     report = ScenarioReport(
         scenario="ddl-churn",
-        params={"tables": args.tables, "probe_ops": args.ops},
+        params={
+            "tables": args.tables,
+            "probe_ops": args.ops,
+            "warmup": max(args.warmup, THERMAL_WARM_OPS),
+            "duration": args.duration,
+            "url": args.url,
+        },
     )
     guard = FailureGuard()
     catalog = bench.new_catalog("ddl")
@@ -81,7 +98,12 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
     after_p50 = _probe_commit_p50(
         report, catalog, ns, "after", args.ops, args.warmup, guard
     )
-    ratio = after_p50 / before_p50 if before_p50 > 0 else 0.0
+    if before_p50 <= 0:
+        raise InsufficientSamples(
+            "insufficient samples for a trustworthy ratio: before-churn "
+            f"probe p50 is {before_p50} ms — refusing to divide by it"
+        )
+    ratio = after_p50 / before_p50
     report.add(
         Metric(
             name="probe.ratio",

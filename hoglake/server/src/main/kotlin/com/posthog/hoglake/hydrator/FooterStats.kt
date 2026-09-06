@@ -2,13 +2,14 @@ package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.stats.IcebergSingleValue
-import dev.hardwood.metadata.ConvertedType
-import dev.hardwood.metadata.FileMetaData
-import dev.hardwood.metadata.LogicalType
-import dev.hardwood.metadata.PhysicalType
-import dev.hardwood.metadata.SchemaElement
-import dev.hardwood.metadata.Statistics
 import io.github.oshai.kotlinlogging.KotlinLogging
+import org.apache.parquet.column.statistics.Statistics
+import org.apache.parquet.hadoop.metadata.BlockMetaData
+import org.apache.parquet.hadoop.metadata.ParquetMetadata
+import org.apache.parquet.schema.LogicalTypeAnnotation
+import org.apache.parquet.schema.MessageType
+import org.apache.parquet.schema.PrimitiveType
+import org.apache.parquet.schema.Type
 import java.math.BigInteger
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -23,19 +24,23 @@ data class CatalogColumn(
 )
 
 /**
- * Pure footer-to-stats aggregation: takes a parquet [FileMetaData] (footer
- * only — no data pages) and the table's live catalog columns, and produces
- * per-field aggregates in Iceberg single-value bound encoding.
+ * Pure footer-to-stats aggregation: takes a parquet footer
+ * ([ParquetMetadata], parquet-java — the project's one parquet library)
+ * and the table's live catalog columns, and produces per-field
+ * aggregates in Iceberg single-value bound encoding. Footer only — no
+ * data pages.
  *
  * Column mapping prefers the parquet schema's field ids
- * (`PARQUET:field_id`) when the file carries any; otherwise it falls back
- * to name matching (logged as a warning — files written without field ids
- * lose rename-safety).
+ * (`PARQUET:field_id`) when the file carries any; otherwise it falls
+ * back to name matching (logged as a warning — files written without
+ * field ids lose rename-safety, and [missingFieldIds] flags them for
+ * the rename guard).
  *
  * Bounds are only produced when every column chunk contributes reliable
- * statistics (present, not the deprecated pre-TYPE_DEFINED_ORDER min/max,
- * decodable under the catalog type, not NaN). Anything else leaves the
- * bounds NULL — never guessed.
+ * statistics (present with a decodable min/max under the catalog type,
+ * not NaN; parquet-java itself refuses unreliable pre-TYPE_DEFINED_ORDER
+ * deprecated min/max at footer decode). Anything else leaves the bounds
+ * NULL — never guessed.
  */
 object FooterStats {
     private val log = KotlinLogging.logger {}
@@ -54,18 +59,35 @@ object FooterStats {
     private data class Leaf(
         val name: String,
         val fieldId: Int?,
-        val physical: PhysicalType?,
-        val logical: LogicalType?,
-        val converted: ConvertedType?,
-        val scale: Int?,
+        val primitive: PrimitiveType,
     )
 
+    /**
+     * The field-id contract check: true when ANY primitive leaf of the
+     * schema lacks a `PARQUET:field_id`. Such files bind columns by
+     * name, so a later column rename would silently NULL their history
+     * in readers — hog_data_file.missing_field_ids records the hazard
+     * and AlterService refuses renames while a flagged file is live.
+     * The reserved `_hog_row_id` id 2147483646 on compacted files is an
+     * id like any other and never trips this.
+     */
+    fun missingFieldIds(schema: MessageType): Boolean = anyLeafWithoutId(schema.fields)
+
+    private fun anyLeafWithoutId(fields: List<Type>): Boolean =
+        fields.any { field ->
+            if (field.isPrimitive) {
+                field.id == null
+            } else {
+                anyLeafWithoutId(field.asGroupType().fields)
+            }
+        }
+
     fun aggregate(
-        meta: FileMetaData,
+        footer: ParquetMetadata,
         columns: List<CatalogColumn>,
         filePath: String,
     ): List<ColumnAgg> {
-        val leaves = topLevelLeaves(meta.schema())
+        val leaves = topLevelLeaves(footer.fileMetaData.schema)
         val byName = leaves.associateBy { it.name }
         val useFieldIds = leaves.any { it.fieldId != null }
         val byFieldId = leaves.filter { it.fieldId != null }.associateBy { it.fieldId!! }
@@ -90,13 +112,13 @@ object FooterStats {
                 }
                 continue
             }
-            aggregateColumn(meta, col, leaf, filePath)?.let(out::add)
+            aggregateColumn(footer.blocks, col, leaf, filePath)?.let(out::add)
         }
         return out
     }
 
     private fun aggregateColumn(
-        meta: FileMetaData,
+        blocks: List<BlockMetaData>,
         col: CatalogColumn,
         leaf: Leaf,
         filePath: String,
@@ -104,27 +126,21 @@ object FooterStats {
         var valueCount = 0L
         var nullCount = 0L
         var nullCountKnown = true
-        var nanCount = 0L
-        var nanCountKnown = true
         var sizeBytes = 0L
         var boundsOk = true
         var min: Any? = null
         var max: Any? = null
         var chunks = 0
 
-        for (rg in meta.rowGroups()) {
-            for (chunk in rg.columns()) {
-                val md = chunk.metaData() ?: continue
-                val path = md.pathInSchema()
-                if (path == null || path.elements().size != 1 || path.leafName() != leaf.name) continue
+        for (block in blocks) {
+            for (chunk in block.columns) {
+                val path = chunk.path.toArray()
+                if (path.size != 1 || path[0] != leaf.name) continue
                 chunks++
-                valueCount += md.numValues()
-                sizeBytes += md.totalCompressedSize()
-                val st: Statistics? = md.statistics()
-                val chunkNulls = st?.nullCount()
-                if (chunkNulls == null) nullCountKnown = false else nullCount += chunkNulls
-                val chunkNans = st?.nanCount()
-                if (chunkNans == null) nanCountKnown = false else nanCount += chunkNans
+                valueCount += chunk.valueCount
+                sizeBytes += chunk.totalSize
+                val st: Statistics<*>? = chunk.statistics
+                if (st == null || !st.isNumNullsSet) nullCountKnown = false else nullCount += st.numNulls
                 if (boundsOk) {
                     val bounds = chunkBounds(col, leaf, st)
                     if (bounds == null) {
@@ -154,7 +170,8 @@ object FooterStats {
             fieldId = col.fieldId,
             valueCount = valueCount,
             nullCount = nullCount,
-            nanCount = if (nanCountKnown) nanCount else null,
+            // Parquet footers carry no NaN counts; honest null over a guess.
+            nanCount = null,
             sizeBytes = sizeBytes,
             lowerBound = if (boundsOk && min != null) encodeBound(col.type, min!!) else null,
             upperBound = if (boundsOk && max != null) encodeBound(col.type, max!!) else null,
@@ -165,11 +182,14 @@ object FooterStats {
     private fun chunkBounds(
         col: CatalogColumn,
         leaf: Leaf,
-        st: Statistics?,
+        st: Statistics<*>?,
     ): Pair<Any, Any>? {
-        if (st == null || st.isMinMaxDeprecated) return null
-        val rawMin = st.minValue() ?: return null
-        val rawMax = st.maxValue() ?: return null
+        // hasNonNullValue is false when the footer carried no reliable
+        // min/max (parquet-java already dropped deprecated min/max whose
+        // sort order is untrustworthy) or the chunk was all-null.
+        if (st == null || !st.hasNonNullValue()) return null
+        val rawMin = st.minBytes ?: return null
+        val rawMax = st.maxBytes ?: return null
         val lo = decode(col, leaf, rawMin, upper = false) ?: return null
         val hi = decode(col, leaf, rawMax, upper = true) ?: return null
         if (isNan(lo) || isNan(hi)) return null
@@ -188,59 +208,80 @@ object FooterStats {
         leaf: Leaf,
         raw: ByteArray,
         upper: Boolean,
-    ): Any? =
-        when (col.type) {
+    ): Any? {
+        val physical = leaf.primitive.primitiveTypeName
+        return when (col.type) {
             ColType.BOOLEAN ->
-                if (leaf.physical == PhysicalType.BOOLEAN && raw.size == 1) raw[0] != 0.toByte() else null
+                if (physical == PrimitiveType.PrimitiveTypeName.BOOLEAN && raw.size == 1) {
+                    raw[0] != 0.toByte()
+                } else {
+                    null
+                }
             ColType.INT ->
-                if (leaf.physical == PhysicalType.INT32) readIntLE(raw) else null
+                if (physical == PrimitiveType.PrimitiveTypeName.INT32) readIntLE(raw) else null
             ColType.LONG ->
-                when (leaf.physical) {
-                    PhysicalType.INT64 -> readLongLE(raw)
-                    PhysicalType.INT32 -> readIntLE(raw)?.toLong()
+                when (physical) {
+                    PrimitiveType.PrimitiveTypeName.INT64 -> readLongLE(raw)
+                    PrimitiveType.PrimitiveTypeName.INT32 -> readIntLE(raw)?.toLong()
                     else -> null
                 }
             ColType.FLOAT ->
-                if (leaf.physical == PhysicalType.FLOAT) readIntLE(raw)?.let { Float.fromBits(it) } else null
+                if (physical == PrimitiveType.PrimitiveTypeName.FLOAT) {
+                    readIntLE(raw)?.let { Float.fromBits(it) }
+                } else {
+                    null
+                }
             ColType.DOUBLE ->
-                when (leaf.physical) {
-                    PhysicalType.DOUBLE -> readLongLE(raw)?.let { Double.fromBits(it) }
-                    PhysicalType.FLOAT -> readIntLE(raw)?.let { Float.fromBits(it).toDouble() }
+                when (physical) {
+                    PrimitiveType.PrimitiveTypeName.DOUBLE -> readLongLE(raw)?.let { Double.fromBits(it) }
+                    PrimitiveType.PrimitiveTypeName.FLOAT ->
+                        readIntLE(raw)?.let { Float.fromBits(it).toDouble() }
                     else -> null
                 }
             ColType.DATE ->
-                if (leaf.physical == PhysicalType.INT32) readIntLE(raw) else null
+                if (physical == PrimitiveType.PrimitiveTypeName.INT32) readIntLE(raw) else null
             ColType.TIME -> decodeTime(leaf, raw)
             ColType.TIMESTAMP, ColType.TIMESTAMPTZ -> decodeTimestamp(leaf, raw, upper)
             ColType.STRING ->
-                if (leaf.physical == PhysicalType.BYTE_ARRAY) raw else null
+                if (physical == PrimitiveType.PrimitiveTypeName.BINARY) raw else null
             ColType.UUID_T ->
-                if (leaf.physical == PhysicalType.FIXED_LEN_BYTE_ARRAY && raw.size == 16) raw else null
+                if (physical == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY && raw.size == 16) {
+                    raw
+                } else {
+                    null
+                }
             ColType.BINARY ->
-                when (leaf.physical) {
-                    PhysicalType.BYTE_ARRAY, PhysicalType.FIXED_LEN_BYTE_ARRAY -> raw
+                when (physical) {
+                    PrimitiveType.PrimitiveTypeName.BINARY,
+                    PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY,
+                    -> raw
                     else -> null
                 }
             ColType.DECIMAL -> decodeDecimal(col, leaf, raw)
         }
+    }
 
     private fun decodeTime(
         leaf: Leaf,
         raw: ByteArray,
     ): Long? {
         val unit =
-            (leaf.logical as? LogicalType.TimeType)?.unit()
-                ?: when (leaf.converted) {
-                    ConvertedType.TIME_MICROS -> LogicalType.TimeUnit.MICROS
-                    ConvertedType.TIME_MILLIS -> LogicalType.TimeUnit.MILLIS
-                    else -> null
-                } ?: return null
+            (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.TimeLogicalTypeAnnotation)
+                ?.unit ?: return null
         return when (unit) {
-            LogicalType.TimeUnit.MICROS ->
-                if (leaf.physical == PhysicalType.INT64) readLongLE(raw) else null
-            LogicalType.TimeUnit.MILLIS ->
-                if (leaf.physical == PhysicalType.INT32) readIntLE(raw)?.let { it * 1_000L } else null
-            LogicalType.TimeUnit.NANOS -> null // sub-micro truncation of a time bound: skip
+            LogicalTypeAnnotation.TimeUnit.MICROS ->
+                if (leaf.primitive.primitiveTypeName == PrimitiveType.PrimitiveTypeName.INT64) {
+                    readLongLE(raw)
+                } else {
+                    null
+                }
+            LogicalTypeAnnotation.TimeUnit.MILLIS ->
+                if (leaf.primitive.primitiveTypeName == PrimitiveType.PrimitiveTypeName.INT32) {
+                    readIntLE(raw)?.let { it * 1_000L }
+                } else {
+                    null
+                }
+            LogicalTypeAnnotation.TimeUnit.NANOS -> null // sub-micro truncation of a time bound: skip
         }
     }
 
@@ -249,21 +290,17 @@ object FooterStats {
         raw: ByteArray,
         upper: Boolean,
     ): Long? {
-        if (leaf.physical != PhysicalType.INT64) return null
+        if (leaf.primitive.primitiveTypeName != PrimitiveType.PrimitiveTypeName.INT64) return null
         val unit =
-            (leaf.logical as? LogicalType.TimestampType)?.unit()
-                ?: when (leaf.converted) {
-                    ConvertedType.TIMESTAMP_MICROS -> LogicalType.TimeUnit.MICROS
-                    ConvertedType.TIMESTAMP_MILLIS -> LogicalType.TimeUnit.MILLIS
-                    else -> null
-                } ?: return null
+            (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.TimestampLogicalTypeAnnotation)
+                ?.unit ?: return null
         val v = readLongLE(raw) ?: return null
         return when (unit) {
-            LogicalType.TimeUnit.MICROS -> v
-            LogicalType.TimeUnit.MILLIS -> Math.multiplyExact(v, 1_000L)
+            LogicalTypeAnnotation.TimeUnit.MICROS -> v
+            LogicalTypeAnnotation.TimeUnit.MILLIS -> Math.multiplyExact(v, 1_000L)
             // Nanos truncate: floor for the lower bound, ceil for the upper,
             // so the bound stays valid for the true values.
-            LogicalType.TimeUnit.NANOS ->
+            LogicalTypeAnnotation.TimeUnit.NANOS ->
                 if (upper) Math.floorDiv(Math.addExact(v, 999L), 1_000L) else Math.floorDiv(v, 1_000L)
         }
     }
@@ -273,7 +310,9 @@ object FooterStats {
         leaf: Leaf,
         raw: ByteArray,
     ): BigInteger? {
-        val parquetScale = (leaf.logical as? LogicalType.DecimalType)?.scale() ?: leaf.scale ?: return null
+        val parquetScale =
+            (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.DecimalLogicalTypeAnnotation)
+                ?.scale ?: return null
         val catalogScale = col.decimalScale ?: return null
         if (parquetScale != catalogScale) {
             log.warn {
@@ -281,10 +320,12 @@ object FooterStats {
             }
             return null
         }
-        return when (leaf.physical) {
-            PhysicalType.INT32 -> readIntLE(raw)?.let { BigInteger.valueOf(it.toLong()) }
-            PhysicalType.INT64 -> readLongLE(raw)?.let { BigInteger.valueOf(it) }
-            PhysicalType.BYTE_ARRAY, PhysicalType.FIXED_LEN_BYTE_ARRAY ->
+        return when (leaf.primitive.primitiveTypeName) {
+            PrimitiveType.PrimitiveTypeName.INT32 -> readIntLE(raw)?.let { BigInteger.valueOf(it.toLong()) }
+            PrimitiveType.PrimitiveTypeName.INT64 -> readLongLE(raw)?.let { BigInteger.valueOf(it) }
+            PrimitiveType.PrimitiveTypeName.BINARY,
+            PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY,
+            ->
                 if (raw.isEmpty()) null else BigInteger(raw)
             else -> null
         }
@@ -318,38 +359,18 @@ object FooterStats {
         if (raw.size == 8) ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).long else null
 
     /**
-     * Walk the flattened SchemaElement list and return the root's direct
-     * primitive children. Nested structures are descended past (their leaf
-     * chunks have multi-element paths and are ignored by [aggregateColumn]).
+     * The root's direct primitive children. Nested structures are
+     * skipped (their leaf chunks have multi-element paths and are
+     * ignored by [aggregateColumn]).
      */
-    private fun topLevelLeaves(schema: List<SchemaElement>): List<Leaf> {
-        if (schema.isEmpty()) return emptyList()
-        val leaves = ArrayList<Leaf>()
-        // Stack of remaining-children counters; size == current depth.
-        val remaining = ArrayDeque<Int>()
-        remaining.addLast(schema[0].numChildren() ?: 0)
-        var i = 1
-        while (i < schema.size && remaining.isNotEmpty()) {
-            val el = schema[i]
-            val depth = remaining.size
-            remaining.addLast(remaining.removeLast() - 1)
-            val children = el.numChildren() ?: 0
-            if (depth == 1 && children == 0) {
-                leaves.add(
-                    Leaf(
-                        name = el.name(),
-                        fieldId = el.fieldId(),
-                        physical = el.type(),
-                        logical = el.logicalType(),
-                        converted = el.convertedType(),
-                        scale = el.scale(),
-                    ),
+    private fun topLevelLeaves(schema: MessageType): List<Leaf> =
+        schema.fields
+            .filter { it.isPrimitive }
+            .map { field ->
+                Leaf(
+                    name = field.name,
+                    fieldId = field.id?.intValue(),
+                    primitive = field.asPrimitiveType(),
                 )
             }
-            if (children > 0) remaining.addLast(children)
-            while (remaining.isNotEmpty() && remaining.last() == 0) remaining.removeLast()
-            i++
-        }
-        return leaves
-    }
 }

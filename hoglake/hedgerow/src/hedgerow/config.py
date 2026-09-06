@@ -16,8 +16,9 @@ values parsed as YAML scalars::
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 import yaml
 
@@ -40,18 +41,31 @@ def _check_keys(d: Mapping[str, Any], allowed: set[str], where: str) -> None:
         raise ConfigError(f"unknown key(s) under {where}: {', '.join(unknown)}")
 
 
-def _str(d: Mapping[str, Any], key: str, where: str, required: bool = True) -> str | None:
+_SENSITIVE_KEY_TOKENS = ("secret", "key", "password")
+
+
+def _str(
+    d: Mapping[str, Any], key: str, where: str, required: bool = True
+) -> str | None:
     if key not in d or d[key] is None:
         if required:
             raise ConfigError(f"missing required key {where}.{key}")
         return None
     v = d[key]
     if not isinstance(v, str) or not v:
-        raise ConfigError(f"{where}.{key} must be a non-empty string, got {v!r}")
+        # Never interpolate the value of a credential-shaped key into an
+        # error message (it ends up in logs); report only its type.
+        if any(tok in key.lower() for tok in _SENSITIVE_KEY_TOKENS):
+            shown = f"a value of type {type(v).__name__}"
+        else:
+            shown = repr(v)
+        raise ConfigError(f"{where}.{key} must be a non-empty string, got {shown}")
     return v
 
 
-def _int(d: Mapping[str, Any], key: str, where: str, default: int, minimum: int = 0) -> int:
+def _int(
+    d: Mapping[str, Any], key: str, where: str, default: int, minimum: int = 0
+) -> int:
     v = d.get(key, default)
     if isinstance(v, bool) or not isinstance(v, int):
         raise ConfigError(f"{where}.{key} must be an integer, got {v!r}")
@@ -68,7 +82,7 @@ class S3Settings:
     path_style: bool = True
 
     @classmethod
-    def parse(cls, d: Mapping[str, Any] | None, where: str) -> "S3Settings":
+    def parse(cls, d: Mapping[str, Any] | None, where: str) -> S3Settings:
         if d is None:
             return cls()
         if not isinstance(d, Mapping):
@@ -111,12 +125,20 @@ class SourceConfig:
     s3: S3Settings = field(default_factory=S3Settings)
 
     @classmethod
-    def parse(cls, d: Any, where: str = "source") -> "SourceConfig":
+    def parse(cls, d: Any, where: str = "source") -> SourceConfig:
         if not isinstance(d, Mapping):
             raise ConfigError(f"{where} must be a mapping")
         _check_keys(
             d,
-            {"url", "catalog", "namespace", "table", "s3", "consumer_id", "start_snapshot"},
+            {
+                "url",
+                "catalog",
+                "namespace",
+                "table",
+                "s3",
+                "consumer_id",
+                "start_snapshot",
+            },
             where,
         )
         return cls(
@@ -139,7 +161,7 @@ class DestinationConfig:
     s3: S3Settings = field(default_factory=S3Settings)
 
     @classmethod
-    def parse(cls, d: Any, where: str = "destination") -> "DestinationConfig":
+    def parse(cls, d: Any, where: str = "destination") -> DestinationConfig:
         if not isinstance(d, Mapping):
             raise ConfigError(f"{where} must be a mapping")
         _check_keys(d, {"url", "catalog", "namespace", "table", "s3"}, where)
@@ -161,7 +183,7 @@ class FilterConfig:
     equals: Any
 
     @classmethod
-    def parse(cls, d: Any, where: str = "filter") -> "FilterConfig | None":
+    def parse(cls, d: Any, where: str = "filter") -> FilterConfig | None:
         if d is None:
             return None
         if not isinstance(d, Mapping):
@@ -170,6 +192,15 @@ class FilterConfig:
         column = _str(d, "column", where)
         if "equals" not in d:
             raise ConfigError(f"missing required key {where}.equals")
+        if d["equals"] is None:
+            # `equals:` / `equals: null` is a one-character YAML trap:
+            # NULL == x is NULL for every row, so it would silently drop
+            # 100% of rows while the offset advances (BUG-5).
+            raise ConfigError(
+                f"{where}.equals filter value must be non-null; a null "
+                "filter matches nothing (NULLs never match an equality "
+                "filter — see README)"
+            )
         return cls(column=column, equals=d["equals"])
 
 
@@ -178,25 +209,44 @@ class ReplicationConfig:
     poll_interval_s: float = 5.0
     max_snapshot_window: int = 1000
     max_rows_per_append: int = 100_000
+    # Transient-failure retry budget PER WINDOW: each retry replays the
+    # whole window (duplicates possible per replay); after this many
+    # consecutive failed cycles hedgerow halts as persistent (BUG-3).
+    max_window_replays: int = 3
 
     @classmethod
-    def parse(cls, d: Any, where: str = "replication") -> "ReplicationConfig":
+    def parse(cls, d: Any, where: str = "replication") -> ReplicationConfig:
         if d is None:
             return cls()
         if not isinstance(d, Mapping):
             raise ConfigError(f"{where} must be a mapping")
         _check_keys(
-            d, {"poll_interval_s", "max_snapshot_window", "max_rows_per_append"}, where
+            d,
+            {
+                "poll_interval_s",
+                "max_snapshot_window",
+                "max_rows_per_append",
+                "max_window_replays",
+            },
+            where,
         )
         poll = d.get("poll_interval_s", 5.0)
         if isinstance(poll, bool) or not isinstance(poll, (int, float)):
             raise ConfigError(f"{where}.poll_interval_s must be a number, got {poll!r}")
-        if poll < 0:
-            raise ConfigError(f"{where}.poll_interval_s must be >= 0, got {poll}")
+        if poll < 0.1:
+            # 0 would busy-spin the loop (and hot-loop error retries)
+            raise ConfigError(f"{where}.poll_interval_s must be >= 0.1, got {poll}")
         return cls(
             poll_interval_s=float(poll),
-            max_snapshot_window=_int(d, "max_snapshot_window", where, default=1000, minimum=1),
-            max_rows_per_append=_int(d, "max_rows_per_append", where, default=100_000, minimum=1),
+            max_snapshot_window=_int(
+                d, "max_snapshot_window", where, default=1000, minimum=1
+            ),
+            max_rows_per_append=_int(
+                d, "max_rows_per_append", where, default=100_000, minimum=1
+            ),
+            max_window_replays=_int(
+                d, "max_window_replays", where, default=3, minimum=0
+            ),
         )
 
 
@@ -205,7 +255,7 @@ class MetricsConfig:
     port: int = 0  # 0 = disabled
 
     @classmethod
-    def parse(cls, d: Any, where: str = "metrics") -> "MetricsConfig":
+    def parse(cls, d: Any, where: str = "metrics") -> MetricsConfig:
         if d is None:
             return cls()
         if not isinstance(d, Mapping):
@@ -223,7 +273,7 @@ class HedgerowConfig:
     filter: FilterConfig | None = None
 
     @classmethod
-    def parse(cls, d: Any) -> "HedgerowConfig":
+    def parse(cls, d: Any) -> HedgerowConfig:
         if not isinstance(d, Mapping):
             raise ConfigError("config root must be a mapping")
         _check_keys(
@@ -247,7 +297,7 @@ def apply_env_overrides(
     for key, value in environ.items():
         if not key.startswith(ENV_PREFIX):
             continue
-        path = [p.lower() for p in key[len(ENV_PREFIX):].split("__") if p]
+        path = [p.lower() for p in key[len(ENV_PREFIX) :].split("__") if p]
         if not path:
             continue
         node = raw
@@ -261,9 +311,7 @@ def apply_env_overrides(
     return raw
 
 
-def load_config(
-    path: str, environ: Mapping[str, str] | None = None
-) -> HedgerowConfig:
+def load_config(path: str, environ: Mapping[str, str] | None = None) -> HedgerowConfig:
     try:
         with open(path) as f:
             raw = yaml.safe_load(f)

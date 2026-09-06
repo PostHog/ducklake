@@ -3,7 +3,10 @@ package com.posthog.hoglake.api
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.model.CatalogOptions
 import com.posthog.hoglake.model.CleanupResult
+import com.posthog.hoglake.model.CompactionResult
 import com.posthog.hoglake.model.ExpiryResult
+import com.posthog.hoglake.model.VerifyCheck
+import com.posthog.hoglake.model.VerifyReport
 import com.posthog.hoglake.service.PatchField
 import io.ktor.server.plugins.BadRequestException
 
@@ -56,6 +59,53 @@ fun CleanupResult.toDto() =
         removed = removed,
         missing = missing,
         stillReferenced = stillReferenced,
+    )
+
+data class CompactionResultDto(
+    val groupsCompacted: Long,
+    val filesIn: Long,
+    val filesOut: Long,
+    val bytesIn: Long,
+    val bytesOut: Long,
+    val skippedConflicts: Long,
+)
+
+fun CompactionResult.toDto() =
+    CompactionResultDto(
+        groupsCompacted = groupsCompacted,
+        filesIn = filesIn,
+        filesOut = filesOut,
+        bytesIn = bytesIn,
+        bytesOut = bytesOut,
+        skippedConflicts = skippedConflicts,
+    )
+
+data class VerifyCheckDto(
+    val check: String,
+    val status: String,
+    val violations: Long,
+    val samples: List<String>,
+)
+
+data class VerifyReportDto(
+    val catalog: String,
+    val status: String,
+    val checks: List<VerifyCheckDto>,
+)
+
+fun VerifyCheck.toDto() =
+    VerifyCheckDto(
+        check = check,
+        status = status,
+        violations = violations,
+        samples = samples,
+    )
+
+fun VerifyReport.toDto() =
+    VerifyReportDto(
+        catalog = catalog,
+        status = status,
+        checks = checks.map { it.toDto() },
     )
 
 /**

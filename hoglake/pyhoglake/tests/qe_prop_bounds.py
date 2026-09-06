@@ -25,11 +25,11 @@ Pinned policies (verified here, and load-bearing for the JVM port):
 import math
 import struct
 import uuid as _uuid
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal, localcontext
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
 from pyhoglake import decode_bound, encode_bound
@@ -65,13 +65,21 @@ def test_long_roundtrip_and_width(v):
     assert decode_bound("long", enc) == v
 
 
-@given(st.one_of(st.integers(max_value=INT32_MIN - 1), st.integers(min_value=INT32_MAX + 1)))
+@given(
+    st.one_of(
+        st.integers(max_value=INT32_MIN - 1), st.integers(min_value=INT32_MAX + 1)
+    )
+)
 def test_int_out_of_range_raises(v):
     with pytest.raises(struct.error):
         encode_bound("int", v)
 
 
-@given(st.one_of(st.integers(max_value=INT64_MIN - 1), st.integers(min_value=INT64_MAX + 1)))
+@given(
+    st.one_of(
+        st.integers(max_value=INT64_MIN - 1), st.integers(min_value=INT64_MAX + 1)
+    )
+)
 def test_long_out_of_range_raises(v):
     with pytest.raises((struct.error, OverflowError)):
         encode_bound("long", v)
@@ -113,7 +121,9 @@ def test_nan_policy_passthrough():
 def test_negative_zero_sign_preserved():
     assert encode_bound("double", -0.0) == b"\x00" * 7 + b"\x80"
     assert encode_bound("float", -0.0) == b"\x00\x00\x00\x80"
-    assert math.copysign(1.0, decode_bound("double", encode_bound("double", -0.0))) == -1.0
+    assert (
+        math.copysign(1.0, decode_bound("double", encode_bound("double", -0.0))) == -1.0
+    )
 
 
 def test_infinities():
@@ -157,9 +167,13 @@ def test_date_roundtrip_full_domain(v):
     assert decode_bound("date", enc) == v
 
 
-@given(st.integers((date.min - date(1970, 1, 1)).days, (date.max - date(1970, 1, 1)).days))
+@given(
+    st.integers((date.min - date(1970, 1, 1)).days, (date.max - date(1970, 1, 1)).days)
+)
 def test_date_int_passthrough(days):
-    assert decode_bound("date", encode_bound("date", days)) == date(1970, 1, 1) + timedelta(days=days)
+    assert decode_bound("date", encode_bound("date", days)) == date(
+        1970, 1, 1
+    ) + timedelta(days=days)
 
 
 def test_date_decode_beyond_pydate_overflows():
@@ -184,7 +198,12 @@ def test_time_decode_out_of_day_raises():
         decode_bound("time", encode_bound("time", -1))
 
 
-@given(st.datetimes(min_value=datetime(1, 1, 1), max_value=datetime(9999, 12, 31, 23, 59, 59, 999999)))
+@given(
+    st.datetimes(
+        min_value=datetime(1, 1, 1),
+        max_value=datetime(9999, 12, 31, 23, 59, 59, 999999),
+    )
+)
 def test_timestamp_roundtrip_full_domain(v):
     enc = encode_bound("timestamp", v)
     assert len(enc) == 8
@@ -197,7 +216,7 @@ def test_timestamp_roundtrip_full_domain(v):
         max_value=datetime(9998, 12, 31),
         timezones=st.sampled_from(
             [
-                timezone.utc,
+                UTC,
                 timezone(timedelta(hours=-12)),
                 timezone(timedelta(hours=14)),
                 timezone(timedelta(minutes=331)),  # weird +05:31 offset
@@ -209,7 +228,7 @@ def test_timestamptz_roundtrip_normalizes_to_utc(v):
     enc = encode_bound("timestamptz", v)
     assert len(enc) == 8
     dec = decode_bound("timestamptz", enc)
-    assert dec.tzinfo == timezone.utc
+    assert dec.tzinfo == UTC
     assert dec == v  # aware comparison: same instant
 
 
@@ -236,7 +255,12 @@ def test_string_roundtrip(v):
     assert decode_bound("string", enc) == v
 
 
-@given(st.text(alphabet=st.characters(min_codepoint=0x10000, max_codepoint=0x10FFFF), min_size=1))
+@given(
+    st.text(
+        alphabet=st.characters(min_codepoint=0x10000, max_codepoint=0x10FFFF),
+        min_size=1,
+    )
+)
 def test_string_astral_planes_roundtrip(v):
     assert decode_bound("string", encode_bound("string", v)) == v
 
@@ -311,9 +335,8 @@ def _minimal(b: bytes) -> bool:
         return True
     if b[0] == 0x00 and b[1] < 0x80:
         return False  # redundant leading zero
-    if b[0] == 0xFF and b[1] >= 0x80:
-        return False  # redundant sign extension
-    return True
+    # not a redundant sign extension
+    return not (b[0] == 0xFF and b[1] >= 0x80)
 
 
 @given(st.integers(-(10**38) + 1, 10**38 - 1), st.integers(0, 38))
@@ -355,7 +378,15 @@ def test_decimal_precision38_boundary_values_encode():
     assert encode_bound("decimal", -129, {"scale": 0}) == b"\xff\x7f"
 
 
-@given(st.decimals(allow_nan=False, allow_infinity=False, places=2, min_value=Decimal("-1e20"), max_value=Decimal("1e20")))
+@given(
+    st.decimals(
+        allow_nan=False,
+        allow_infinity=False,
+        places=2,
+        min_value=Decimal("-1e20"),
+        max_value=Decimal("1e20"),
+    )
+)
 def test_decimal_from_decimal_value_roundtrip(v):
     enc = encode_bound("decimal", v, {"precision": 25, "scale": 2})
     assert decode_bound("decimal", enc, {"scale": 2}) == v
@@ -369,15 +400,31 @@ def test_decimal_scale_overflow_rejected():
 # -- canonical byte-level second-preimage sanity ---------------------------
 
 
-@given(st.sampled_from(["int", "long", "float", "double", "date", "time", "timestamp", "timestamptz"]))
+@given(
+    st.sampled_from(
+        ["int", "long", "float", "double", "date", "time", "timestamp", "timestamptz"]
+    )
+)
 def test_fixed_width_table(col_type):
     widths = {
-        "int": 4, "long": 8, "float": 4, "double": 8,
-        "date": 4, "time": 8, "timestamp": 8, "timestamptz": 8,
+        "int": 4,
+        "long": 8,
+        "float": 4,
+        "double": 8,
+        "date": 4,
+        "time": 8,
+        "timestamp": 8,
+        "timestamptz": 8,
     }
     sample = {
-        "int": 1, "long": 1, "float": 1.0, "double": 1.0,
-        "date": 1, "time": time(1, 2, 3), "timestamp": 1, "timestamptz": 1,
+        "int": 1,
+        "long": 1,
+        "float": 1.0,
+        "double": 1.0,
+        "date": 1,
+        "time": time(1, 2, 3),
+        "timestamp": 1,
+        "timestamptz": 1,
     }[col_type]
     assert len(encode_bound(col_type, sample)) == widths[col_type]
 

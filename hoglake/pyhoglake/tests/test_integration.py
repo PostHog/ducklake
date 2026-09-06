@@ -7,12 +7,13 @@ disposable: catalog ``pyhog-<runid>`` with data under
 
 import time
 import uuid
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
 
 from pyhoglake import (
     AlreadyExistsError,
@@ -22,8 +23,6 @@ from pyhoglake import (
     S3Config,
     ops,
 )
-
-from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
 
 pytestmark = pytest.mark.integration
 
@@ -52,9 +51,7 @@ def client(live_server_url, s3config):
 
 @pytest.fixture(scope="module")
 def catalog(client):
-    return client.create_catalog(
-        f"pyhog-{RUN_ID}", f"s3://{BUCKET}/{RUN_ID}/"
-    )
+    return client.create_catalog(f"pyhog-{RUN_ID}", f"s3://{BUCKET}/{RUN_ID}/")
 
 
 @pytest.fixture(scope="module")
@@ -123,7 +120,9 @@ def test_append_lifecycle_roundtrip(client, catalog, ns, s3config):
     head_before = catalog.refresh().head_snapshot_id
     data = _events_data(1000)
     res = table.append(
-        data, author="pyhoglake-itest", message="lifecycle append",
+        data,
+        author="pyhoglake-itest",
+        message="lifecycle append",
         row_group_size=250,
     )
     assert res.snapshot_id > head_before
@@ -138,7 +137,7 @@ def test_append_lifecycle_roundtrip(client, catalog, ns, s3config):
 
     # the parquet actually exists in MinIO and round-trips
     fs = s3config.filesystem()
-    key = f.path[len("s3://"):]
+    key = f.path[len("s3://") :]
     got = pq.read_table(key, filesystem=fs)
     assert got.num_rows == 1000
     # compare against what we appended (align: server-side schema ordering)
@@ -217,11 +216,7 @@ def test_alter_add_column_then_append(catalog, ns):
     new_field_id = info.columns[1].field_id
     assert new_field_id > info.columns[0].field_id
 
-    table.append(
-        pa.table(
-            {"id": pa.array([3, 4], pa.int64()), "score": [1.5, None]}
-        )
-    )
+    table.append(pa.table({"id": pa.array([3, 4], pa.int64()), "score": [1.5, None]}))
     files = table.files()
     assert len(files) == 2
     assert table.info().record_count == 4
@@ -245,9 +240,7 @@ def test_time_travel(catalog, ns):
     assert table.info(snapshot=s2).file_count == 2
     assert table.info().record_count == 10
 
-    t1 = next(
-        s.snapshot_time for s in catalog.snapshots() if s.snapshot_id == s1
-    )
+    t1 = next(s.snapshot_time for s in catalog.snapshots() if s.snapshot_id == s1)
     assert table.info(at_timestamp=t1).file_count == 1
     files_t1 = table.files(at_timestamp=t1)
     assert len(files_t1) == 1
@@ -256,15 +249,10 @@ def test_time_travel(catalog, ns):
     assert table.info(at_timestamp=datetime(2100, 1, 1)).file_count == 2
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "SERVER BUG (observed 2026-09-05): getTable?snapshot= scopes "
-        "file_count to the snapshot but returns HEAD-scoped record_count "
-        "and file_size_bytes (e.g. file_count=1 with record_count=10 and "
-        "the head's byte total after a second append)"
-    ),
-)
+# Regression: getTable?snapshot= once returned HEAD-scoped record_count/
+# file_size_bytes alongside snapshot-scoped file_count (fixed by
+# aggregateAt: TableInfo aggregates come from files visible at the
+# requested snapshot).
 def test_time_travel_aggregates_are_snapshot_scoped(catalog, ns):
     table = ns.create_table("travel_agg", _events_schema())
     s1 = table.append(_events_data(5)).snapshot_id
@@ -293,16 +281,16 @@ def test_offsets_commit_and_regression(catalog, ns):
         catalog.commit_offset(consumer, table.table_uuid, s1)
 
     # equal snapshot re-commit is not a regression
-    assert catalog.commit_offset(consumer, table.table_uuid, s2).committed_snapshot == s2
+    assert (
+        catalog.commit_offset(consumer, table.table_uuid, s2).committed_snapshot == s2
+    )
 
 
 def test_snapshots_pagination(catalog):
     all_at_once = list(catalog.snapshots(limit=1000))
     assert len(all_at_once) > 2  # prior tests committed plenty
     paged = list(catalog.snapshots(limit=2))  # forces real has_more pages
-    assert [s.snapshot_id for s in paged] == [
-        s.snapshot_id for s in all_at_once
-    ]
+    assert [s.snapshot_id for s in paged] == [s.snapshot_id for s in all_at_once]
     ids = [s.snapshot_id for s in paged]
     assert ids == sorted(ids)
     assert len(set(ids)) == len(ids)
@@ -328,9 +316,7 @@ def test_views(catalog, ns):
 
 def test_expire_and_cleanup(client):
     # a dedicated catalog so retention fiddling can't disturb other tests
-    cat = client.create_catalog(
-        f"pyhog-{RUN_ID}-exp", f"s3://{BUCKET}/{RUN_ID}-exp/"
-    )
+    cat = client.create_catalog(f"pyhog-{RUN_ID}-exp", f"s3://{BUCKET}/{RUN_ID}-exp/")
     ns = cat.create_namespace("ns1")
     table = ns.create_table("t", _events_schema())
     table.append(_events_data(3))

@@ -14,7 +14,6 @@ import uuid
 from typing import Any
 
 import pyarrow as pa
-
 from pyhoglake import Catalog, Table
 from pyhoglake.bounds import encode_bound
 from pyhoglake.models import ColumnStats

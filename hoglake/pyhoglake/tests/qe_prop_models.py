@@ -44,13 +44,16 @@ from pyhoglake.models import (
 
 # The "qe" hypothesis profile (deadline=None) is loaded in conftest.py.
 # The composite model strategies are generation-heavy; cap explicitly.
-MODEL_SETTINGS = settings(
-    max_examples=50, suppress_health_check=[HealthCheck.too_slow]
-)
+MODEL_SETTINGS = settings(max_examples=50, suppress_health_check=[HealthCheck.too_slow])
 
 # JSON-shaped junk for unknown extra fields
 json_scalars = st.one_of(
-    st.none(), st.booleans(), st.integers(), st.floats(allow_nan=False), st.text()
+    st.none(),
+    st.booleans(),
+    st.integers(),
+    # bodies must be JSON-encodable: stdlib json rejects inf/-inf/nan
+    st.floats(allow_nan=False, allow_infinity=False),
+    st.text(),
 )
 json_values = st.recursive(
     json_scalars,
@@ -90,7 +93,9 @@ DATA_FILE = st.fixed_dictionaries(
     optional={
         "footer_size": I64,
         "spec_id": I64,
-        "partition_values": st.lists(st.one_of(st.none(), st.text(max_size=8)), max_size=3),
+        "partition_values": st.lists(
+            st.one_of(st.none(), st.text(max_size=8)), max_size=3
+        ),
     },
 )
 
@@ -206,9 +211,7 @@ MODEL_CASES = [
     ),
     (
         CommitResult,
-        st.fixed_dictionaries(
-            {"snapshot_id": I64}, optional={"schema_version": I64}
-        ),
+        st.fixed_dictionaries({"snapshot_id": I64}, optional={"schema_version": I64}),
     ),
     (
         TableInfo,
@@ -289,8 +292,15 @@ def test_models_required_values_survive_verbatim(case):
     # every scalar top-level field that is not container/datetime-parsed
     # must be stored verbatim
     parsed_specially = {
-        "snapshot_time", "updated_at", "changes", "columns", "files",
-        "delete_files", "partition_spec", "data_file", "delete_file",
+        "snapshot_time",
+        "updated_at",
+        "changes",
+        "columns",
+        "files",
+        "delete_files",
+        "partition_spec",
+        "data_file",
+        "delete_file",
         "partition_values",
     }
     for k, v in wire.items():
@@ -332,7 +342,9 @@ def test_missing_required_field_never_leaks_keyerror_BUG(case, data):
         "from _pick. Repro: Snapshot.from_wire({..., 'changes': ['x']})."
     ),
 )
-@given(st.one_of(st.text(max_size=4), st.integers(), st.lists(st.integers(), max_size=2)))
+@given(
+    st.one_of(st.text(max_size=4), st.integers(), st.lists(st.integers(), max_size=2))
+)
 def test_wrong_typed_nested_entries_never_leak_attributeerror_BUG(junk):
     wire = {
         "snapshot_id": 1,
@@ -365,14 +377,17 @@ def test_changes_and_files_default_to_empty_tuples():
         {"snapshot_id": 1, "snapshot_time": "2026-09-04T12:00:00Z", "schema_version": 1}
     )
     assert s.changes == ()
-    p = ChangesPlan.from_wire(
-        {"table_uuid": "u", "from_snapshot": 1, "to_snapshot": 2}
-    )
+    p = ChangesPlan.from_wire({"table_uuid": "u", "from_snapshot": 1, "to_snapshot": 2})
     assert p.files == () and p.delete_files == ()
     # explicit null arrays behave like absent ones
     p2 = ChangesPlan.from_wire(
-        {"table_uuid": "u", "from_snapshot": 1, "to_snapshot": 2,
-         "files": None, "delete_files": None}
+        {
+            "table_uuid": "u",
+            "from_snapshot": 1,
+            "to_snapshot": 2,
+            "files": None,
+            "delete_files": None,
+        }
     )
     assert p2 == p
 
@@ -380,9 +395,7 @@ def test_changes_and_files_default_to_empty_tuples():
 # -- ApiError mapping under fire -------------------------------------------
 
 error_bodies = st.one_of(
-    st.fixed_dictionaries(
-        {}, optional={"error": json_scalars, "detail": json_values}
-    ),
+    st.fixed_dictionaries({}, optional={"error": json_scalars, "detail": json_values}),
     json_values,  # non-dict JSON bodies
 )
 

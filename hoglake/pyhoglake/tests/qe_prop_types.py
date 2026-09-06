@@ -16,7 +16,7 @@ Two totality claims under test:
 
 import pyarrow as pa
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
 from pyhoglake import UnsupportedTypeError, arrow_type_to_coltype, coltype_to_arrow
@@ -32,8 +32,18 @@ from pyhoglake.types import (
 # -- generators -------------------------------------------------------------
 
 SIMPLE_COLTYPES = [
-    "boolean", "int", "long", "float", "double", "string", "binary",
-    "date", "time", "timestamp", "timestamptz", "uuid",
+    "boolean",
+    "int",
+    "long",
+    "float",
+    "double",
+    "string",
+    "binary",
+    "date",
+    "time",
+    "timestamp",
+    "timestamptz",
+    "uuid",
 ]
 
 coltype_with_params = st.one_of(
@@ -41,9 +51,7 @@ coltype_with_params = st.one_of(
     st.tuples(
         st.just("decimal"),
         st.integers(1, 38).flatmap(
-            lambda p: st.integers(0, p).map(
-                lambda s: {"precision": p, "scale": s}
-            )
+            lambda p: st.integers(0, p).map(lambda s: {"precision": p, "scale": s})
         ),
     ),
 )
@@ -51,9 +59,18 @@ coltype_with_params = st.one_of(
 canonical_arrow = st.one_of(
     st.sampled_from(
         [
-            pa.bool_(), pa.int32(), pa.int64(), pa.float32(), pa.float64(),
-            pa.string(), pa.binary(), pa.date32(), pa.time64("us"),
-            pa.timestamp("us"), pa.timestamp("us", tz="UTC"), pa.binary(16),
+            pa.bool_(),
+            pa.int32(),
+            pa.int64(),
+            pa.float32(),
+            pa.float64(),
+            pa.string(),
+            pa.binary(),
+            pa.date32(),
+            pa.time64("us"),
+            pa.timestamp("us"),
+            pa.timestamp("us", tz="UTC"),
+            pa.binary(16),
         ]
     ),
     st.integers(1, 38).flatmap(
@@ -63,23 +80,35 @@ canonical_arrow = st.one_of(
 
 noncanonical_arrow = st.one_of(
     st.sampled_from([pa.large_string(), pa.large_binary()]),
-    st.sampled_from(
-        ["America/New_York", "Asia/Tokyo", "+05:30", "Europe/Berlin"]
-    ).map(lambda tz: pa.timestamp("us", tz=tz)),
+    st.sampled_from(["America/New_York", "Asia/Tokyo", "+05:30", "Europe/Berlin"]).map(
+        lambda tz: pa.timestamp("us", tz=tz)
+    ),
 )
 
 _unsupported_scalars = [
     pa.null(),
-    pa.int8(), pa.int16(),
-    pa.uint8(), pa.uint16(), pa.uint32(), pa.uint64(),
+    pa.int8(),
+    pa.int16(),
+    pa.uint8(),
+    pa.uint16(),
+    pa.uint32(),
+    pa.uint64(),
     pa.float16(),
     pa.date64(),
-    pa.time32("s"), pa.time32("ms"), pa.time64("ns"),
-    pa.timestamp("s"), pa.timestamp("ms"), pa.timestamp("ns"),
-    pa.timestamp("ns", tz="UTC"), pa.timestamp("s", tz="America/New_York"),
-    pa.duration("s"), pa.duration("us"), pa.duration("ns"),
+    pa.time32("s"),
+    pa.time32("ms"),
+    pa.time64("ns"),
+    pa.timestamp("s"),
+    pa.timestamp("ms"),
+    pa.timestamp("ns"),
+    pa.timestamp("ns", tz="UTC"),
+    pa.timestamp("s", tz="America/New_York"),
+    pa.duration("s"),
+    pa.duration("us"),
+    pa.duration("ns"),
     pa.month_day_nano_interval(),
-    pa.decimal256(40, 2), pa.decimal256(10, 2),
+    pa.decimal256(40, 2),
+    pa.decimal256(10, 2),
 ]
 
 unsupported_scalar = st.one_of(

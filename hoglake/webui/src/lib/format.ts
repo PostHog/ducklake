@@ -1,9 +1,26 @@
 import type { Column, PartitionField } from "../api/types";
 
-export function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
+const DECIMAL_INT_RE = /^-?\d+$/;
+
+/**
+ * Guard for the int64-string humanizers: missing values and anything that is
+ * not an exact decimal integer render as an em-dash, never "NaN"/"undefined".
+ */
+function asDecimalInt(n: string | number | null | undefined): string | null {
+  if (n === null || n === undefined) return null;
+  const s = typeof n === "number" ? String(n) : n;
+  return DECIMAL_INT_RE.test(s) ? s : null;
+}
+
+export function formatBytes(n: string | number | null | undefined): string {
+  const s = asDecimalInt(n);
+  if (s === null) return "—";
+  // Number() here only picks the humanized magnitude; the exact value is the
+  // decimal string itself (shown wherever exactness matters, e.g. `title`).
+  const abs = Number(s);
+  if (abs < 1024) return `${s} B`;
   const units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
-  let v = n;
+  let v = abs;
   let i = -1;
   while (v >= 1024 && i < units.length - 1) {
     v /= 1024;
@@ -12,8 +29,15 @@ export function formatBytes(n: number): string {
   return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
 }
 
-export function formatCount(n: number): string {
-  return n.toLocaleString("en-US");
+export function formatCount(n: string | number | null | undefined): string {
+  const s = asDecimalInt(n);
+  if (s === null) return "—";
+  // Group digits on the exact decimal string: values above 2^53 must not
+  // round-trip through Number/toLocaleString.
+  const neg = s.startsWith("-");
+  const digits = neg ? s.slice(1) : s;
+  const grouped = digits.replace(/\B(?=(\d{3})+$)/g, ",");
+  return neg ? `-${grouped}` : grouped;
 }
 
 export function formatTime(iso: string): string {

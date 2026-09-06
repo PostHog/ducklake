@@ -62,6 +62,57 @@ class SnapshotsAndOffsetsIntegrationTest {
     }
 
     @Test
+    fun `listSnapshots pages descending with before`() {
+        svc.createCatalog("before-cat", "s3://bucket/b") // S0
+        for (i in 1..5) svc.createNamespace("before-cat", "ns$i") // S1..S5
+        val head = svc.getCatalog("before-cat").headSnapshotId
+        assertThat(head).isEqualTo(5)
+
+        // Newest-first walk starting at head + 1.
+        val (p1, more1) = svc.listSnapshots("before-cat", after = 0, limit = 2, before = head + 1)
+        assertThat(p1.map { it.snapshotId }).containsExactly(5L, 4L)
+        assertThat(more1).isTrue()
+        // Changes ride along in DESC pages too.
+        assertThat(p1[0].changes.single().kind).isEqualTo(ChangeKind.NAMESPACE_CREATED)
+
+        val (p2, more2) = svc.listSnapshots("before-cat", after = 0, limit = 2, before = 4)
+        assertThat(p2.map { it.snapshotId }).containsExactly(3L, 2L)
+        assertThat(more2).isTrue()
+
+        // Exact-boundary page: the remaining 1, 0 fill the page with
+        // nothing below -> no phantom hasMore.
+        val (p3, more3) = svc.listSnapshots("before-cat", after = 0, limit = 2, before = 2)
+        assertThat(p3.map { it.snapshotId }).containsExactly(1L, 0L)
+        assertThat(more3).isFalse()
+
+        // before=1 yields exactly snapshot 0.
+        val (p4, more4) = svc.listSnapshots("before-cat", after = 0, limit = 2, before = 1)
+        assertThat(p4.map { it.snapshotId }).containsExactly(0L)
+        assertThat(more4).isFalse()
+
+        // before=0: nothing below the first snapshot.
+        val (p5, more5) = svc.listSnapshots("before-cat", after = 0, limit = 2, before = 0)
+        assertThat(p5).isEmpty()
+        assertThat(more5).isFalse()
+
+        // hasMore edge: limit exactly covers everything below before.
+        val (all, moreAll) = svc.listSnapshots("before-cat", after = 0, limit = 6, before = head + 1)
+        assertThat(all.map { it.snapshotId }).containsExactly(5L, 4L, 3L, 2L, 1L, 0L)
+        assertThat(moreAll).isFalse()
+    }
+
+    @Test
+    fun `before and a non-zero after are mutually exclusive`() {
+        svc.createCatalog("cursor-cat", "s3://bucket/c")
+        assertThatThrownBy { svc.listSnapshots("cursor-cat", after = 3, limit = 10, before = 9) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("mutually exclusive")
+        // after = 0 (the default) alongside before is fine.
+        val (page, _) = svc.listSnapshots("cursor-cat", after = 0, limit = 10, before = 1)
+        assertThat(page.map { it.snapshotId }).containsExactly(0L)
+    }
+
+    @Test
     fun `listSnapshots validates limit and catalog`() {
         svc.createCatalog("page-val-cat", "s3://bucket/pv")
         assertThatThrownBy { svc.listSnapshots("page-val-cat", after = 0, limit = 0) }
@@ -145,6 +196,33 @@ class SnapshotsAndOffsetsIntegrationTest {
         val offsets = svc.listOffsets("off-drop-cat", "c")
         assertThat(offsets.single().tableUuid).isEqualTo(t.tableUuid)
         assertThat(offsets.single().tableUuid).isNotEqualTo(recreated.tableUuid)
+    }
+
+    @Test
+    fun `getOffset returns the single stored row or 404s`() {
+        svc.createCatalog("off-get-cat", "s3://bucket/og")
+        svc.createNamespace("off-get-cat", "ns")
+        val t1 = svc.createTable("off-get-cat", "ns", "t1", listOf(idCol))
+        val t2 = svc.createTable("off-get-cat", "ns", "t2", listOf(idCol))
+        svc.commitOffset("off-get-cat", "c", t1.tableUuid, 2)
+
+        val got = svc.getOffset("off-get-cat", "c", t1.tableUuid)
+        assertThat(got.consumerId).isEqualTo("c")
+        assertThat(got.tableUuid).isEqualTo(t1.tableUuid)
+        assertThat(got.committedSnapshot).isEqualTo(2)
+
+        // Known table, no offset stored for it -> NotFound.
+        assertThatThrownBy { svc.getOffset("off-get-cat", "c", t2.tableUuid) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+        // Garbage uuid (never a table here) -> clean NotFound, same shape.
+        assertThatThrownBy { svc.getOffset("off-get-cat", "c", UUID.randomUUID()) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+        // Unknown consumer -> NotFound.
+        assertThatThrownBy { svc.getOffset("off-get-cat", "nobody", t1.tableUuid) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+        // Unknown catalog -> NotFound.
+        assertThatThrownBy { svc.getOffset("nope", "c", t1.tableUuid) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
     }
 
     @Test

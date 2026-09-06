@@ -47,9 +47,11 @@ data class CatalogDto(
     val dataPath: String,
     val headSnapshotId: Long,
     val schemaVersion: Long,
+    /** Expiry-floor snapshot's time; NON_NULL omits it until expiry first advances the floor. */
+    val earliestSnapshotTime: Instant? = null,
 )
 
-fun CatalogInfo.toDto() = CatalogDto(name, dataPath, headSnapshotId, schemaVersion)
+fun CatalogInfo.toDto() = CatalogDto(name, dataPath, headSnapshotId, schemaVersion, earliestSnapshotTime)
 
 data class CreateCatalogRequestDto(val name: String, val dataPath: String)
 
@@ -121,6 +123,8 @@ data class TableDto(
      * NON_NULL omits it for an unpartitioned table.
      */
     val partitionSpec: AlterPartitionSpecDto? = null,
+    /** Sort order at the requested snapshot; NON_NULL omits when unsorted. */
+    val sortSpec: AlterSortSpecDto? = null,
 )
 
 fun TableInfo.toDto() =
@@ -133,6 +137,7 @@ fun TableInfo.toDto() =
         fileCount = fileCount,
         fileSizeBytes = fileSizeBytes,
         partitionSpec = partitionSpec?.toAlterDto(),
+        sortSpec = sortSpec?.toAlterDto(),
     )
 
 // ---- commits -------------------------------------------------------------
@@ -184,12 +189,13 @@ data class TableAppendDto(
     val namespace: String,
     val table: String,
     val files: List<FileRegistrationDto>,
+    val expectedTableUuid: UUID? = null,
 ) {
     fun toModel(): TableAppend {
         if (files.isEmpty()) {
             throw HoglakeException.Validation("append to $namespace.$table has no files")
         }
-        return TableAppend(namespace, table, files.map { it.toModel() })
+        return TableAppend(namespace, table, files.map { it.toModel() }, expectedTableUuid)
     }
 }
 
@@ -212,12 +218,13 @@ data class TableDeletesDto(
     val namespace: String,
     val table: String,
     val files: List<DeleteFileRegistrationDto>,
+    val expectedTableUuid: UUID? = null,
 ) {
     fun toModel(): TableDeletes {
         if (files.isEmpty()) {
             throw HoglakeException.Validation("deletes for $namespace.$table have no files")
         }
-        return TableDeletes(namespace, table, files.map { it.toModel() })
+        return TableDeletes(namespace, table, files.map { it.toModel() }, expectedTableUuid)
     }
 }
 
@@ -260,6 +267,8 @@ data class DataFileDto(
     // (unpartitioned file, or a read path that does not load them).
     val specId: Long? = null,
     val partitionValues: List<String?>? = null,
+    /** True for compaction outputs: row ids ride the physical _hog_row_id column. */
+    val explicitRowIds: Boolean = false,
 )
 
 fun DataFile.toDto() =
@@ -275,6 +284,7 @@ fun DataFile.toDto() =
         beginSnapshot = beginSnapshot,
         specId = specId,
         partitionValues = partitionValues,
+        explicitRowIds = explicitRowIds,
     )
 
 // ---- scan planning -------------------------------------------------------
@@ -357,7 +367,7 @@ data class CreateViewRequestDto(
 
 // ---- snapshots -----------------------------------------------------------
 
-data class SnapshotChangeDto(val kind: String, val objectId: Long?)
+data class SnapshotChangeDto(val kind: String, val objectId: Long)
 
 data class SnapshotDto(
     val snapshotId: Long,

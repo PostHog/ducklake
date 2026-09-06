@@ -1,6 +1,9 @@
 package com.posthog.hoglake.persistence
 
+import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.observability.Metrics
 import org.jdbi.v3.core.Handle
+import org.jdbi.v3.core.statement.UnableToExecuteStatementException
 
 /**
  * Advisory-lock discipline for the catalog. Every DDL / commit tail in
@@ -30,16 +33,50 @@ object Locks {
      * `(class << 32) | (catalog_id & 0xFFFFFFFF)` bigint, or commit
      * serialization silently breaks (two writers would take DIFFERENT
      * locks for the same catalog and interleave the commit tail).
+     *
+     * Observability + admission control (B2):
+     *  - the wait is always recorded into the
+     *    `hoglake_commit_lock_wait_seconds` histogram (commit path and
+     *    every DDL/maintenance tail alike);
+     *  - [lockTimeoutMs] > 0 sets a transaction-local `lock_timeout`
+     *    (via set_config(..., is_local => true), so it dies with the
+     *    transaction) BEFORE queuing; a timeout expiry surfaces as
+     *    [HoglakeException.CommitQueueTimeout] — typed, retryable
+     *    backpressure, mapped to HTTP 503 — never a generic failure.
+     *    0 (the default) leaves the wait unbounded, exactly the old
+     *    behavior. The timeout stays in force for the rest of the
+     *    transaction, so a pathological row-lock convoy later in the
+     *    tail is bounded by the same admission contract.
      */
     fun acquireCatalogCommitLock(
         handle: Handle,
         catalogId: Long,
+        lockTimeoutMs: Long = 0,
     ) {
-        handle.createQuery(
-            "SELECT pg_advisory_xact_lock(($CATALOG_COMMIT_LOCK_CLASS::bigint << 32) | (?::bigint & 4294967295))",
-        )
-            .bind(0, catalogId)
-            .mapToMap()
-            .one()
+        if (lockTimeoutMs > 0) {
+            handle.createQuery("SELECT set_config('lock_timeout', ?, true)")
+                .bind(0, lockTimeoutMs.toString())
+                .mapToMap()
+                .one()
+        }
+        val start = System.nanoTime()
+        try {
+            handle.createQuery(
+                "SELECT pg_advisory_xact_lock(($CATALOG_COMMIT_LOCK_CLASS::bigint << 32) | (?::bigint & 4294967295))",
+            )
+                .bind(0, catalogId)
+                .mapToMap()
+                .one()
+        } catch (e: UnableToExecuteStatementException) {
+            if (Pg.isLockTimeout(e)) {
+                throw HoglakeException.CommitQueueTimeout(
+                    "commit admission timed out after ${lockTimeoutMs}ms waiting for the " +
+                        "catalog commit lock (catalog_id=$catalogId); the catalog is busy — retry",
+                )
+            }
+            throw e
+        } finally {
+            Metrics.commitLockWait(System.nanoTime() - start)
+        }
     }
 }

@@ -2,12 +2,21 @@
 
 from . import ops
 from .bounds import decode_bound, encode_bound
-from .client import Catalog, HoglakeClient, Namespace, S3Config, Table, View
+from .client import (
+    UNGUARDED,
+    Catalog,
+    HoglakeClient,
+    Namespace,
+    S3Config,
+    Table,
+    View,
+)
 from .errors import (
     AlreadyExistsError,
     CommitConflictError,
     ExpiredError,
     HoglakeError,
+    IncarnationChangedError,
     NotFoundError,
     OffsetRegressionError,
     UnsupportedTypeError,
@@ -40,6 +49,7 @@ from .types import arrow_type_to_coltype, coltype_to_arrow
 __version__ = "0.1.0"
 
 __all__ = [
+    "UNGUARDED",
     "AlreadyExistsError",
     "AlterOp",
     "Catalog",
@@ -58,6 +68,7 @@ __all__ = [
     "ExpiryResult",
     "HoglakeClient",
     "HoglakeError",
+    "IncarnationChangedError",
     "Namespace",
     "NotFoundError",
     "OffsetRegressionError",
@@ -74,10 +85,10 @@ __all__ = [
     "ValidationError",
     "View",
     "ViewInfo",
+    "__version__",
     "arrow_type_to_coltype",
     "coltype_to_arrow",
     "decode_bound",
     "encode_bound",
     "ops",
-    "__version__",
 ]

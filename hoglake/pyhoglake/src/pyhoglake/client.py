@@ -10,12 +10,13 @@ from __future__ import annotations
 import io
 import struct
 import uuid as _uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Iterator
+from datetime import UTC, datetime
+from typing import Any, Self
+from urllib.parse import quote
 
 import httpx
-from urllib.parse import quote
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -24,6 +25,7 @@ from .errors import (
     CommitConflictError,
     ExpiredError,
     HoglakeError,
+    IncarnationChangedError,
     NotFoundError,
     OffsetRegressionError,
     ValidationError,
@@ -49,6 +51,17 @@ from .types import columns_to_arrow_schema, schema_to_column_defs
 
 DEFAULT_TIMEOUT = 30.0
 
+# Sentinel for Table.append(expected_table_uuid=...): opt out of the
+# incarnation guard entirely — no pre-flight uuid check, and the commit
+# carries no expected_table_uuid field (name-only resolution).
+UNGUARDED = object()
+
+# The server's commit 409 for a mismatched expected_table_uuid carries
+# this phrase in its ApiError message/detail; it is how the client tells
+# a recreation refusal (IncarnationChangedError, never retryable) from an
+# ordinary commit conflict (CommitConflictError, retryable).
+_RECREATED_MARKER = "the table was recreated"
+
 
 def _seg(name: object) -> str:
     """Percent-encode one URL path segment. Identifiers are user data:
@@ -58,8 +71,6 @@ def _seg(name: object) -> str:
 
 
 @dataclass
-
-
 class S3Config:
     """Object-store connection settings for the parquet write path.
 
@@ -90,22 +101,21 @@ class S3Config:
         return fs.S3FileSystem(**kwargs)
 
 
-def _ts_param(value: "datetime | str | None") -> str | None:
+def _ts_param(value: datetime | str | None) -> str | None:
     if value is None:
         return None
     if isinstance(value, datetime):
         if value.tzinfo is None:
             # the server requires an ISO-8601 instant (with offset);
             # naive datetimes are taken as UTC
-            from datetime import timezone
 
-            value = value.replace(tzinfo=timezone.utc)
+            value = value.replace(tzinfo=UTC)
         return value.isoformat()
     return value
 
 
 def _travel_params(
-    snapshot: int | None, at_timestamp: "datetime | str | None"
+    snapshot: int | None, at_timestamp: datetime | str | None
 ) -> dict[str, Any]:
     if snapshot is not None and at_timestamp is not None:
         raise ValueError("snapshot and at_timestamp are mutually exclusive")
@@ -137,7 +147,7 @@ class HoglakeClient:
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self) -> "HoglakeClient":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -172,7 +182,7 @@ class HoglakeClient:
             if isinstance(body, dict):
                 message = body.get("error", message)
                 detail = body.get("detail")
-        except Exception:
+        except Exception:  # noqa: BLE001  # any body-parse failure falls back to raw text
             detail = resp.text[:500] or None
         cls: type[HoglakeError]
         if resp.status_code == 404:
@@ -199,13 +209,13 @@ class HoglakeClient:
 
     # -- catalogs ----------------------------------------------------------
 
-    def create_catalog(self, name: str, data_path: str) -> "Catalog":
+    def create_catalog(self, name: str, data_path: str) -> Catalog:
         body = self._request(
             "POST", "/catalogs", json={"name": name, "data_path": data_path}
         )
         return Catalog(self, CatalogInfo.from_wire(body))
 
-    def catalog(self, name: str) -> "Catalog":
+    def catalog(self, name: str) -> Catalog:
         body = self._request("GET", f"/catalogs/{_seg(name)}")
         return Catalog(self, CatalogInfo.from_wire(body))
 
@@ -246,13 +256,11 @@ class Catalog:
 
     # -- namespaces --------------------------------------------------------
 
-    def create_namespace(self, name: str) -> "Namespace":
-        self._client._request(
-            "POST", self._path("/namespaces"), json={"name": name}
-        )
+    def create_namespace(self, name: str) -> Namespace:
+        self._client._request("POST", self._path("/namespaces"), json={"name": name})
         return Namespace(self, name)
 
-    def namespace(self, name: str) -> "Namespace":
+    def namespace(self, name: str) -> Namespace:
         # No per-namespace GET in the API; existence-check via the listing.
         if name not in self.list_namespaces():
             raise NotFoundError(
@@ -267,14 +275,38 @@ class Catalog:
 
     # -- snapshots ---------------------------------------------------------
 
-    def snapshots(self, after: int = 0, limit: int = 1000) -> Iterator[Snapshot]:
-        """Iterate snapshots with id > ``after``; auto-paginates on has_more."""
-        cursor = after
+    def snapshots(
+        self, after: int = 0, before: int | None = None, limit: int = 1000
+    ) -> Iterator[Snapshot]:
+        """Iterate snapshots; auto-paginates on has_more.
+
+        Ascending (default): id > ``after``, oldest first. Descending:
+        pass ``before`` to walk id < ``before``, newest first (a UI pages
+        down from head + 1 with the last id of each page). ``before`` is
+        mutually exclusive with a non-zero ``after`` — enforced here with
+        a ValueError before any request (the server 422s the same
+        combination).
+        """
+        if before is not None and after != 0:
+            # eager (not deferred to first iteration): the bad call fails
+            # where it is written, before any request
+            raise ValueError(
+                "snapshots(): 'before' and a non-zero 'after' are mutually "
+                "exclusive cursors — pass exactly one (ascending walks use "
+                "'after', descending walks use 'before')"
+            )
+        return self._snapshot_pages(
+            "after" if before is None else "before",
+            after if before is None else before,
+            limit,
+        )
+
+    def _snapshot_pages(self, key: str, cursor: int, limit: int) -> Iterator[Snapshot]:
         while True:
             body = self._client._request(
                 "GET",
                 self._path("/snapshots"),
-                params={"after": cursor, "limit": limit},
+                params={key: cursor, "limit": limit},
             )
             snaps = body.get("snapshots") or []
             for s in snaps:
@@ -331,15 +363,45 @@ class Catalog:
         )
         return [ConsumerOffset.from_wire(o) for o in body]
 
+    def offset(self, consumer_id: str, table_uuid: str) -> ConsumerOffset | None:
+        """One (consumer, table_uuid) offset, or None when the server has
+        none stored (404).
+
+        Deliberate divergence from the client's raise-on-404 idiom: an
+        absent offset is the routine state of every consumer that has not
+        committed yet, not an error condition.
+        """
+        try:
+            body = self._client._request(
+                "GET",
+                self._path(f"/consumers/{_seg(consumer_id)}/offsets/{table_uuid}"),
+            )
+        except NotFoundError:
+            return None
+        return ConsumerOffset.from_wire(body)
+
     # -- commit (internal; Table.append is the public writer path) ---------
 
     def _commit(self, payload: dict[str, Any]) -> CommitResult:
-        body = self._client._request(
-            "POST",
-            self._path("/commit"),
-            json=payload,
-            conflict=CommitConflictError,
-        )
+        try:
+            body = self._client._request(
+                "POST",
+                self._path("/commit"),
+                json=payload,
+                conflict=CommitConflictError,
+            )
+        except CommitConflictError as e:
+            # Discriminate the expected_table_uuid guard's 409 from an
+            # ordinary (retryable) commit conflict: the server's
+            # recreation refusal says "the table was recreated" in its
+            # message/detail. That refusal is atomic (zero writes) and
+            # never retryable — surface it as IncarnationChangedError.
+            text = f"{e.message} {e.detail or ''}".lower()
+            if _RECREATED_MARKER in text:
+                raise IncarnationChangedError(
+                    e.message, status_code=e.status_code, detail=e.detail
+                ) from e
+            raise
         return CommitResult.from_wire(body)
 
 
@@ -356,7 +418,7 @@ class Namespace:
 
     # -- tables ------------------------------------------------------------
 
-    def create_table(self, name: str, schema: pa.Schema) -> "Table":
+    def create_table(self, name: str, schema: pa.Schema) -> Table:
         body = self._catalog._client._request(
             "POST",
             self._path("/tables"),
@@ -364,7 +426,7 @@ class Namespace:
         )
         return Table(self, TableInfo.from_wire(body))
 
-    def table(self, name: str) -> "Table":
+    def table(self, name: str) -> Table:
         body = self._catalog._client._request(
             "GET", self._path(f"/tables/{_seg(name)}")
         )
@@ -376,7 +438,7 @@ class Namespace:
 
     # -- views -------------------------------------------------------------
 
-    def create_view(self, name: str, sql: str, dialect: str = "trino") -> "View":
+    def create_view(self, name: str, sql: str, dialect: str = "trino") -> View:
         body = self._catalog._client._request(
             "POST",
             self._path("/views"),
@@ -384,7 +446,7 @@ class Namespace:
         )
         return View(self, ViewInfo.from_wire(body))
 
-    def view(self, name: str) -> "View":
+    def view(self, name: str) -> View:
         body = self._catalog._client._request("GET", self._path(f"/views/{_seg(name)}"))
         return View(self, ViewInfo.from_wire(body))
 
@@ -462,7 +524,7 @@ class Table:
     def info(
         self,
         snapshot: int | None = None,
-        at_timestamp: "datetime | str | None" = None,
+        at_timestamp: datetime | str | None = None,
     ) -> TableInfo:
         body = self._namespace._catalog._client._request(
             "GET", self._path(), params=_travel_params(snapshot, at_timestamp)
@@ -475,7 +537,7 @@ class Table:
     def files(
         self,
         snapshot: int | None = None,
-        at_timestamp: "datetime | str | None" = None,
+        at_timestamp: datetime | str | None = None,
     ) -> list[DataFile]:
         body = self._namespace._catalog._client._request(
             "GET",
@@ -487,7 +549,7 @@ class Table:
     def scan_plan(
         self,
         snapshot: int | None = None,
-        at_timestamp: "datetime | str | None" = None,
+        at_timestamp: datetime | str | None = None,
     ) -> list[ScanFile]:
         body = self._namespace._catalog._client._request(
             "GET",
@@ -513,7 +575,7 @@ class Table:
 
     # -- DDL ---------------------------------------------------------------
 
-    def alter(self, ops: "list[AlterOp]") -> TableInfo:
+    def alter(self, ops: list[AlterOp]) -> TableInfo:
         body = self._namespace._catalog._client._request(
             "POST",
             self._path("/alter"),
@@ -524,9 +586,7 @@ class Table:
         return self._info
 
     def drop(self) -> CommitResult:
-        body = self._namespace._catalog._client._request(
-            "DELETE", self._path()
-        )
+        body = self._namespace._catalog._client._request("DELETE", self._path())
         return CommitResult.from_wire(body)
 
     # -- THE writer path ---------------------------------------------------
@@ -535,6 +595,7 @@ class Table:
         self,
         data: pa.Table,
         *,
+        expected_table_uuid: _uuid.UUID | str | object | None = None,
         deferred_stats: bool = False,
         read_snapshot: int | None = None,
         author: str | None = None,
@@ -548,11 +609,44 @@ class Table:
         (``PARQUET:field_id``). Unless ``deferred_stats``, per-column stats
         are extracted from the writer's own footer metadata (never re-read
         from object storage) and shipped with the commit.
+
+        **Incarnation guard — atomic at commit.** The commit payload is
+        addressed by (namespace, table) NAME, so it lands on whatever
+        table currently holds that name. ``expected_table_uuid``
+        (default: the ``table_uuid`` this ``Table`` object was resolved
+        as; pass one explicitly to pin a specific incarnation) is shipped
+        ON the commit body, and the server rejects the whole commit with
+        409 — atomically, zero writes — when the live table's uuid
+        differs (drop + recreate under the same name). The client maps
+        that refusal to :class:`IncarnationChangedError`; ordinary commit
+        conflicts stay :class:`CommitConflictError` (retryable).
+
+        A single cheap pre-flight re-resolve runs before the parquet
+        upload as an optimization only (fast-fail on an already-dead
+        incarnation saves the S3 write); the server-side guard is the
+        safety mechanism. A commit-time refusal orphans the uploaded
+        parquet (cleanup's problem, never the catalog's).
+
+        Pass ``expected_table_uuid=pyhoglake.UNGUARDED`` to opt out: no
+        pre-flight uuid check, and the commit carries no
+        ``expected_table_uuid`` field (name-only resolution).
         """
         catalog = self._namespace._catalog
         client = catalog._client
 
-        info = self.info()  # refresh: current columns + partition spec
+        if expected_table_uuid is UNGUARDED:
+            expected = None
+        elif expected_table_uuid is None:
+            expected = self._info.table_uuid
+        else:
+            expected = str(expected_table_uuid)
+
+        if expected is not None:
+            # Pre-flight fast-fail (optimization, not the guarantee):
+            # re-resolve by name before paying for the parquet upload.
+            info = self._check_incarnation(expected)  # current columns + spec
+        else:
+            info = self.info()  # UNGUARDED: name-only resolution
         if info.partition_spec is not None and info.partition_spec.fields:
             raise HoglakeError(
                 "pyhoglake 0.1 cannot append to partitioned tables "
@@ -578,8 +672,7 @@ class Table:
         if not data_path.endswith("/"):
             data_path += "/"
         file_uri = (
-            f"{data_path}data/{self.namespace}/{self.name}/"
-            f"{_uuid.uuid4()}.parquet"
+            f"{data_path}data/{self.namespace}/{self.name}/{_uuid.uuid4()}.parquet"
         )
         _upload(client._filesystem(), file_uri, raw)
 
@@ -592,22 +685,51 @@ class Table:
         if column_stats is not None:
             file_reg["column_stats"] = [s.to_wire() for s in column_stats]
 
-        payload: dict[str, Any] = {
-            "appends": [
-                {
-                    "namespace": self.namespace,
-                    "table": self.name,
-                    "files": [file_reg],
-                }
-            ]
+        append_entry: dict[str, Any] = {
+            "namespace": self.namespace,
+            "table": self.name,
+            "files": [file_reg],
         }
+        if expected is not None:
+            # The atomic guard: the server 409s the whole commit (zero
+            # writes) when the live table's uuid differs.
+            append_entry["expected_table_uuid"] = expected
+
+        payload: dict[str, Any] = {"appends": [append_entry]}
         if read_snapshot is not None:
             payload["read_snapshot"] = read_snapshot
         if author is not None:
             payload["author"] = author
         if message is not None:
             payload["message"] = message
+
+        # No second re-resolve: the server enforces expected_table_uuid
+        # atomically at commit time (409, zero writes), superseding the
+        # old post-upload check. A refusal orphans the uploaded parquet
+        # (cleanup's problem, never the catalog's).
         return catalog._commit(payload)
+
+    def _check_incarnation(self, expected_uuid: str) -> TableInfo:
+        """Pre-flight fast-fail: re-resolve this table by name and raise
+        IncarnationChangedError if the name now binds to a different
+        table_uuid. Purely an optimization — it saves the parquet upload
+        when the incarnation is already dead; the server-side
+        ``expected_table_uuid`` commit guard is the atomic safety
+        mechanism. ``self._info`` is only adopted when the incarnation
+        matches, so the pinned identity (and the default
+        ``expected_table_uuid`` of later appends) is never silently
+        rebased onto a recreated table."""
+        body = self._namespace._catalog._client._request("GET", self._path())
+        info = TableInfo.from_wire(body)
+        if info.table_uuid != expected_uuid:
+            raise IncarnationChangedError(
+                f"table {self._namespace._catalog.name}/{self.namespace}."
+                f"{self.name} was recreated: expected table_uuid "
+                f"{expected_uuid}, name now resolves to {info.table_uuid}. "
+                "Refusing to append across incarnations."
+            )
+        self._info = info
+        return info
 
 
 def _align_table(data: pa.Table, target: pa.Schema) -> pa.Table:

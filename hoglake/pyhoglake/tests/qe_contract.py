@@ -209,7 +209,9 @@ def test_op_get_table_default_and_travel(client, httpx_mock):
     url = f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events"
     httpx_mock.add_response(method="GET", url=url, json=TABLE_WIRE)
     t.info()
-    _assert_wire(_last(httpx_mock), "GET", "/v1/catalogs/cat/namespaces/ns1/tables/events")
+    _assert_wire(
+        _last(httpx_mock), "GET", "/v1/catalogs/cat/namespaces/ns1/tables/events"
+    )
 
     httpx_mock.add_response(method="GET", url=f"{url}?snapshot=3", json=TABLE_WIRE)
     t.info(snapshot=3)
@@ -238,7 +240,8 @@ def test_at_timestamp_iso8601_with_offset(client, httpx_mock):
 
     # naive datetime -> taken as UTC, +00:00 offset REQUIRED on the wire
     httpx_mock.add_response(
-        method="GET", url=f"{url}?at_timestamp=2026-09-04T12%3A00%3A00%2B00%3A00",
+        method="GET",
+        url=f"{url}?at_timestamp=2026-09-04T12%3A00%3A00%2B00%3A00",
         json=TABLE_WIRE,
     )
     t.info(at_timestamp=datetime(2026, 9, 4, 12, 0, 0))
@@ -302,7 +305,10 @@ def test_op_alter_table_exact_op_bodies(client, httpx_mock):
         "/v1/catalogs/cat/namespaces/ns1/tables/events/alter",
         body={
             "ops": [
-                {"op": "add_column", "column": {"name": "s", "type": "string", "nullable": True}},
+                {
+                    "op": "add_column",
+                    "column": {"name": "s", "type": "string", "nullable": True},
+                },
                 {"op": "drop_column", "name": "d"},
                 {"op": "rename_column", "from": "a", "to": "b"},
                 {"op": "promote_column", "name": "i", "to": "long"},
@@ -315,7 +321,11 @@ def test_op_alter_table_exact_op_bodies(client, httpx_mock):
                 {
                     "op": "set_partition_spec",
                     "fields": [
-                        {"source_field_id": 1, "transform": "bucket", "transform_param": 16}
+                        {
+                            "source_field_id": 1,
+                            "transform": "bucket",
+                            "transform_param": 16,
+                        }
                     ],
                 },
             ]
@@ -356,7 +366,9 @@ def test_op_get_changes_param_set(client, httpx_mock):
         "files": [],
         "delete_files": [],
     }
-    httpx_mock.add_response(method="GET", url=f"{url}?from_snapshot=3&to_snapshot=9", json=plan)
+    httpx_mock.add_response(
+        method="GET", url=f"{url}?from_snapshot=3&to_snapshot=9", json=plan
+    )
     t.changes(3, 9)
     assert dict(_last(httpx_mock).url.params) == {
         "from_snapshot": "3",
@@ -385,13 +397,17 @@ def test_op_patch_options_body_shapes(client, httpx_mock):
     httpx_mock.add_response(method="PATCH", url=url, json=OPTIONS_WIRE)
     cat.set_retention(None)
     _assert_wire(
-        _last(httpx_mock), "PATCH", "/v1/catalogs/cat/options",
+        _last(httpx_mock),
+        "PATCH",
+        "/v1/catalogs/cat/options",
         body={"snapshot_retention_seconds": None},
     )
     httpx_mock.add_response(method="PATCH", url=url, json=OPTIONS_WIRE)
     cat.set_retention(3600, consumer_floor=False)
     _assert_wire(
-        _last(httpx_mock), "PATCH", "/v1/catalogs/cat/options",
+        _last(httpx_mock),
+        "PATCH",
+        "/v1/catalogs/cat/options",
         body={"snapshot_retention_seconds": 3600, "consumer_floor": False},
     )
 
@@ -407,7 +423,9 @@ EXPIRY_WIRE = {
 def test_op_run_expiry_and_cleanup_spec_clean_when_no_batch(client, httpx_mock):
     cat = _catalog(client, httpx_mock)
     httpx_mock.add_response(
-        method="POST", url=f"{BASE}/v1/catalogs/cat/maintenance/expire", json=EXPIRY_WIRE
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/maintenance/expire",
+        json=EXPIRY_WIRE,
     )
     cat.expire()
     _assert_wire(
@@ -461,7 +479,9 @@ def test_op_create_view(client, httpx_mock):
     # spec: required [name, sql]; dialect has default "trino" — the
     # client always sends it explicitly (harmless: documented property)
     _assert_wire(
-        _last(httpx_mock), "POST", "/v1/catalogs/cat/namespaces/ns1/views",
+        _last(httpx_mock),
+        "POST",
+        "/v1/catalogs/cat/namespaces/ns1/views",
         body={"name": "v", "sql": "SELECT 1", "dialect": "duckdb"},
     )
 
@@ -470,7 +490,9 @@ def test_op_get_and_drop_view(client, httpx_mock):
     cat = _catalog(client, httpx_mock)
     ns = Namespace(cat, "ns1")
     httpx_mock.add_response(
-        method="GET", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/views/v", json=VIEW_WIRE
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/views/v",
+        json=VIEW_WIRE,
     )
     v = ns.view("v")
     _assert_wire(_last(httpx_mock), "GET", "/v1/catalogs/cat/namespaces/ns1/views/v")
@@ -496,6 +518,22 @@ def test_op_list_snapshots_params(client, httpx_mock):
     assert dict(_last(httpx_mock).url.params) == {"after": "0", "limit": "1000"}
 
 
+def test_op_list_snapshots_before_param(client, httpx_mock):
+    # descending cursor: `before` only, never combined with `after`
+    # (spec: 422 if both; the client refuses the combination with a
+    # ValueError before any request)
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/snapshots?before=6&limit=1000",
+        json={"snapshots": [], "has_more": False},
+    )
+    list(cat.snapshots(before=6))
+    assert dict(_last(httpx_mock).url.params) == {"before": "6", "limit": "1000"}
+    with pytest.raises(ValueError):
+        cat.snapshots(after=1, before=6)
+
+
 def test_op_commit_body_fields(client, httpx_mock):
     cat = _catalog(client, httpx_mock)
     httpx_mock.add_response(
@@ -508,7 +546,11 @@ def test_op_commit_body_fields(client, httpx_mock):
                 "namespace": "ns1",
                 "table": "events",
                 "files": [
-                    {"path": "s3://b/f.parquet", "record_count": 1, "file_size_bytes": 10}
+                    {
+                        "path": "s3://b/f.parquet",
+                        "record_count": 1,
+                        "file_size_bytes": 10,
+                    }
                 ],
             }
         ],
@@ -526,6 +568,31 @@ def test_op_list_consumer_offsets(client, httpx_mock):
     )
     cat.offsets("c1")
     _assert_wire(_last(httpx_mock), "GET", "/v1/catalogs/cat/consumers/c1/offsets")
+
+
+def test_op_get_consumer_offset(client, httpx_mock):
+    # GET /catalogs/{catalog}/consumers/{consumer}/offsets/{tableUuid}:
+    # 200 -> ConsumerOffset; the documented 404 ("none is stored") is a
+    # routine state and surfaces as None, not NotFoundError.
+    cat = _catalog(client, httpx_mock)
+    uuid = TABLE_WIRE["table_uuid"]
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/consumers/c1/offsets/{uuid}",
+        json=OFFSET_WIRE,
+    )
+    off = cat.offset("c1", uuid)
+    _assert_wire(
+        _last(httpx_mock), "GET", f"/v1/catalogs/cat/consumers/c1/offsets/{uuid}"
+    )
+    assert off is not None
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/consumers/c1/offsets/{uuid}",
+        json=ERR,
+        status_code=404,
+    )
+    assert cat.offset("c1", uuid) is None
 
 
 def test_op_commit_consumer_offset(client, httpx_mock):
@@ -557,32 +624,391 @@ def _err_cases():
     """(name, setup(client, httpx_mock) -> callable, status, exc_class)
     for every documented error response in the spec."""
     return [
-        ("createCatalog-409", lambda c, m: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs", json=ERR, status_code=409), lambda: c.create_catalog("cat", "s3://x/"))[1], AlreadyExistsError),
-        ("getCatalog-404", lambda c, m: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat", json=ERR, status_code=404), lambda: c.catalog("cat"))[1], NotFoundError),
-        ("createNamespace-409", lambda c, m: (lambda cat: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/namespaces", json=ERR, status_code=409), lambda: cat.create_namespace("ns"))[1])(_catalog(c, m)), AlreadyExistsError),
-        ("createTable-409", lambda c, m: (lambda ns: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables", json=ERR, status_code=409), lambda: ns.create_table("t", pa.schema([pa.field("id", pa.int64())])))[1])(Namespace(_catalog(c, m), "ns1")), AlreadyExistsError),
-        ("getTable-404", lambda c, m: (lambda ns: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/t", json=ERR, status_code=404), lambda: ns.table("t"))[1])(Namespace(_catalog(c, m), "ns1")), NotFoundError),
-        ("dropTable-404", lambda c, m: (lambda t: (m.add_response(method="DELETE", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events", json=ERR, status_code=404), t.drop)[1])(_table(c, m)), NotFoundError),
-        ("alterTable-404", lambda c, m: (lambda t: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter", json=ERR, status_code=404), lambda: t.alter([ops.drop_column("x")]))[1])(_table(c, m)), NotFoundError),
-        ("alterTable-409", lambda c, m: (lambda t: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter", json=ERR, status_code=409), lambda: t.alter([ops.drop_column("x")]))[1])(_table(c, m)), CommitConflictError),
-        ("alterTable-422", lambda c, m: (lambda t: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter", json=ERR, status_code=422), lambda: t.alter([ops.drop_column("x")]))[1])(_table(c, m)), ValidationError),
-        ("planScan-404", lambda c, m: (lambda t: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/scan", json=ERR, status_code=404), t.scan_plan)[1])(_table(c, m)), NotFoundError),
-        ("listFiles-404", lambda c, m: (lambda t: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/files", json=ERR, status_code=404), t.files)[1])(_table(c, m)), NotFoundError),
-        ("getChanges-404", lambda c, m: (lambda t: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/changes?from_snapshot=1", json=ERR, status_code=404), lambda: t.changes(1))[1])(_table(c, m)), NotFoundError),
-        ("getChanges-410", lambda c, m: (lambda t: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/changes?from_snapshot=1", json=ERR, status_code=410), lambda: t.changes(1))[1])(_table(c, m)), ExpiredError),
-        ("getOptions-404", lambda c, m: (lambda cat: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat/options", json=ERR, status_code=404), cat.options)[1])(_catalog(c, m)), NotFoundError),
-        ("patchOptions-404", lambda c, m: (lambda cat: (m.add_response(method="PATCH", url=f"{BASE}/v1/catalogs/cat/options", json=ERR, status_code=404), lambda: cat.set_retention(1))[1])(_catalog(c, m)), NotFoundError),
-        ("patchOptions-422", lambda c, m: (lambda cat: (m.add_response(method="PATCH", url=f"{BASE}/v1/catalogs/cat/options", json=ERR, status_code=422), lambda: cat.set_retention(-1))[1])(_catalog(c, m)), ValidationError),
-        ("runExpiry-404", lambda c, m: (lambda cat: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/maintenance/expire", json=ERR, status_code=404), cat.expire)[1])(_catalog(c, m)), NotFoundError),
-        ("runCleanup-404", lambda c, m: (lambda cat: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/maintenance/cleanup", json=ERR, status_code=404), cat.cleanup)[1])(_catalog(c, m)), NotFoundError),
-        ("createView-409", lambda c, m: (lambda ns: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/views", json=ERR, status_code=409), lambda: ns.create_view("v", "SELECT 1"))[1])(Namespace(_catalog(c, m), "ns1")), AlreadyExistsError),
-        ("getView-404", lambda c, m: (lambda ns: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/views/v", json=ERR, status_code=404), lambda: ns.view("v"))[1])(Namespace(_catalog(c, m), "ns1")), NotFoundError),
-        ("listSnapshots-404", lambda c, m: (lambda cat: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat/snapshots?after=0&limit=1000", json=ERR, status_code=404), lambda: list(cat.snapshots()))[1])(_catalog(c, m)), NotFoundError),
-        ("commit-409", lambda c, m: (lambda cat: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/commit", json=ERR, status_code=409), lambda: cat._commit({"appends": []}))[1])(_catalog(c, m)), CommitConflictError),
-        ("commit-422", lambda c, m: (lambda cat: (m.add_response(method="POST", url=f"{BASE}/v1/catalogs/cat/commit", json=ERR, status_code=422), lambda: cat._commit({"appends": []}))[1])(_catalog(c, m)), ValidationError),
-        ("listOffsets-404", lambda c, m: (lambda cat: (m.add_response(method="GET", url=f"{BASE}/v1/catalogs/cat/consumers/c1/offsets", json=ERR, status_code=404), lambda: cat.offsets("c1"))[1])(_catalog(c, m)), NotFoundError),
-        ("commitOffset-404", lambda c, m: (lambda cat: (m.add_response(method="PUT", url=f"{BASE}/v1/catalogs/cat/consumers/c1/offsets/u1", json=ERR, status_code=404), lambda: cat.commit_offset("c1", "u1", 1))[1])(_catalog(c, m)), NotFoundError),
-        ("commitOffset-409", lambda c, m: (lambda cat: (m.add_response(method="PUT", url=f"{BASE}/v1/catalogs/cat/consumers/c1/offsets/u1", json=ERR, status_code=409), lambda: cat.commit_offset("c1", "u1", 1))[1])(_catalog(c, m)), OffsetRegressionError),
+        (
+            "createCatalog-409",
+            lambda c, m: (
+                m.add_response(
+                    method="POST", url=f"{BASE}/v1/catalogs", json=ERR, status_code=409
+                ),
+                lambda: c.create_catalog("cat", "s3://x/"),
+            )[1],
+            AlreadyExistsError,
+        ),
+        (
+            "getCatalog-404",
+            lambda c, m: (
+                m.add_response(
+                    method="GET",
+                    url=f"{BASE}/v1/catalogs/cat",
+                    json=ERR,
+                    status_code=404,
+                ),
+                lambda: c.catalog("cat"),
+            )[1],
+            NotFoundError,
+        ),
+        (
+            "createNamespace-409",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces",
+                        json=ERR,
+                        status_code=409,
+                    ),
+                    lambda: cat.create_namespace("ns"),
+                )[1]
+            )(_catalog(c, m)),
+            AlreadyExistsError,
+        ),
+        (
+            "createTable-409",
+            lambda c, m: (
+                lambda ns: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables",
+                        json=ERR,
+                        status_code=409,
+                    ),
+                    lambda: ns.create_table(
+                        "t", pa.schema([pa.field("id", pa.int64())])
+                    ),
+                )[1]
+            )(Namespace(_catalog(c, m), "ns1")),
+            AlreadyExistsError,
+        ),
+        (
+            "getTable-404",
+            lambda c, m: (
+                lambda ns: (
+                    m.add_response(
+                        method="GET",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/t",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    lambda: ns.table("t"),
+                )[1]
+            )(Namespace(_catalog(c, m), "ns1")),
+            NotFoundError,
+        ),
+        (
+            "dropTable-404",
+            lambda c, m: (
+                lambda t: (
+                    m.add_response(
+                        method="DELETE",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    t.drop,
+                )[1]
+            )(_table(c, m)),
+            NotFoundError,
+        ),
+        (
+            "alterTable-404",
+            lambda c, m: (
+                lambda t: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    lambda: t.alter([ops.drop_column("x")]),
+                )[1]
+            )(_table(c, m)),
+            NotFoundError,
+        ),
+        (
+            "alterTable-409",
+            lambda c, m: (
+                lambda t: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter",
+                        json=ERR,
+                        status_code=409,
+                    ),
+                    lambda: t.alter([ops.drop_column("x")]),
+                )[1]
+            )(_table(c, m)),
+            CommitConflictError,
+        ),
+        (
+            "alterTable-422",
+            lambda c, m: (
+                lambda t: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter",
+                        json=ERR,
+                        status_code=422,
+                    ),
+                    lambda: t.alter([ops.drop_column("x")]),
+                )[1]
+            )(_table(c, m)),
+            ValidationError,
+        ),
+        (
+            "planScan-404",
+            lambda c, m: (
+                lambda t: (
+                    m.add_response(
+                        method="GET",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/scan",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    t.scan_plan,
+                )[1]
+            )(_table(c, m)),
+            NotFoundError,
+        ),
+        (
+            "listFiles-404",
+            lambda c, m: (
+                lambda t: (
+                    m.add_response(
+                        method="GET",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/files",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    t.files,
+                )[1]
+            )(_table(c, m)),
+            NotFoundError,
+        ),
+        (
+            "getChanges-404",
+            lambda c, m: (
+                lambda t: (
+                    m.add_response(
+                        method="GET",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/changes?from_snapshot=1",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    lambda: t.changes(1),
+                )[1]
+            )(_table(c, m)),
+            NotFoundError,
+        ),
+        (
+            "getChanges-410",
+            lambda c, m: (
+                lambda t: (
+                    m.add_response(
+                        method="GET",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/changes?from_snapshot=1",
+                        json=ERR,
+                        status_code=410,
+                    ),
+                    lambda: t.changes(1),
+                )[1]
+            )(_table(c, m)),
+            ExpiredError,
+        ),
+        (
+            "getOptions-404",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="GET",
+                        url=f"{BASE}/v1/catalogs/cat/options",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    cat.options,
+                )[1]
+            )(_catalog(c, m)),
+            NotFoundError,
+        ),
+        (
+            "patchOptions-404",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="PATCH",
+                        url=f"{BASE}/v1/catalogs/cat/options",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    lambda: cat.set_retention(1),
+                )[1]
+            )(_catalog(c, m)),
+            NotFoundError,
+        ),
+        (
+            "patchOptions-422",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="PATCH",
+                        url=f"{BASE}/v1/catalogs/cat/options",
+                        json=ERR,
+                        status_code=422,
+                    ),
+                    lambda: cat.set_retention(-1),
+                )[1]
+            )(_catalog(c, m)),
+            ValidationError,
+        ),
+        (
+            "runExpiry-404",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/maintenance/expire",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    cat.expire,
+                )[1]
+            )(_catalog(c, m)),
+            NotFoundError,
+        ),
+        (
+            "runCleanup-404",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/maintenance/cleanup",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    cat.cleanup,
+                )[1]
+            )(_catalog(c, m)),
+            NotFoundError,
+        ),
+        (
+            "createView-409",
+            lambda c, m: (
+                lambda ns: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/views",
+                        json=ERR,
+                        status_code=409,
+                    ),
+                    lambda: ns.create_view("v", "SELECT 1"),
+                )[1]
+            )(Namespace(_catalog(c, m), "ns1")),
+            AlreadyExistsError,
+        ),
+        (
+            "getView-404",
+            lambda c, m: (
+                lambda ns: (
+                    m.add_response(
+                        method="GET",
+                        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/views/v",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    lambda: ns.view("v"),
+                )[1]
+            )(Namespace(_catalog(c, m), "ns1")),
+            NotFoundError,
+        ),
+        (
+            "listSnapshots-404",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="GET",
+                        url=f"{BASE}/v1/catalogs/cat/snapshots?after=0&limit=1000",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    lambda: list(cat.snapshots()),
+                )[1]
+            )(_catalog(c, m)),
+            NotFoundError,
+        ),
+        (
+            "commit-409",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/commit",
+                        json=ERR,
+                        status_code=409,
+                    ),
+                    lambda: cat._commit({"appends": []}),
+                )[1]
+            )(_catalog(c, m)),
+            CommitConflictError,
+        ),
+        (
+            "commit-422",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="POST",
+                        url=f"{BASE}/v1/catalogs/cat/commit",
+                        json=ERR,
+                        status_code=422,
+                    ),
+                    lambda: cat._commit({"appends": []}),
+                )[1]
+            )(_catalog(c, m)),
+            ValidationError,
+        ),
+        (
+            "listOffsets-404",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="GET",
+                        url=f"{BASE}/v1/catalogs/cat/consumers/c1/offsets",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    lambda: cat.offsets("c1"),
+                )[1]
+            )(_catalog(c, m)),
+            NotFoundError,
+        ),
+        (
+            "commitOffset-404",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="PUT",
+                        url=f"{BASE}/v1/catalogs/cat/consumers/c1/offsets/u1",
+                        json=ERR,
+                        status_code=404,
+                    ),
+                    lambda: cat.commit_offset("c1", "u1", 1),
+                )[1]
+            )(_catalog(c, m)),
+            NotFoundError,
+        ),
+        (
+            "commitOffset-409",
+            lambda c, m: (
+                lambda cat: (
+                    m.add_response(
+                        method="PUT",
+                        url=f"{BASE}/v1/catalogs/cat/consumers/c1/offsets/u1",
+                        json=ERR,
+                        status_code=409,
+                    ),
+                    lambda: cat.commit_offset("c1", "u1", 1),
+                )[1]
+            )(_catalog(c, m)),
+            OffsetRegressionError,
+        ),
     ]
 
 
@@ -620,10 +1046,10 @@ def test_undocumented_5xx_maps_to_base_error(client, httpx_mock):
 @pytest.mark.parametrize(
     "raw,expected_b64",
     [
-        (b"\x01", "AQ=="),          # 1 byte -> 2 pad chars
-        (b"\x01\x02", "AQI="),      # 2 bytes -> 1 pad char
+        (b"\x01", "AQ=="),  # 1 byte -> 2 pad chars
+        (b"\x01\x02", "AQI="),  # 2 bytes -> 1 pad char
         (b"\x01\x02\x03", "AQID"),  # 3 bytes -> no padding
-        (b"", ""),                  # empty bound (e.g. empty-string min)
+        (b"", ""),  # empty bound (e.g. empty-string min)
         (b"\xff" * 16, "/////////////////////w=="),  # 16-byte uuid bound
     ],
 )
@@ -645,12 +1071,22 @@ def test_column_stats_wire_key_set_minimal():
     s = ColumnStats(field_id=1, value_count=2, null_count=0)
     assert s.to_wire() == {"field_id": 1, "value_count": 2, "null_count": 0}
     full = ColumnStats(
-        field_id=1, value_count=2, null_count=0, nan_count=1, size_bytes=9,
-        lower_bound=b"\x00", upper_bound=b"\x01",
+        field_id=1,
+        value_count=2,
+        null_count=0,
+        nan_count=1,
+        size_bytes=9,
+        lower_bound=b"\x00",
+        upper_bound=b"\x01",
     )
     assert set(full.to_wire()) == {
-        "field_id", "value_count", "null_count", "nan_count", "size_bytes",
-        "lower_bound", "upper_bound",
+        "field_id",
+        "value_count",
+        "null_count",
+        "nan_count",
+        "size_bytes",
+        "lower_bound",
+        "upper_bound",
     }
 
 

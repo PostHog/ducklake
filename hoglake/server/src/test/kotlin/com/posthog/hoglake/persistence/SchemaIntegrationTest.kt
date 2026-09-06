@@ -173,6 +173,73 @@ class SchemaIntegrationTest {
     }
 
     @Test
+    fun `duplicate live ordinal and negative ordinal are rejected by the DB`() {
+        val cat = svc.createCatalog("ordinal-cat", "s3://bucket/o2")
+        svc.createNamespace("ordinal-cat", "ns")
+        val t =
+            svc.createTable(
+                "ordinal-cat",
+                "ns",
+                "t",
+                listOf(ColumnDef("id", ColType.LONG), ColumnDef("v", ColType.STRING)),
+            )
+        // A second LIVE row at ordinal 0 (id's ordinal): unique partial
+        // index hog_column_live_ordinal must refuse — a duplicate live
+        // ordinal silently corrupts writers that stamp field order.
+        org.assertj.core.api.Assertions.assertThatThrownBy {
+            db.jdbi.withHandleUnchecked { h ->
+                h.execute(
+                    "INSERT INTO hog_column " +
+                        "(catalog_id, table_id, field_id, begin_snapshot, name, col_type, ordinal) " +
+                        "VALUES (?, ?, 99, 5, 'smuggled', 'long', 0)",
+                    cat.catalogId,
+                    t.tableId,
+                )
+            }
+        }.hasMessageContaining("hog_column_live_ordinal")
+        // An END-SNAPSHOTTED row at the same ordinal is history, not a
+        // conflict (the index is partial on end_snapshot IS NULL).
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                "INSERT INTO hog_column " +
+                    "(catalog_id, table_id, field_id, begin_snapshot, end_snapshot, name, col_type, ordinal) " +
+                    "VALUES (?, ?, 98, 1, 2, 'old', 'long', 0)",
+                cat.catalogId,
+                t.tableId,
+            )
+        }
+        // ordinal >= 0 is a CHECK.
+        org.assertj.core.api.Assertions.assertThatThrownBy {
+            db.jdbi.withHandleUnchecked { h ->
+                h.execute(
+                    "INSERT INTO hog_column " +
+                        "(catalog_id, table_id, field_id, begin_snapshot, name, col_type, ordinal) " +
+                        "VALUES (?, ?, 97, 5, 'negative', 'long', -1)",
+                    cat.catalogId,
+                    t.tableId,
+                )
+            }
+        }.hasMessageContaining("ordinal")
+    }
+
+    @Test
+    fun `snapshot change rows refuse a NULL object_id`() {
+        // Every change kind names an object; a NULL object_id would be a
+        // conflict row the conflict index never matches (an invisible OCC
+        // bypass), so the column is NOT NULL outright.
+        val cat = svc.createCatalog("objid-cat", "s3://bucket/o3")
+        org.assertj.core.api.Assertions.assertThatThrownBy {
+            db.jdbi.withHandleUnchecked { h ->
+                h.execute(
+                    "INSERT INTO hog_snapshot_change (catalog_id, snapshot_id, kind, object_id) " +
+                        "VALUES (?, 0, 'table_created', NULL)",
+                    cat.catalogId,
+                )
+            }
+        }.hasMessageContaining("object_id")
+    }
+
+    @Test
     fun `offset upsert guard is race-safe at the SQL level`() {
         val cat = svc.createCatalog("offset-sql-cat", "s3://bucket/o")
         svc.createNamespace("offset-sql-cat", "ns")

@@ -14,6 +14,7 @@ import java.sql.SQLException
 internal object Pg {
     const val UNIQUE_VIOLATION = "23505"
     const val CHECK_VIOLATION = "23514"
+    const val LOCK_NOT_AVAILABLE = "55P03"
 
     private val json: ObjectMapper = jacksonObjectMapper()
     private val mapType = object : TypeReference<Map<String, Any?>>() {}
@@ -24,6 +25,9 @@ internal object Pg {
     fun isUniqueViolation(e: UnableToExecuteStatementException): Boolean = sqlState(e) == UNIQUE_VIOLATION
 
     fun isCheckViolation(e: UnableToExecuteStatementException): Boolean = sqlState(e) == CHECK_VIOLATION
+
+    /** lock_timeout expiry ("canceling statement due to lock timeout"). */
+    fun isLockTimeout(e: UnableToExecuteStatementException): Boolean = sqlState(e) == LOCK_NOT_AVAILABLE
 
     /** Serialize column type params for a jsonb column; null stays null. */
     fun toJson(params: Map<String, Any?>?): String? = params?.let { json.writeValueAsString(it) }

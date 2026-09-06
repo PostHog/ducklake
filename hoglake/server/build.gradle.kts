@@ -19,6 +19,10 @@ val testcontainersVersion = "1.21.3"
 val awsSdkVersion = "2.29.29"
 
 dependencies {
+    // Background loops (BackgroundLoops.kt): explicit pin of the
+    // kotlinx-coroutines line ktor already carries transitively.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
+
     // HTTP server
     implementation("io.ktor:ktor-server-core:$ktorVersion")
     implementation("io.ktor:ktor-server-netty:$ktorVersion")
@@ -38,9 +42,18 @@ dependencies {
     implementation("org.flywaydb:flyway-core:$flywayVersion")
     implementation("org.flywaydb:flyway-database-postgresql:$flywayVersion")
 
-    // Object store + parquet footers
+    // Object store
     implementation("software.amazon.awssdk:s3:$awsSdkVersion")
-    implementation("dev.hardwood:hardwood-core:1.1.0.Beta1")
+
+    // parquet-java is THE parquet library (decision 2026-09-05: Hardwood is
+    // out entirely — field ids are a contract, and parquet-java reads AND
+    // writes them): the hydrator's footer reads and the compaction rewrite
+    // writer both live on it. hadoop-client-api is the shaded,
+    // dependency-free jar; the wider Hadoop dependency tree must not leak
+    // into the codebase.
+    implementation("org.apache.parquet:parquet-hadoop:1.15.2")
+    implementation("org.apache.hadoop:hadoop-client-api:3.4.1")
+    runtimeOnly("org.apache.hadoop:hadoop-client-runtime:3.4.1")
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.5.12")

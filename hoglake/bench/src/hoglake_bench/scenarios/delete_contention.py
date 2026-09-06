@@ -22,11 +22,22 @@ from pyhoglake import Catalog, CommitConflictError, Table
 
 from ..context import Bench
 from ..fabricate import BENCH_SCHEMA, dv_payload, fabricated_files
-from ..runner import FailureGuard, InvariantViolation, LoopResult, run_loop, run_threads
+from ..runner import (
+    FailureGuard,
+    InvariantViolation,
+    LoopResult,
+    OpDiscarded,
+    run_loop,
+    run_threads,
+)
 from ..stats import Metric, Recorder
-from .common import ScenarioReport, check
+from .common import ScenarioReport, check, notice
 
 FILE_RECORD_COUNT = 1_000_000  # headroom: delete_count may never exceed it
+
+# hotfile: retries per op before the attempt is abandoned (counted
+# separately) — the retry loop must never be able to hammer forever
+HOTFILE_MAX_RETRIES = 50
 
 
 def _live_dv_count(table: Table, data_file_id: int) -> int:
@@ -45,6 +56,9 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
             "files_per_writer": args.files_per_writer,
             "rounds": args.rounds,
             "hotfile_ops": args.hotfile_ops,
+            "duration": args.duration,
+            "warmup": 0,
+            "url": args.url,
         },
     )
     catalog = bench.new_catalog("dc")
@@ -87,6 +101,7 @@ def _disjoint(
 ) -> None:
     k = args.writers
     conflicts = [0] * k
+    conflict_lat = [Recorder() for _ in range(k)]  # 409 attempts, separately
     stop = threading.Event()
 
     def make_worker(i: int):
@@ -96,6 +111,7 @@ def _disjoint(
         def op(n: int) -> None:
             file_id = mine[n % len(mine)]
             delete_count = n // len(mine) + 1
+            t0 = time.perf_counter_ns()
             try:
                 r = catalog._commit(
                     dv_payload(catalog, table, file_id, delete_count, state["snapshot"])
@@ -103,7 +119,9 @@ def _disjoint(
                 state["snapshot"] = r.snapshot_id
             except CommitConflictError:
                 conflicts[i] += 1
+                conflict_lat[i].record_ns(time.perf_counter_ns() - t0)
                 state["snapshot"] = catalog.refresh().head_snapshot_id
+                raise OpDiscarded from None
 
         def worker() -> LoopResult:
             return run_loop(
@@ -129,10 +147,14 @@ def _disjoint(
         check(r.loop.errors == 0, f"disjoint writer {r.index}: {r.loop.errors} failures")
         merged.merge(r.loop.recorder)
     n_conflicts = sum(conflicts)
+    merged_conflict = Recorder()
+    for rec in conflict_lat:
+        merged_conflict.merge(rec)
+    extra = {"conflicts": n_conflicts}
+    if merged_conflict.count:
+        extra["conflict_p50_ms"] = merged_conflict.percentiles_ms()["p50_ms"]
     report.add(
-        Metric.from_recorder(
-            f"dv.disjoint.k{k}", merged, wall_s, conflicts=n_conflicts
-        )
+        Metric.from_recorder(f"dv.disjoint.k{k}", merged, wall_s, **extra)
     )
     if n_conflicts:
         report.flag(
@@ -156,6 +178,11 @@ def _disjoint(
                     f"file {fid}: live DV delete_count={got}, expected "
                     f"{args.rounds}",
                 )
+    elif not complete:
+        notice(
+            "delete-contention disjoint: --duration cut the round loop "
+            "short — the per-file final-DV invariant check was SKIPPED"
+        )
 
 
 def _hotfile(
@@ -171,15 +198,37 @@ def _hotfile(
     stop = threading.Event()
     attempts_per_writer = max(1, args.hotfile_ops // k)
     conflict_counts = [0] * k
+    success_counts = [0] * k
+    abandoned_counts = [0] * k
     retry_latency = [Recorder() for _ in range(k)]  # first attempt -> success
+    # deadline shared by every writer's retry loop: --duration is a hard
+    # cap on the whole hotfile phase, consulted INSIDE op(), not just
+    # between ops
+    op_deadline = (
+        time.monotonic() + args.duration if args.duration is not None else None
+    )
 
     def make_worker(i: int):
         def op(_: int) -> None:
             t0 = time.perf_counter_ns()
+            retries = 0
             while True:
+                if (
+                    stop.is_set()
+                    or retries >= HOTFILE_MAX_RETRIES
+                    or (
+                        op_deadline is not None
+                        and time.monotonic() > op_deadline
+                    )
+                ):
+                    # bounded: give up on THIS op, count it separately
+                    abandoned_counts[i] += 1
+                    raise OpDiscarded
                 snapshot = catalog.refresh().head_snapshot_id
                 current = _live_dv_count(table, hot_file_id)
                 try:
+                    # transport/5xx failures propagate to run_loop's
+                    # failure guard — the guard is consulted per attempt
                     catalog._commit(
                         dv_payload(
                             catalog, table, hot_file_id, current + 1, snapshot
@@ -188,8 +237,8 @@ def _hotfile(
                     break
                 except CommitConflictError:
                     conflict_counts[i] += 1
-                    if stop.is_set():
-                        raise
+                    retries += 1
+            success_counts[i] += 1
             retry_latency[i].record_ns(time.perf_counter_ns() - t0)
 
         def worker() -> LoopResult:
@@ -210,15 +259,21 @@ def _hotfile(
         stop.set()
         raise
 
-    successes = 0
     merged_retry = Recorder()
     for i, r in enumerate(results):
         assert r.loop is not None
         check(r.loop.errors == 0, f"hotfile writer {r.index}: {r.loop.errors} failures")
-        successes += r.loop.recorder.count
         merged_retry.merge(retry_latency[i])
+    successes = sum(success_counts)
     n_conflicts = sum(conflict_counts)
+    n_abandoned = sum(abandoned_counts)
     attempts = successes + n_conflicts
+    if n_abandoned:
+        notice(
+            f"delete-contention hotfile: {n_abandoned} op(s) abandoned "
+            f"(retry cap {HOTFILE_MAX_RETRIES} or --duration deadline) — "
+            "counted separately, excluded from latency stats"
+        )
     report.add(
         Metric.from_recorder(
             f"dv.hotfile.k{k}",
@@ -226,6 +281,7 @@ def _hotfile(
             wall_s,
             successes=successes,
             conflicts=n_conflicts,
+            abandoned=n_abandoned,
             conflict_rate=(n_conflicts / attempts) if attempts else 0.0,
         )
     )

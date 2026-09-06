@@ -6,6 +6,7 @@ import pytest
 from hoglake_bench.runner import (
     BenchAbort,
     FailureGuard,
+    OpDiscarded,
     run_loop,
     run_threads,
 )
@@ -68,6 +69,30 @@ class TestRunLoop:
 
         with pytest.raises(KeyError):
             run_loop(bug, ops=3, warmup=0)
+
+    def test_discarded_ops_excluded_from_stats(self):
+        def op(i):
+            if i % 2:
+                raise OpDiscarded
+
+        result = run_loop(op, ops=6, warmup=0)
+        assert result.recorder.count == 3
+        assert result.discarded == 3
+        assert result.errors == 0
+
+    def test_discarded_op_resets_failure_streak(self):
+        g = FailureGuard(limit=3)
+        calls = {"n": 0}
+
+        def op(_):
+            calls["n"] += 1
+            if calls["n"] % 3 == 0:
+                raise OpDiscarded  # server answered; streak resets
+            raise httpx.ReadTimeout("blip")
+
+        result = run_loop(op, ops=30, warmup=0, guard=g)
+        assert result.discarded == 10
+        assert result.errors == 20  # never 3 consecutive -> no BenchAbort
 
     def test_intermittent_failures_recovered(self):
         calls = {"n": 0}

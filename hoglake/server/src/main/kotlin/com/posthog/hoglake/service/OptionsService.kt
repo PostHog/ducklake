@@ -1,9 +1,10 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.CatalogOptions
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Audit
-import org.jdbi.v3.core.Handle
+import com.posthog.hoglake.persistence.CatalogRepo
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
@@ -22,59 +23,17 @@ sealed interface PatchField<out T> {
 }
 
 /**
- * The lifecycle-relevant slice of a hog_catalog row. Shared by the
- * options/expiry/cleanup services (CatalogRepo's CatalogInfo predates
- * the V3 retention columns and cannot grow them from here).
+ * The options payload of a catalog row. The row itself comes from
+ * CatalogRepo's single hog_catalog mapper (the LifecycleCatalog
+ * duplicate that predated the retention columns is gone — the
+ * mapper-coverage gate now pins the one mapping to the live schema).
  */
-internal data class LifecycleCatalog(
-    val catalogId: Long,
-    val name: String,
-    val headSnapshotId: Long,
-    val snapshotRetentionSeconds: Long?,
-    val consumerFloor: Boolean,
-    val earliestSnapshotId: Long,
-) {
-    fun options() =
-        CatalogOptions(
-            snapshotRetentionSeconds = snapshotRetentionSeconds,
-            consumerFloor = consumerFloor,
-            earliestSnapshotId = earliestSnapshotId,
-        )
-
-    companion object {
-        fun find(
-            handle: Handle,
-            catalog: String,
-        ): LifecycleCatalog? =
-            handle.createQuery(
-                """
-                SELECT catalog_id, name, last_snapshot_id,
-                       snapshot_retention_seconds, consumer_floor, earliest_snapshot_id
-                FROM hog_catalog WHERE name = :name
-                """,
-            )
-                .bind("name", catalog)
-                .map { rs, _ ->
-                    LifecycleCatalog(
-                        catalogId = rs.getLong("catalog_id"),
-                        name = rs.getString("name"),
-                        headSnapshotId = rs.getLong("last_snapshot_id"),
-                        snapshotRetentionSeconds =
-                            rs.getLong("snapshot_retention_seconds")
-                                .let { if (rs.wasNull()) null else it },
-                        consumerFloor = rs.getBoolean("consumer_floor"),
-                        earliestSnapshotId = rs.getLong("earliest_snapshot_id"),
-                    )
-                }
-                .findOne()
-                .orElse(null)
-
-        fun require(
-            handle: Handle,
-            catalog: String,
-        ): LifecycleCatalog = find(handle, catalog) ?: throw HoglakeException.NotFound("catalog '$catalog'")
-    }
-}
+internal fun CatalogInfo.options() =
+    CatalogOptions(
+        snapshotRetentionSeconds = snapshotRetentionSeconds,
+        consumerFloor = consumerFloor,
+        earliestSnapshotId = earliestSnapshotId,
+    )
 
 /**
  * The catalog options surface (GET/PATCH /v1/catalogs/{catalog}/options):
@@ -88,7 +47,7 @@ internal data class LifecycleCatalog(
  */
 class OptionsService(private val jdbi: Jdbi) {
     fun get(catalog: String): CatalogOptions =
-        jdbi.withHandleUnchecked { h -> LifecycleCatalog.require(h, catalog).options() }
+        jdbi.withHandleUnchecked { h -> CatalogRepo.require(h, catalog).options() }
 
     fun patch(
         catalog: String,
@@ -114,7 +73,7 @@ class OptionsService(private val jdbi: Jdbi) {
                 }
             }
             jdbi.inTransactionUnchecked { h ->
-                val cat = LifecycleCatalog.require(h, catalog)
+                val cat = CatalogRepo.require(h, catalog)
                 if (snapshotRetentionSeconds is PatchField.Set) {
                     h.createUpdate(
                         """
@@ -137,7 +96,7 @@ class OptionsService(private val jdbi: Jdbi) {
                         .bind("catalogId", cat.catalogId)
                         .execute()
                 }
-                LifecycleCatalog.require(h, catalog).options()
+                CatalogRepo.require(h, catalog).options()
             }
         }
 }

@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any
 
 NS_PER_MS = 1_000_000
 
@@ -69,7 +70,7 @@ class Recorder:
     def count(self) -> int:
         return len(self.samples_ns)
 
-    def merge(self, other: "Recorder") -> None:
+    def merge(self, other: Recorder) -> None:
         self.samples_ns.extend(other.samples_ns)
 
     def percentiles_ms(self) -> dict[str, float]:
@@ -83,6 +84,8 @@ class Recorder:
 
 
 def _fmt(v: Any) -> str:
+    if v is None:
+        return "n/a"  # display only; the JSONL keeps a real null
     if isinstance(v, bool):
         return str(v).lower()
     if isinstance(v, float):
@@ -121,7 +124,7 @@ class Metric:
         recorder: Recorder,
         wall_s: float,
         **extra: Any,
-    ) -> "Metric":
+    ) -> Metric:
         p = recorder.percentiles_ms() if recorder.count else {}
         return cls(
             name=name,

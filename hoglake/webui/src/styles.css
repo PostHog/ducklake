@@ -422,6 +422,14 @@ button.ghost:hover:not(:disabled) {
   color: var(--text-dim);
 }
 
+/* Inline client-side validation message next to a form field. */
+.field-error {
+  margin: 2px 0 0;
+  font-size: 0.85em;
+  color: var(--bad);
+  flex-basis: 100%;
+}
+
 .skeleton {
   display: inline-block;
   width: 70%;

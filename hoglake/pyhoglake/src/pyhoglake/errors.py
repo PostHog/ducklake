@@ -60,5 +60,18 @@ class ExpiredError(HoglakeError):
     floor. Reconcile from a full scan rather than silently skipping."""
 
 
+class IncarnationChangedError(HoglakeError):
+    """The table resolved by name no longer carries the ``table_uuid``
+    the caller expected (drop + recreate under the same name).
+
+    Raised on the append path in two places: by the server — the commit
+    ships ``expected_table_uuid`` and a mismatch 409s the whole commit
+    atomically with zero writes ("the table was recreated") — and by the
+    client's cheap pre-flight re-resolve, which fast-fails an
+    already-dead incarnation before the parquet upload. Never retry
+    blindly: the expected incarnation is gone and its history does not
+    carry over."""
+
+
 class UnsupportedTypeError(HoglakeError, TypeError):
     """An Arrow type with no hoglake column-type mapping."""

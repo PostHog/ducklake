@@ -20,9 +20,9 @@ import uuid
 
 from ..context import Bench
 from ..fabricate import BENCH_SCHEMA, fabricated_files
-from ..runner import FailureGuard, run_loop
+from ..runner import FailureGuard
 from ..stats import Metric, Recorder
-from .common import ScenarioReport, check, seed_snapshots
+from .common import ScenarioReport, check, notice, seed_snapshots
 
 REAL_OBJECT_BYTES = b"hoglake-bench cleanup probe\n" * 4
 FILES_PER_REAL_COMMIT = 50
@@ -35,6 +35,9 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
             "snapshots": args.snapshots,
             "batch": args.batch,
             "objects": args.objects,
+            "duration": args.duration,
+            "warmup": 0,
+            "url": args.url,
         },
     )
     guard = FailureGuard()
@@ -50,21 +53,29 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
         )
     )
 
-    # real objects, registered in batched commits
+    # real objects, registered in batched commits (failure-guard capped:
+    # a dead server/MinIO trips the guard instead of looping forever)
     bench.ensure_bucket()
     uploaded = 0
     while uploaded < args.objects:
         n = min(FILES_PER_REAL_COMMIT, args.objects - uploaded)
-        regs = fabricated_files(catalog, t_real, n, record_count=10)
-        for reg in regs:
-            reg["path"] = (
-                f"{catalog.data_path}data/bench/real/{uuid.uuid4().hex}.parquet"
+        try:
+            regs = fabricated_files(catalog, t_real, n, record_count=10)
+            for reg in regs:
+                reg["path"] = (
+                    f"{catalog.data_path}data/bench/real/{uuid.uuid4().hex}.parquet"
+                )
+                reg["file_size_bytes"] = len(REAL_OBJECT_BYTES)
+                bench.put_object(reg["path"], REAL_OBJECT_BYTES)
+            catalog._commit(
+                {"appends": [{"namespace": "bench", "table": "real", "files": regs}]}
             )
-            reg["file_size_bytes"] = len(REAL_OBJECT_BYTES)
-            bench.put_object(reg["path"], REAL_OBJECT_BYTES)
-        catalog._commit(
-            {"appends": [{"namespace": "bench", "table": "real", "files": regs}]}
-        )
+        except Exception as exc:
+            if guard.is_server_failure(exc):
+                guard.failure(exc)  # trips BenchAbort after the cap
+                continue
+            raise
+        guard.success()
         uploaded += n
 
     # drop both tables -> every file row becomes unreachable once the
@@ -89,11 +100,12 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
         totals["calls"] += 1
         return r.snapshots_expired > 0
 
+    capped = False
     t0 = time.perf_counter_ns()
     while True:
         try:
             more = expire_once()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if guard.is_server_failure(exc):
                 guard.failure(exc)
                 continue
@@ -102,6 +114,7 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
         if not more:
             break
         if deadline is not None and time.monotonic() > deadline:
+            capped = True
             break
     expire_wall = (time.perf_counter_ns() - t0) / 1e9
     report.add(
@@ -119,16 +132,23 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
         )
     )
     # +4 non-seed snapshots: 2 creates, 2 drops; head-1 floor keeps >= 1
-    check(
-        totals["snapshots"] >= args.snapshots,
-        f"expired {totals['snapshots']} snapshots, expected at least "
-        f"{args.snapshots}",
-    )
-    check(
-        totals["files"] >= args.snapshots + args.objects,
-        f"queued {totals['files']} files, expected at least "
-        f"{args.snapshots + args.objects} (all files were unreachable)",
-    )
+    if capped:
+        notice(
+            "expiry-throughput: --duration cut the expire drain short — "
+            "drain-completeness invariant checks were SKIPPED (rates above "
+            "are for a partial drain)"
+        )
+    else:
+        check(
+            totals["snapshots"] >= args.snapshots,
+            f"expired {totals['snapshots']} snapshots, expected at least "
+            f"{args.snapshots}",
+        )
+        check(
+            totals["files"] >= args.snapshots + args.objects,
+            f"queued {totals['files']} files, expected at least "
+            f"{args.snapshots + args.objects} (all files were unreachable)",
+        )
 
     # cleanup drain against MinIO
     clean_lat = Recorder()
@@ -138,7 +158,7 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
         try:
             with clean_lat.measure():
                 r = catalog.cleanup(batch=args.batch)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if guard.is_server_failure(exc):
                 guard.failure(exc)
                 continue
@@ -150,6 +170,7 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
         if r.removed + r.missing + r.still_referenced == 0:
             break
         if deadline is not None and time.monotonic() > deadline:
+            capped = True
             break
     clean_wall = (time.perf_counter_ns() - t0) / 1e9
     report.add(
@@ -169,10 +190,16 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
         f"cleanup reported {still_ref} still-referenced paths in the "
         "removal queue — expiry queued a live file (invariant violation)",
     )
-    check(
-        removed == args.objects,
-        f"cleanup removed {removed} real objects, expected {args.objects}",
-    )
+    if capped:
+        notice(
+            "expiry-throughput: --duration cut the cleanup drain short — "
+            "the removed-object-count invariant check was SKIPPED"
+        )
+    else:
+        check(
+            removed == args.objects,
+            f"cleanup removed {removed} real objects, expected {args.objects}",
+        )
     return report
 
 

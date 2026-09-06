@@ -5,6 +5,7 @@ import { createTable, listTables } from "../api/client";
 import { COLUMN_TYPES, type ColumnType } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
+import { identifierError } from "../lib/names";
 
 interface ColumnRow {
   name: string;
@@ -53,11 +54,17 @@ function CreateTableForm({
       cols.map((c, idx) => (idx === i ? { ...c, ...patch } : c)),
     );
 
+  // Mirror the server's identifier pattern (422 on violation) client-side.
+  const nameError = identifierError(name);
+  const columnErrors = columns.map((c) => identifierError(c.name));
+  const hasErrors = nameError !== null || columnErrors.some((e) => e !== null);
+
   return (
     <form
       className="inline-form"
       onSubmit={(e) => {
         e.preventDefault();
+        if (hasErrors) return;
         mutation.mutate();
       }}
     >
@@ -70,9 +77,11 @@ function CreateTableForm({
             onChange={(e) => setName(e.target.value)}
             required
             placeholder="pageviews"
+            aria-invalid={nameError !== null}
           />
         </label>
       </div>
+      {nameError && <p className="field-error">table name: {nameError}</p>}
       <div className="column-rows">
         {columns.map((col, i) => (
           <div className="form-row column-row" key={i}>
@@ -84,6 +93,7 @@ function CreateTableForm({
                 required
                 placeholder={`col_${i + 1}`}
                 aria-label={`column ${i + 1} name`}
+                aria-invalid={columnErrors[i] !== null}
               />
             </label>
             <label>
@@ -122,6 +132,11 @@ function CreateTableForm({
             >
               ×
             </button>
+            {columnErrors[i] && (
+              <p className="field-error">
+                column {i + 1}: {columnErrors[i]}
+              </p>
+            )}
           </div>
         ))}
       </div>
@@ -133,7 +148,7 @@ function CreateTableForm({
         >
           + Add column
         </button>
-        <button type="submit" disabled={mutation.isPending}>
+        <button type="submit" disabled={mutation.isPending || hasErrors}>
           {mutation.isPending ? "Creating…" : "Create table"}
         </button>
       </div>

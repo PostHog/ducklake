@@ -5,10 +5,12 @@ Everything created here is qe-* prefixed and disposable: catalog
 
 Server behaviors OBSERVED on 2026-09-05 and pinned here:
 
-* Catalog names enforce ``^[a-z][a-z0-9_-]{0,62}$`` (422 otherwise);
-  namespace/table/view names, author, message, and consumer ids have NO
-  charset check and round-trip verbatim (SQL-injection strings
-  included) without harming the catalog.
+* Catalog names enforce ``^[a-z][a-z0-9_-]{0,62}$`` (422 otherwise).
+  Namespace/table/view/column names enforce
+  ``^[A-Za-z_][A-Za-z0-9_-]{0,127}$`` at every DDL surface (422
+  otherwise; policy change 2026-09-06 — verbatim round-trip was the
+  old pinned contract). author, message, and consumer ids stay
+  free-text and round-trip verbatim.
 * record_count=0 files register with a zero-width row-id range; the
   next file starts at the same row_id_start (adjacent zero-width is
   legal). file_size_bytes=0 is accepted; negatives are 422.
@@ -31,6 +33,7 @@ import uuid
 
 import pyarrow as pa
 import pytest
+from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
 
 from pyhoglake import (
     CommitConflictError,
@@ -43,8 +46,6 @@ from pyhoglake import (
     ValidationError,
     ops,
 )
-
-from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
 
 pytestmark = pytest.mark.integration
 
@@ -140,31 +141,44 @@ def test_catalog_name_63_chars_is_accepted(client):
     assert cat.refresh().head_snapshot_id >= 0
 
 
-def test_ns_table_view_names_store_injection_verbatim(client, catalog, ns):
-    # namespaces/tables/views have NO charset check: verbatim round-trip
-    # is the accepted contract; the catalog must keep working after.
-    inj_ns = catalog.create_namespace(INJECTION)
-    assert INJECTION in catalog.list_namespaces()
-    assert catalog.namespace(INJECTION).name == INJECTION
+@pytest.mark.parametrize(
+    "bad",
+    [
+        INJECTION,
+        "café",  # unicode
+        "日本語テーブル",  # more unicode
+        "\U0001f994-hog",  # astral-plane emoji
+        "9leading-digit",
+        "a/b",  # path separator
+        "x" * 129,  # one past the 128 cap
+        "x" * 10_000,  # 10KB name
+    ],
+)
+def test_ns_table_view_hostile_names_rejected(client, catalog, ns, bad):
+    # policy change 2026-09-06: identifier pattern enforced at every
+    # DDL surface -> 422, never a 5xx, never stored (was: verbatim
+    # round-trip). The catalog must keep working after each poke.
+    with pytest.raises(ValidationError) as ei:
+        catalog.create_namespace(bad)
+    assert ei.value.status_code == 422
+    assert bad not in catalog.list_namespaces()
 
-    t = ns.create_table(INJECTION, _schema())
-    assert t.name == INJECTION
-    assert INJECTION in [x.name for x in ns.list_tables()]
-    got = ns.table(INJECTION)  # URL round-trip (percent-encoded path)
-    assert got.table_uuid == t.table_uuid
-    t.append(_rows(1, 2))
-    assert got.info().record_count == 2
+    with pytest.raises(ValidationError) as ei:
+        ns.create_table(bad, _schema())
+    assert ei.value.status_code == 422
+    assert bad not in [x.name for x in ns.list_tables()]
 
-    v = ns.create_view(INJECTION, f"SELECT * FROM {INJECTION!r}")
-    assert ns.view(INJECTION).sql == f"SELECT * FROM {INJECTION!r}"
-    v.drop()
+    with pytest.raises(ValidationError) as ei:
+        ns.create_view(bad, "SELECT 1")
+    assert ei.value.status_code == 422
 
-    t.drop()
     _sanity(client, catalog)
 
 
-def test_unicode_table_names_roundtrip(client, catalog, ns):
-    for name in ("café", "日本語テーブル", "\U0001f994-hog"):
+def test_identifier_boundary_names_accepted(client, catalog, ns):
+    # the pattern's accept edge: leading underscore, uppercase, digits,
+    # hyphens, exactly 128 chars.
+    for name in ("_leading", "UPPER-Case_9", "x" * 128):
         t = ns.create_table(name, _schema())
         assert ns.table(name).table_uuid == t.table_uuid
         t.append(_rows(1))
@@ -176,9 +190,7 @@ def test_unicode_table_names_roundtrip(client, catalog, ns):
 def test_author_message_consumer_id_injection_roundtrip(catalog, ns):
     t = ns.create_table("inj_meta", _schema())
     res = t.append(_rows(1), author=INJECTION, message=INJECTION)
-    snap = next(
-        s for s in catalog.snapshots() if s.snapshot_id == res.snapshot_id
-    )
+    snap = next(s for s in catalog.snapshots() if s.snapshot_id == res.snapshot_id)
     assert snap.author == INJECTION
     assert snap.message == INJECTION
 
@@ -190,15 +202,14 @@ def test_author_message_consumer_id_injection_roundtrip(catalog, ns):
     t.drop()
 
 
-def test_slash_in_table_name_is_reachable(client, catalog, ns):
-    # The server accepts 'a/b' as a table name (no CHECK). The client
-    # percent-encodes path segments (URL-encoding fix, 2026-09-05), so
-    # the name round-trips and the table is fully addressable.
-    t = ns.create_table(f"a/b-{RUN_ID}", _schema())
-    assert t.table_uuid
-    assert f"a/b-{RUN_ID}" in [x.name for x in ns.list_tables()]
-    fetched = ns.table(f"a/b-{RUN_ID}")
-    assert fetched.table_uuid == t.table_uuid
+def test_slash_in_table_name_rejected_and_lookup_misses(client, catalog, ns):
+    # 'a/b' is 422 at create (identifier pattern). Reads don't validate:
+    # a hostile lookup simply 404s (the client still percent-encodes
+    # path segments, so the request is well-formed either way).
+    with pytest.raises(ValidationError):
+        ns.create_table(f"a/b-{RUN_ID}", _schema())
+    with pytest.raises(NotFoundError):
+        ns.table(f"a/b-{RUN_ID}")
     _sanity(client, catalog)
 
 
@@ -228,7 +239,7 @@ def test_zero_row_append_zero_width_rowid_range(catalog, ns):
 
 
 def test_zero_size_fabricated_file_accepted_negatives_rejected(catalog, ns):
-    t = ns.create_table("sizes", _schema())
+    ns.create_table("sizes", _schema())
     res = catalog._commit(
         {
             "appends": [
@@ -427,7 +438,9 @@ def test_snapshot_pagination_edges(catalog):
     raw = catalog._client._request
 
     page = raw(
-        "GET", f"/catalogs/{catalog.name}/snapshots", params={"after": head, "limit": 10}
+        "GET",
+        f"/catalogs/{catalog.name}/snapshots",
+        params={"after": head, "limit": 10},
     )
     assert page == {"snapshots": [], "has_more": False}  # after=head
 
@@ -525,7 +538,7 @@ def test_view_with_100kb_sql(catalog, ns):
         + ")"
     )
     assert len(big_sql) > 100_000
-    v = ns.create_view(f"big_view_{RUN_ID}", big_sql)
+    ns.create_view(f"big_view_{RUN_ID}", big_sql)
     got = ns.view(f"big_view_{RUN_ID}")
     assert got.sql == big_sql  # byte-for-byte round-trip
     got.drop()

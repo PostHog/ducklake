@@ -49,3 +49,33 @@ class SchemaMismatchError(HaltError):
     message carries the precise diff."""
 
     exit_code = 6
+
+
+class SplitBrainError(HaltError):
+    """The source catalog rejected our offset commit as a regression
+    (409): some OTHER writer sharing this consumer_id has advanced the
+    offset past our window. Adopting the foreign offset would silently
+    skip rows never replicated to THIS destination — evidence of a
+    consumer_id collision. HALT; never adopt a foreign offset."""
+
+    exit_code = 7
+
+
+class DataIntegrityError(HaltError):
+    """A data file delivered a different number of rows than the change
+    plan's server-side record_count. Committing the offset would cover
+    rows that were never read or appended (short read: truncated or
+    stale object-store response, reader bug, wrong file content). HALT
+    before any offset movement."""
+
+    exit_code = 8
+
+
+class PersistentFailureError(HaltError):
+    """Retrying cannot succeed (a permanent client error: validation,
+    not-found, already-exists), or the transient-retry budget
+    (``max_window_replays``) is exhausted. Each retry replays the whole
+    window — duplicates per replay — so the amplification is capped by
+    halting instead of retrying forever."""
+
+    exit_code = 9

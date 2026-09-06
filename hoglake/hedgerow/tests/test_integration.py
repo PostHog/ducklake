@@ -14,7 +14,7 @@ import uuid
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
+from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
 from pyhoglake import HoglakeClient, S3Config
 
 from hedgerow import (
@@ -29,8 +29,6 @@ from hedgerow import (
     SourceConfig,
 )
 from hedgerow.config import S3Settings
-
-from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
 
 pytestmark = pytest.mark.integration
 
@@ -167,7 +165,7 @@ def _read_table_back(table, s3config: S3Config, columns: list[str]) -> pa.Table:
     fs = s3config.filesystem()
     parts = []
     for f in table.files():
-        parts.append(pq.read_table(f.path[len("s3://"):], filesystem=fs))
+        parts.append(pq.read_table(f.path[len("s3://") :], filesystem=fs))
     if not parts:
         return pa.table({c: [] for c in columns})
     merged = pa.concat_tables(parts).select(columns)
@@ -224,7 +222,11 @@ def test_filter_and_projection(
     src = src_ns.create_table("filt", _schema())
     dst = dst_ns.create_table("filt", _dest_schema())  # team_id dropped
     cfg = _make_config(
-        live_server_url, src_catalog, dst_catalog, "filt", "filt",
+        live_server_url,
+        src_catalog,
+        dst_catalog,
+        "filt",
+        "filt",
         f"hedge-filt-{RUN_ID}",
         filter_cfg=FilterConfig(column="team_id", equals=1),
     )
@@ -286,8 +288,13 @@ def test_lag_metric_sanity(
     src = src_ns.create_table("lag", _schema())
     dst_ns.create_table("lag", _schema())
     cfg = _make_config(
-        live_server_url, src_catalog, dst_catalog, "lag", "lag",
-        f"hedge-lag-{RUN_ID}", max_window=1,
+        live_server_url,
+        src_catalog,
+        dst_catalog,
+        "lag",
+        "lag",
+        f"hedge-lag-{RUN_ID}",
+        max_window=1,
     )
     registry = prom.CollectorRegistry()
     daemon = Hedgerow(
@@ -300,9 +307,7 @@ def test_lag_metric_sanity(
 
     r1 = daemon.run_once()  # window of 1: lag must remain
     assert r1.lag_snapshots >= 1
-    assert (
-        registry.get_sample_value("hedgerow_lag_snapshots") == r1.lag_snapshots
-    )
+    assert registry.get_sample_value("hedgerow_lag_snapshots") == r1.lag_snapshots
     assert (
         registry.get_sample_value("hedgerow_last_committed_snapshot")
         == r1.committed_offset
@@ -322,7 +327,11 @@ def test_halt_on_delete(
     src = src_ns.create_table("deltest", _schema())
     dst_ns.create_table("deltest", _schema())
     cfg = _make_config(
-        live_server_url, src_catalog, dst_catalog, "deltest", "deltest",
+        live_server_url,
+        src_catalog,
+        dst_catalog,
+        "deltest",
+        "deltest",
         f"hedge-del-{RUN_ID}",
     )
     daemon = Hedgerow(cfg)
@@ -372,7 +381,11 @@ def test_halt_on_source_recreate(
     src = src_ns.create_table("reborn", _schema())
     dst_ns.create_table("reborn", _schema())
     cfg = _make_config(
-        live_server_url, src_catalog, dst_catalog, "reborn", "reborn",
+        live_server_url,
+        src_catalog,
+        dst_catalog,
+        "reborn",
+        "reborn",
         f"hedge-reborn-{RUN_ID}",
     )
     daemon = Hedgerow(cfg)

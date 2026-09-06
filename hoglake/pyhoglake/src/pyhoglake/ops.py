@@ -30,7 +30,7 @@ class AlterOp:
 
 
 def _column_def(
-    name: str, type_: "pa.DataType | str", nullable: bool = True
+    name: str, type_: pa.DataType | str, nullable: bool = True
 ) -> dict[str, Any]:
     if isinstance(type_, pa.DataType):
         col_type, params = arrow_type_to_coltype(type_)
@@ -42,9 +42,7 @@ def _column_def(
     return col
 
 
-def add_column(
-    name: str, type_: "pa.DataType | str", nullable: bool = True
-) -> AlterOp:
+def add_column(name: str, type_: pa.DataType | str, nullable: bool = True) -> AlterOp:
     """Add a column. ``type_`` is a pyarrow DataType or a hoglake type name."""
     return AlterOp("add_column", {"column": _column_def(name, type_, nullable)})
 
@@ -77,10 +75,8 @@ def partition_field(
 
 
 def set_partition_spec(
-    fields: "list[PartitionField | dict[str, Any]]",
+    fields: list[PartitionField | dict[str, Any]],
 ) -> AlterOp:
     """Set the partition spec. An empty list makes the table unpartitioned."""
-    wire = [
-        f.to_wire() if isinstance(f, PartitionField) else dict(f) for f in fields
-    ]
+    wire = [f.to_wire() if isinstance(f, PartitionField) else dict(f) for f in fields]
     return AlterOp("set_partition_spec", {"fields": wire})

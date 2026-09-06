@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import httpx
 from pyhoglake import HoglakeError
@@ -17,12 +17,25 @@ MAX_CONSECUTIVE_FAILURES = 10
 
 
 class BenchAbort(RuntimeError):
-    """The server stopped answering; the scenario refuses to hammer it."""
+    """The run cannot produce trustworthy numbers and refuses to go on
+    (unresponsive server, insufficient samples, ...). Exit code 3."""
+
+
+class InsufficientSamples(BenchAbort):
+    """A guarded stage measured too few ops to compute a trustworthy
+    ratio/headline. Aborting loudly beats emitting a vacuous 0.0."""
 
 
 class InvariantViolation(AssertionError):
     """A correctness check failed after a load phase. The numbers above
     the raise are not trustworthy."""
+
+
+class OpDiscarded(Exception):
+    """Raised by an op to drop the current iteration from the latency
+    recorder — e.g. a conflicted or abandoned attempt whose latency is
+    tracked in a separate, clearly-labeled recorder. The op index still
+    advances; the sample never contaminates the success percentiles."""
 
 
 class FailureGuard:
@@ -67,6 +80,7 @@ class LoopResult:
     warmup: Recorder
     wall_s: float
     errors: int = 0
+    discarded: int = 0
 
 
 def run_loop(
@@ -87,6 +101,7 @@ def run_loop(
     measured = Recorder()
     warm = Recorder()
     errors = 0
+    discarded = 0
     deadline = None
     if duration_s is not None:
         deadline = time.monotonic() + duration_s
@@ -104,7 +119,14 @@ def run_loop(
         t0 = time.perf_counter_ns()
         try:
             op(i)
-        except BaseException as exc:  # noqa: BLE001 - classified below
+        except OpDiscarded:
+            # the op handled (and separately recorded) this attempt;
+            # the server answered, so the failure streak resets
+            guard.success()
+            discarded += 1
+            i += 1
+            continue
+        except BaseException as exc:
             if guard.is_server_failure(exc):
                 guard.failure(exc)
                 errors += 1
@@ -117,7 +139,13 @@ def run_loop(
     wall_s = 0.0
     if wall_t0 is not None:
         wall_s = (time.perf_counter_ns() - wall_t0) / 1e9
-    return LoopResult(recorder=measured, warmup=warm, wall_s=wall_s, errors=errors)
+    return LoopResult(
+        recorder=measured,
+        warmup=warm,
+        wall_s=wall_s,
+        errors=errors,
+        discarded=discarded,
+    )
 
 
 @dataclass

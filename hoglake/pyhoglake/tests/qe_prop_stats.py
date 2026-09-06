@@ -24,15 +24,12 @@ Pinned policies (verified here):
 """
 
 import io
-import math
 import struct
-import uuid as _uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -72,9 +69,7 @@ COLUMN_KINDS = {
     ),
     "decimal": (
         {"precision": 18, "scale": 3},
-        st.integers(-(10**18) + 1, 10**18 - 1).map(
-            lambda n: Decimal(n).scaleb(-3)
-        ),
+        st.integers(-(10**18) + 1, 10**18 - 1).map(lambda n: Decimal(n).scaleb(-3)),
     ),
     "uuid": (None, st.binary(min_size=16, max_size=16)),
 }
@@ -83,9 +78,7 @@ COLUMN_KINDS = {
 @st.composite
 def stats_case(draw):
     kinds = draw(
-        st.lists(
-            st.sampled_from(sorted(COLUMN_KINDS)), min_size=1, max_size=4
-        )
+        st.lists(st.sampled_from(sorted(COLUMN_KINDS)), min_size=1, max_size=4)
     )
     n_rows = draw(st.integers(0, 40))
     columns = []
@@ -140,7 +133,10 @@ def test_extracted_stats_match_ground_truth(case):
     columns, values, n_rows, row_group_size = case
     schema = columns_to_arrow_schema(columns)
     table = pa.table(
-        {c.name: pa.array(v, schema.field(c.name).type) for c, v in zip(columns, values)},
+        {
+            c.name: pa.array(v, schema.field(c.name).type)
+            for c, v in zip(columns, values)
+        },
         schema=schema,
     )
     meta = _write_meta(table, row_group_size)
@@ -225,9 +221,7 @@ def test_negative_zero_bounds_bitpattern():
 def test_string_beyond_4096_stat_cap_omits_bounds_not_truncates():
     cols = (Column(name="s", type="string", field_id=1, ordinal=0),)
     big = "z" * 5000
-    t = pa.table(
-        {"s": pa.array(["a", big])}, schema=columns_to_arrow_schema(cols)
-    )
+    t = pa.table({"s": pa.array(["a", big])}, schema=columns_to_arrow_schema(cols))
     (s,) = extract_column_stats(_write_meta(t, 10), cols)
     assert s.value_count == 2 and s.null_count == 0
     # a truncated max ("zzz...z"[:4096]) would be an INVALID upper bound
@@ -238,9 +232,7 @@ def test_string_beyond_4096_stat_cap_omits_bounds_not_truncates():
 def test_string_at_4096_cap_keeps_exact_bounds():
     cols = (Column(name="s", type="string", field_id=1, ordinal=0),)
     lo, hi = "a" * 4096, "z" * 4096
-    t = pa.table(
-        {"s": pa.array([lo, hi])}, schema=columns_to_arrow_schema(cols)
-    )
+    t = pa.table({"s": pa.array([lo, hi])}, schema=columns_to_arrow_schema(cols))
     (s,) = extract_column_stats(_write_meta(t, 10), cols)
     assert s.lower_bound == lo.encode()
     assert s.upper_bound == hi.encode()

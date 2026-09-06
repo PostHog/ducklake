@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import argparse
 import threading
+import time
 
-from pyhoglake import Catalog, CommitConflictError, Table
+from pyhoglake import CommitConflictError, Table
 
 from ..context import Bench
 from ..fabricate import BENCH_SCHEMA, append_payload
-from ..runner import FailureGuard, LoopResult, run_loop, run_threads
+from ..runner import FailureGuard, LoopResult, OpDiscarded, run_loop, run_threads
 from ..stats import Metric, Recorder
 from .common import (
     ScenarioReport,
@@ -37,6 +38,8 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
             "ops": args.ops,
             "files_per_commit": args.files_per_commit,
             "warmup": args.warmup,
+            "duration": args.duration,
+            "url": args.url,
         },
     )
     for k in args.writers:
@@ -60,6 +63,7 @@ def _run_level(
 
     guard = FailureGuard()
     conflicts = [0] * k
+    conflict_lat = [Recorder() for _ in range(k)]  # 409 attempts, separately
     stop = threading.Event()
 
     def make_worker(i: int):
@@ -67,6 +71,7 @@ def _run_level(
         last_snapshot = {"v": start_head}
 
         def op(_: int) -> None:
+            t0 = time.perf_counter_ns()
             try:
                 result = catalog._commit(
                     append_payload(
@@ -79,8 +84,12 @@ def _run_level(
                 )
                 last_snapshot["v"] = result.snapshot_id
             except CommitConflictError:
+                # conflicted attempts are recorded on their own; they
+                # must never contaminate the success percentiles
                 conflicts[i] += 1
+                conflict_lat[i].record_ns(time.perf_counter_ns() - t0)
                 last_snapshot["v"] = catalog.refresh().head_snapshot_id
+                raise OpDiscarded from None
 
         def worker() -> LoopResult:
             return run_loop(
@@ -115,16 +124,19 @@ def _run_level(
                 worker_p99_max, r.loop.recorder.percentiles_ms()["p99_ms"]
             )
     n_conflicts = sum(conflicts)
-    report.add(
-        Metric.from_recorder(
-            f"contention.k{k}",
-            merged,
-            wall_s,
-            files_s=(total_ops * args.files_per_commit / wall_s) if wall_s else 0.0,
-            conflicts=n_conflicts,
-            worker_p99_max_ms=worker_p99_max,
-        )
-    )
+    merged_conflict = Recorder()
+    for r in conflict_lat:
+        merged_conflict.merge(r)
+    extra = {
+        "files_s": (total_ops * args.files_per_commit / wall_s)
+        if wall_s
+        else 0.0,
+        "conflicts": n_conflicts,
+        "worker_p99_max_ms": worker_p99_max,
+    }
+    if merged_conflict.count:
+        extra["conflict_p50_ms"] = merged_conflict.percentiles_ms()["p50_ms"]
+    report.add(Metric.from_recorder(f"contention.k{k}", merged, wall_s, **extra))
     if n_conflicts:
         report.flag(
             f"commit-contention k={k}: {n_conflicts} append/append 409s "
@@ -132,8 +144,9 @@ def _run_level(
         )
 
     # correctness: dense snapshot ids for every successful commit, and
-    # row-range tiling on the shared (most contended) table
-    commits = total_ops + total_warmup - n_conflicts  # 409s mint no snapshot
+    # row-range tiling on the shared (most contended) table.
+    # 409s mint no snapshot and are discarded from both recorders.
+    commits = total_ops + total_warmup
     assert_dense_snapshots(catalog, start_head, commits)
     assert_row_tiling(shared)
     for t in tables:

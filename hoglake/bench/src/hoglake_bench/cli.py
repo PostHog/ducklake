@@ -4,6 +4,16 @@ Every scenario prints one line per metric (name, ops, wall_s, rate_s,
 p50/p95/p99/max) and appends a JSON line to bench-results.jsonl so runs
 compare over time. Regression ratios above 1.5x are flagged loudly on
 stderr and make the exit code nonzero.
+
+Exit codes (severity-resolved across `all`; a later scenario can never
+demote an earlier one — precedence 4 > 2 > 5 > 3 > 0):
+
+- 0: everything ran, no flags
+- 2: at least one regression flag
+- 3: abort — server unresponsive, or a guarded stage had insufficient
+  samples for a trustworthy ratio
+- 4: invariant violation (the numbers are not trustworthy)
+- 5: unexpected exception (harness bug)
 """
 
 from __future__ import annotations
@@ -12,7 +22,8 @@ import argparse
 import os
 import sys
 import time
-from typing import Any, Callable
+import traceback
+from typing import Any
 
 import httpx
 
@@ -46,6 +57,7 @@ QUICK_PROFILE: dict[str, dict[str, Any]] = {
         "preseed_snapshots": [0, 1000],
         "files_per_commit": [1, 10],
         "ops": 40,
+        "tables": 150,
     },
     "commit-contention": {"writers": [1, 4, 8], "ops": 25},
     "delete-contention": {
@@ -133,7 +145,7 @@ def check_server(url: str) -> None:
     try:
         r = httpx.get(url.rstrip("/") + "/healthz", timeout=5.0)
         r.raise_for_status()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise BenchAbort(
             f"no healthy hoglake server at {url} ({exc}); start one with "
             "`docker compose up -d && flox activate -- gradle run` in "
@@ -141,15 +153,101 @@ def check_server(url: str) -> None:
         ) from exc
 
 
+# Exit codes, in severity-precedence order (first present wins across
+# an `all` run): invariant violation > regression > unexpected error >
+# abort/insufficient-samples > ok. A later scenario's failure can never
+# demote an earlier scenario's regression flag.
+EXIT_OK = 0
+EXIT_REGRESSION = 2
+EXIT_ABORT = 3
+EXIT_INVARIANT = 4
+EXIT_ERROR = 5
+EXIT_PRECEDENCE = (EXIT_INVARIANT, EXIT_REGRESSION, EXIT_ERROR, EXIT_ABORT)
+
+
+def _resolve_exit(codes: list[int]) -> int:
+    for code in EXIT_PRECEDENCE:
+        if code in codes:
+            return code
+    return EXIT_OK
+
+
+def _journal_params(args: argparse.Namespace) -> dict[str, Any]:
+    """Effective config for a scenario that died before building its
+    report — everything except credentials."""
+    return {
+        k: v
+        for k, v in vars(args).items()
+        if k not in ("s3_access_key", "s3_secret_key", "scenario", "quick", "full")
+    }
+
+
 def _run_scenario(
-    bench: Bench, name: str, args: argparse.Namespace
-) -> ScenarioReport:
+    bench: Bench,
+    name: str,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+) -> tuple[int, list[str]]:
+    """Run one scenario; journal a JSONL line whether it completed or
+    failed (always with a ``status`` field); return (exit code, flags)."""
     print(f"=== {name} (run {bench.cfg.run_id}) ===", flush=True)
     t0 = time.monotonic()
-    report = SCENARIOS[name].run(bench, args)
-    bench.append_result(name, report.params, report.metrics)
+    try:
+        report: ScenarioReport = SCENARIOS[name].run(bench, args)
+    except InvariantViolation as exc:
+        bench.append_result(
+            name,
+            _journal_params(args),
+            [],
+            status="invariant_violation",
+            error=str(exc),
+            config=config,
+        )
+        print(
+            f"\nINVARIANT VIOLATION in {name}: {exc}\n"
+            "The benchmark corrupted or mis-modeled catalog state; the "
+            "numbers above are not trustworthy.",
+            file=sys.stderr,
+        )
+        return EXIT_INVARIANT, []
+    except BenchAbort as exc:
+        bench.append_result(
+            name,
+            _journal_params(args),
+            [],
+            status="aborted",
+            error=str(exc),
+            config=config,
+        )
+        print(f"\nABORT in {name}: {exc}", file=sys.stderr)
+        return EXIT_ABORT, []
+    except Exception as exc:  # noqa: BLE001 - harness bug, own exit code
+        bench.append_result(
+            name,
+            _journal_params(args),
+            [],
+            status="error",
+            error=f"{type(exc).__name__}: {exc}",
+            config=config,
+        )
+        traceback.print_exc()
+        print(
+            f"\nERROR in {name}: unexpected {type(exc).__name__}: {exc} "
+            f"(harness bug — exit {EXIT_ERROR})",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR, []
+    status = "regression" if report.flags else "ok"
+    bench.append_result(
+        name,
+        report.params,
+        report.metrics,
+        status=status,
+        flags=report.flags,
+        config=config,
+    )
     print(f"=== {name} done in {time.monotonic() - t0:.1f}s ===\n", flush=True)
-    return report
+    return (EXIT_REGRESSION if report.flags else EXIT_OK), report.flags
 
 
 def _namespace_for(
@@ -190,38 +288,51 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         check_server(cfg.url)
-        bench = Bench(cfg)
-        flags: list[str] = []
-        try:
-            if args.scenario == "all":
-                profile = FULL_PROFILE if args.full else QUICK_PROFILE
-                label = "full" if args.full else "quick"
-                print(f"hoglake-bench all --{label}\n", flush=True)
-                for name in SCENARIOS:
-                    ns = _namespace_for(name, args, profile[name])
-                    flags.extend(_run_scenario(bench, name, ns).flags)
-            else:
-                flags.extend(_run_scenario(bench, args.scenario, args).flags)
-        finally:
-            bench.close()
-        if flags:
-            print(
-                f"\n{len(flags)} regression flag(s) raised — see !!! lines",
-                file=sys.stderr,
-            )
-            return 2
-        return 0
     except BenchAbort as exc:
         print(f"\nABORT: {exc}", file=sys.stderr)
-        return 3
-    except InvariantViolation as exc:
+        return EXIT_ABORT
+    bench = Bench(cfg)
+    codes: list[int] = []
+    flags: list[str] = []
+    try:
+        if args.scenario == "all":
+            profile = FULL_PROFILE if args.full else QUICK_PROFILE
+            label = "full" if args.full else "quick"
+            print(f"hoglake-bench all --{label}\n", flush=True)
+            for name in SCENARIOS:
+                ns = _namespace_for(name, args, profile[name])
+                config = {"url": cfg.url, "profile": label}
+                code, scenario_flags = _run_scenario(bench, name, ns, config)
+                codes.append(code)
+                flags.extend(scenario_flags)
+                if code == EXIT_ABORT:
+                    # keep going only if the server still answers — an
+                    # insufficient-samples abort shouldn't kill the run,
+                    # but a dead server must not be hammered further
+                    try:
+                        check_server(cfg.url)
+                    except BenchAbort:
+                        print(
+                            "server unreachable — skipping remaining "
+                            "scenarios",
+                            file=sys.stderr,
+                        )
+                        break
+        else:
+            config = {"url": cfg.url, "profile": None}
+            code, scenario_flags = _run_scenario(
+                bench, args.scenario, args, config
+            )
+            codes.append(code)
+            flags.extend(scenario_flags)
+    finally:
+        bench.close()
+    if flags:
         print(
-            f"\nINVARIANT VIOLATION: {exc}\n"
-            "The benchmark corrupted or mis-modeled catalog state; the "
-            "numbers above are not trustworthy.",
+            f"\n{len(flags)} regression flag(s) raised — see !!! lines",
             file=sys.stderr,
         )
-        return 4
+    return _resolve_exit(codes)
 
 
 if __name__ == "__main__":

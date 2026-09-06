@@ -1,9 +1,12 @@
 package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.posthog.hoglake.compaction.CompactionService
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.OptionsService
+import com.posthog.hoglake.service.VerifyService
+import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
@@ -30,6 +33,8 @@ fun Application.installMaintenanceRoutes(
     options: OptionsService,
     expiry: ExpiryService,
     cleanup: CleanupService,
+    compaction: CompactionService,
+    verify: VerifyService,
 ) {
     routing {
         route("/v1/catalogs/{catalog}") {
@@ -62,6 +67,34 @@ fun Application.installMaintenanceRoutes(
                         call.maintenanceCatalog(),
                         call.batchQuery() ?: DEFAULT_CLEANUP_BATCH,
                     ).toDto(),
+                )
+            }
+            // `batch` = groups rewritten this run (default: the config knob,
+            // 1 — compaction takes tiny bites by construction).
+            post("/maintenance/compact") {
+                call.respond(
+                    compaction.runOnce(
+                        call.maintenanceCatalog(),
+                        call.batchQuery(),
+                    ).toDto(),
+                )
+            }
+            // Metadata-only invariant scan (gaps.md B3, absorbing B4's
+            // density assertion). Read-only, MVCC snapshot, no locks.
+            post("/maintenance/verify") {
+                call.respond(verify.runOnce(call.maintenanceCatalog()).toDto())
+            }
+            // DR/export surface (gaps.md B5): specified in
+            // openapi/hoglake.yaml, 501 until built — the publications
+            // pattern, so clients get the documented contract instead of
+            // a bare 404 fall-through.
+            get("/export") {
+                call.respond(
+                    HttpStatusCode.NotImplemented,
+                    ApiErrorDto(
+                        error = "not_implemented",
+                        detail = "catalog export is specified but not yet implemented",
+                    ),
                 )
             }
         }

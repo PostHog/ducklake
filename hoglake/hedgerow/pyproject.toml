@@ -33,6 +33,14 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/hedgerow"]
 
+[tool.ruff.lint.per-file-ignores]
+# Default rule selection applies; src/ stays strict.
+"tests/**" = [
+    "PLC3002", # table-driven lambda-call test style is deliberate
+    "DTZ001",  # tests exercise naive datetimes on purpose
+    "BLE001",  # conftest server-probe catch is deliberate
+]
+
 [tool.pytest.ini_options]
 markers = [
     "integration: tests that require a live hoglake server (HOGLAKE_URL)",

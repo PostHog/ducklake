@@ -138,8 +138,10 @@ fun Application.installApiRoutes(
 
                 get("/snapshots") {
                     val after = call.longQuery("after") ?: 0L
+                    val before = call.longQuery("before")
                     val limit = (call.intQuery("limit") ?: 1000).coerceAtMost(10_000)
-                    val (page, hasMore) = catalogs.listSnapshots(call.catalog(), after, limit)
+                    val (page, hasMore) =
+                        catalogs.listSnapshots(call.catalog(), after, limit, before)
                     call.respond(SnapshotPageDto(page.map { it.toDto() }, hasMore))
                 }
 
@@ -153,6 +155,15 @@ fun Application.installApiRoutes(
                         call.respond(
                             catalogs.listOffsets(call.catalog(), call.consumer())
                                 .map { it.toDto() },
+                        )
+                    }
+                    get("/{tableUuid}") {
+                        call.respond(
+                            catalogs.getOffset(
+                                call.catalog(),
+                                call.consumer(),
+                                call.uuidPath("tableUuid"),
+                            ).toDto(),
                         )
                     }
                     put("/{tableUuid}") {

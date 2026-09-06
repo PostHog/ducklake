@@ -2,11 +2,10 @@
 
 import pyarrow as pa
 import pytest
+from fakes import col
 
 from hedgerow.config import ConfigError, FilterConfig
 from hedgerow.filtering import build_filter
-
-from fakes import col
 
 SRC = (
     col("id", "long", 1, 0, nullable=False),

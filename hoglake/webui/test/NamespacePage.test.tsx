@@ -92,6 +92,37 @@ describe("NamespacePage", () => {
     expect(alert).toHaveTextContent("unknown field ids in column_stats: [99]");
   });
 
+  it("rejects invalid table and column names client-side without a POST", async () => {
+    const fetchMock = mockFetch((url) =>
+      url === tablesUrl ? jsonResponse([]) : undefined,
+    );
+    renderApp("/catalogs/analytics/namespaces/events");
+    const user = userEvent.setup();
+
+    await screen.findByText("No tables in this namespace.");
+    await user.type(screen.getByLabelText("name"), "9bad-table");
+    await user.type(screen.getByLabelText("column 1 name"), "col.dotted");
+    expect(await screen.findByText(/table name:/)).toBeInTheDocument();
+    expect(await screen.findByText(/column 1:/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create table" })).toBeDisabled();
+
+    const posts = fetchMock.mock.calls.filter(
+      (c) => (c[1] as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posts).toHaveLength(0);
+
+    // Fixing the names clears the errors and re-enables the form.
+    await user.clear(screen.getByLabelText("name"));
+    await user.type(screen.getByLabelText("name"), "good_table");
+    await user.clear(screen.getByLabelText("column 1 name"));
+    await user.type(screen.getByLabelText("column 1 name"), "col_1");
+    expect(screen.queryByText(/table name:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/column 1:/)).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Create table" }),
+    ).toBeEnabled();
+  });
+
   it("surfaces a 404 when the namespace does not exist", async () => {
     mockFetch((url) =>
       url === tablesUrl ? jsonResponse(notFoundError, 404) : undefined,

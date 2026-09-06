@@ -3,27 +3,35 @@ package com.posthog.hoglake.hydrator
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.observability.Metrics
-import dev.hardwood.InputFile
-import dev.hardwood.metadata.FileMetaData
-import dev.hardwood.reader.ParquetFileReader
 import io.github.oshai.kotlinlogging.KotlinLogging
+import org.apache.parquet.hadoop.ParquetFileReader
+import org.apache.parquet.hadoop.metadata.ParquetMetadata
+import org.apache.parquet.io.InputFile
+import org.apache.parquet.io.SeekableInputStream
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.statement.Update
+import java.io.EOFException
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.sql.Types
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 /**
  * Async stats hydration for deferred-stats registrations (the
  * footer-shipping decision in ../README.md): files committed with
  * `stats_state = 'pending'` get their parquet footers read from the object
- * store, per-column statistics aggregated across row groups, bounds
- * encoded in Iceberg single-value form, and the row flipped to
- * `'provided'` — or `'failed'` when the object is missing/unparseable or
- * the registered record_count does not match the footer.
+ * store (parquet-java — the project's one parquet library), per-column
+ * statistics aggregated across row groups, bounds encoded in Iceberg
+ * single-value form, and the row flipped to `'provided'` — or `'failed'`
+ * when the object is missing/unparseable or the registered record_count
+ * does not match the footer.
+ *
+ * The footer read doubles as the field-id contract check: any primitive
+ * leaf without a `PARQUET:field_id` flags the row
+ * (`hog_data_file.missing_field_ids`) — such files bind columns by name,
+ * so AlterService refuses column renames while one is live, and
+ * CatalogMetrics gauges the flagged population
+ * (`hoglake_missing_field_id_files`).
  *
  * Footer-only: nothing here decodes data pages. When the registration
  * carried `footer_size`, only the object's tail is fetched (ranged GET);
@@ -86,59 +94,34 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
         return pending.size
     }
 
-    /**
-     * Background sweep loop on a daemon thread. [intervalMs] <= 0 returns a
-     * no-op handle (tests drive [runOnce] directly).
-     */
-    fun startLoop(intervalMs: Long): AutoCloseable {
-        if (intervalMs <= 0) return AutoCloseable { }
-        val running = AtomicBoolean(true)
-        val worker =
-            thread(name = "hoglake-hydrator", isDaemon = true) {
-                while (running.get()) {
-                    try {
-                        runOnce()
-                    } catch (e: Exception) {
-                        log.error(e) { "hydrator sweep failed" }
-                    }
-                    try {
-                        Thread.sleep(intervalMs)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        break
-                    }
-                }
-            }
-        return AutoCloseable {
-            running.set(false)
-            worker.interrupt()
-            worker.join(5_000)
-        }
-    }
-
     private fun hydrate(file: PendingFile) {
         val columns = liveColumns(file)
-        val meta = readFooter(file)
-        if (meta.numRows() != file.recordCount) {
+        val footer = readFooter(file)
+        // The field-id contract check rides the footer we already hold.
+        val missingFieldIds = FooterStats.missingFieldIds(footer.fileMetaData.schema)
+        val footerRows = footer.blocks.sumOf { it.rowCount }
+        if (footerRows != file.recordCount) {
             log.error {
                 "REGISTRATION MISMATCH for file ${file.dataFileId} (${file.path}): " +
-                    "parquet footer has ${meta.numRows()} rows but hog_data_file.record_count " +
+                    "parquet footer has $footerRows rows but hog_data_file.record_count " +
                     "is ${file.recordCount}; marking failed, writing no stats"
             }
-            markFailed(file)
+            markFailed(file, missingFieldIds)
             return
         }
-        val aggs = FooterStats.aggregate(meta, columns, file.path)
+        val aggs = FooterStats.aggregate(footer, columns, file.path)
         jdbi.useTransaction<Exception> { h ->
             for (agg in aggs) upsertStats(h, file, agg)
             val flipped =
                 h.createUpdate(
                     """
-                UPDATE hog_data_file SET stats_state = 'provided'
+                UPDATE hog_data_file
+                   SET stats_state = 'provided', missing_field_ids = :missingFieldIds
                 WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
                   AND stats_state = 'pending'
                 """,
                 )
+                    .bind("missingFieldIds", missingFieldIds)
                     .bind("catalogId", file.catalogId)
                     .bind("dataFileId", file.dataFileId)
                     .execute()
@@ -149,6 +132,12 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
             }
         }
         Metrics.statsHydrated("provided")
+        if (missingFieldIds) {
+            log.warn {
+                "file ${file.dataFileId} (${file.path}) has leaves without parquet field ids; " +
+                    "flagged missing_field_ids (column renames on its table are blocked while it is live)"
+            }
+        }
         log.debug { "hydrated file ${file.dataFileId} (${file.path}): ${aggs.size} column stats" }
     }
 
@@ -185,17 +174,33 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
             .execute()
     }
 
-    private fun markFailed(file: PendingFile) {
+    /**
+     * Flip to 'failed'; when the footer WAS parsed (record-count
+     * mismatch), [missingFieldIds] still records the contract check.
+     */
+    private fun markFailed(
+        file: PendingFile,
+        missingFieldIds: Boolean? = null,
+    ) {
         Metrics.statsHydrated("failed")
         try {
             jdbi.useHandle<Exception> { h ->
                 h.createUpdate(
                     """
-                    UPDATE hog_data_file SET stats_state = 'failed'
+                    UPDATE hog_data_file
+                       SET stats_state = 'failed',
+                           missing_field_ids = COALESCE(:missingFieldIds, missing_field_ids)
                     WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
                       AND stats_state = 'pending'
                     """,
                 )
+                    .apply {
+                        if (missingFieldIds == null) {
+                            bindNull("missingFieldIds", Types.BOOLEAN)
+                        } else {
+                            bind("missingFieldIds", missingFieldIds)
+                        }
+                    }
                     .bind("catalogId", file.catalogId)
                     .bind("dataFileId", file.dataFileId)
                     .execute()
@@ -234,11 +239,15 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
 
     // ---- footer fetch ------------------------------------------------------
 
-    private fun readFooter(file: PendingFile): FileMetaData {
+    private fun readFooter(file: PendingFile): ParquetMetadata {
         val footerSize = file.footerSize
         if (footerSize != null && footerSize > 0 && footerSize + FOOTER_SUFFIX < file.fileSizeBytes) {
             try {
-                return parseFooter(tailInput(file, footerSize))
+                val tailStart = file.fileSizeBytes - footerSize - FOOTER_SUFFIX
+                val tail = store.getTail(file.path, tailStart)
+                return parseFooter(
+                    RegionInputFile(file.fileSizeBytes, tailStart, tail, file.path),
+                )
             } catch (e: Exception) {
                 log.debug(e) {
                     "tail read of ${file.path} (footer_size=$footerSize) insufficient; " +
@@ -247,67 +256,110 @@ class Hydrator(private val jdbi: Jdbi, private val store: ObjectStore) {
             }
         }
         val bytes = store.get(file.path)
-        return parseFooter(InputFile.of(ByteBuffer.wrap(bytes)))
+        return parseFooter(RegionInputFile(bytes.size.toLong(), 0, bytes, file.path))
     }
 
-    private fun parseFooter(input: InputFile): FileMetaData = ParquetFileReader.open(input).use { it.fileMetaData }
-
-    private fun tailInput(
-        file: PendingFile,
-        footerSize: Long,
-    ): InputFile {
-        val tailStart = file.fileSizeBytes - footerSize - FOOTER_SUFFIX
-        val tail = store.getTail(file.path, tailStart)
-        // Hardwood validates the leading "PAR1" magic at open, so fetch the
-        // real prefix too (a second tiny ranged GET, never synthesized).
-        val prefix = store.getPrefix(file.path, MAGIC_LENGTH)
-        return TailInputFile(file.fileSizeBytes, prefix, tailStart, tail, file.path)
-    }
+    private fun parseFooter(input: InputFile): ParquetMetadata = ParquetFileReader.open(input).use { it.footer }
 
     /**
-     * An [InputFile] over a cached object prefix + tail: serves
-     * absolute-offset range reads that fall entirely inside either cached
-     * region, and refuses everything else so the caller can fall back to a
-     * whole-object read.
+     * A parquet-java [InputFile] over one cached byte region of the
+     * object (the footer tail, or the whole object): serves reads that
+     * fall entirely inside the region and refuses everything else with
+     * [IOException] so the caller can fall back to a whole-object read.
+     * The footer parse only touches the tail (footer length + magic,
+     * then the thrift footer), so a correct footer_size never leaves
+     * the region.
      */
-    private class TailInputFile(
+    private class RegionInputFile(
         private val totalLength: Long,
-        private val prefix: ByteArray,
-        private val tailStart: Long,
-        private val tail: ByteArray,
+        private val regionStart: Long,
+        private val region: ByteArray,
         private val uri: String,
     ) : InputFile {
-        override fun open() {}
+        override fun getLength(): Long = totalLength
 
-        override fun length(): Long = totalLength
+        override fun newStream(): SeekableInputStream = RegionStream()
 
-        override fun name(): String = uri
+        private inner class RegionStream : SeekableInputStream() {
+            private var pos = 0L
 
-        override fun close() {}
-
-        override fun readRange(
-            offset: Long,
-            length: Int,
-        ): ByteBuffer {
-            if (offset >= 0 && offset + length <= prefix.size) {
-                return ByteBuffer.wrap(prefix, Math.toIntExact(offset), length).slice()
+            private fun regionOffset(
+                offset: Long,
+                len: Int,
+            ): Int {
+                if (offset < regionStart || offset + len > regionStart + region.size) {
+                    throw IOException(
+                        "range [$offset, +$len) outside cached region " +
+                            "[$regionStart, ${regionStart + region.size}) of $uri",
+                    )
+                }
+                return Math.toIntExact(offset - regionStart)
             }
-            if (offset >= tailStart && offset + length <= tailStart + tail.size) {
-                return ByteBuffer.wrap(tail, Math.toIntExact(offset - tailStart), length).slice()
+
+            override fun getPos(): Long = pos
+
+            override fun seek(newPos: Long) {
+                pos = newPos
             }
-            throw IOException(
-                "range [$offset, +$length) outside cached prefix [0, ${prefix.size}) " +
-                    "and tail [$tailStart, ${tailStart + tail.size}) of $uri",
-            )
+
+            override fun read(): Int {
+                if (pos >= totalLength) return -1
+                val idx = regionOffset(pos, 1)
+                pos += 1
+                return region[idx].toInt() and 0xFF
+            }
+
+            override fun read(
+                b: ByteArray,
+                off: Int,
+                len: Int,
+            ): Int {
+                if (len == 0) return 0
+                if (pos >= totalLength) return -1
+                val n = Math.toIntExact(minOf(len.toLong(), totalLength - pos))
+                val idx = regionOffset(pos, n)
+                System.arraycopy(region, idx, b, off, n)
+                pos += n
+                return n
+            }
+
+            override fun readFully(bytes: ByteArray) = readFully(bytes, 0, bytes.size)
+
+            override fun readFully(
+                bytes: ByteArray,
+                start: Int,
+                len: Int,
+            ) {
+                if (pos + len > totalLength) throw EOFException("read past end of $uri")
+                val idx = regionOffset(pos, len)
+                System.arraycopy(region, idx, bytes, start, len)
+                pos += len
+            }
+
+            override fun read(buf: ByteBuffer): Int {
+                val len = buf.remaining()
+                if (len == 0) return 0
+                if (pos >= totalLength) return -1
+                val n = Math.toIntExact(minOf(len.toLong(), totalLength - pos))
+                val idx = regionOffset(pos, n)
+                buf.put(region, idx, n)
+                pos += n
+                return n
+            }
+
+            override fun readFully(buf: ByteBuffer) {
+                val len = buf.remaining()
+                if (pos + len > totalLength) throw EOFException("read past end of $uri")
+                val idx = regionOffset(pos, len)
+                buf.put(region, idx, len)
+                pos += len
+            }
         }
     }
 
     private companion object {
         /** 4-byte footer length + 4-byte "PAR1" magic at the end of the file. */
         const val FOOTER_SUFFIX = 8L
-
-        /** Leading "PAR1" magic. */
-        const val MAGIC_LENGTH = 4
     }
 }
 

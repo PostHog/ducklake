@@ -13,12 +13,15 @@ from __future__ import annotations
 import argparse
 
 from ..context import Bench
-from ..runner import FailureGuard, run_loop
+from ..runner import FailureGuard, InsufficientSamples, run_loop
 from ..stats import Metric, pearson
 from .common import (
+    MIN_GUARDED_SAMPLES,
+    THERMAL_WARM_OPS,
     ScenarioReport,
     check,
     make_bench_table,
+    require_samples,
     seed_snapshots,
 )
 
@@ -35,6 +38,9 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
             "windows": windows,
             "reps": args.reps,
             "offset_commits": args.offset_commits,
+            "warmup": THERMAL_WARM_OPS,
+            "duration": args.duration,
+            "url": args.url,
         },
     )
     catalog, table = make_bench_table(bench, "cf")
@@ -60,10 +66,18 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
                 f"(one appended per seeded snapshot)",
             )
 
-        # the ratio flag hangs off this p50: use a rep floor so a
-        # handful of ~1ms samples can't flip it on scheduler noise
-        loop = run_loop(op, ops=max(args.reps, 20), warmup=2, guard=guard)
+        # the ratio flag hangs off this p50: every stage gets the same
+        # fixed warm phase and must clear the guarded-sample floor
+        loop = run_loop(
+            op,
+            ops=max(args.reps, MIN_GUARDED_SAMPLES),
+            warmup=THERMAL_WARM_OPS,
+            guard=guard,
+        )
         check(loop.errors == 0, f"{loop.errors} failed changes() calls")
+        require_samples(
+            loop.recorder.count, f"changefeed fixed-window stage {stage}"
+        )
         m = report.add(
             Metric.from_recorder(
                 f"changes.fixed_w{w}.catalog{stage}", loop.recorder, loop.wall_s
@@ -90,24 +104,28 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
 
     # correlations: rows-vs-latency should be strong, catalog-vs-latency flat
     rows_corr = pearson([x for x, _ in window_lat], [y for _, y in window_lat])
-    catalog_ratio = (
-        fixed_p50[-1][1] / fixed_p50[0][1]
-        if len(fixed_p50) > 1 and fixed_p50[0][1] > 0
-        else 1.0
-    )
+    if len(fixed_p50) > 1:
+        if fixed_p50[0][1] <= 0:
+            raise InsufficientSamples(
+                "insufficient samples for a trustworthy ratio: first-stage "
+                f"fixed-window p50 is {fixed_p50[0][1]} ms — refusing to "
+                "divide by it"
+            )
+        catalog_ratio = fixed_p50[-1][1] / fixed_p50[0][1]
+    else:
+        catalog_ratio = 1.0
     catalog_corr = pearson(
         [float(s) for s, _ in fixed_p50], [p for _, p in fixed_p50]
     )
+    # corr fields are float-or-null in the JSONL, never a string
     report.add(
         Metric(
             name="changes.scaling",
             ops=0,
             wall_s=0.0,
             extra={
-                "rows_latency_corr": rows_corr if rows_corr is not None else "n/a",
-                "catalog_latency_corr": catalog_corr
-                if catalog_corr is not None
-                else "n/a",
+                "rows_latency_corr": rows_corr,
+                "catalog_latency_corr": catalog_corr,
                 "fixed_window_ratio": catalog_ratio,
             },
         )

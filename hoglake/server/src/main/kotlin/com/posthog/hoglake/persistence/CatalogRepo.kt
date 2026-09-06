@@ -16,6 +16,18 @@ data class SnapshotAlloc(val snapshotId: Long, val schemaVersion: Long)
  * callers own that discipline.
  */
 object CatalogRepo {
+    /**
+     * THE hog_catalog row mapping — options/expiry/cleanup read the
+     * lifecycle slice through the same mapper (the drifted
+     * OptionsService.LifecycleCatalog duplicate is gone). The column
+     * list lives in [HogSchemaColumns]; the mapper-coverage gate keeps
+     * it equal to the live schema.
+     */
+    private const val CATALOG_COLUMNS =
+        "catalog_id, name, data_path, last_snapshot_id, schema_version, " +
+            "earliest_snapshot_time, snapshot_retention_seconds, consumer_floor, " +
+            "earliest_snapshot_id"
+
     private val catalogMapper =
         RowMapper { rs, _ ->
             CatalogInfo(
@@ -24,6 +36,14 @@ object CatalogRepo {
                 dataPath = rs.getString("data_path"),
                 headSnapshotId = rs.getLong("last_snapshot_id"),
                 schemaVersion = rs.getLong("schema_version"),
+                earliestSnapshotTime =
+                    rs.getObject("earliest_snapshot_time", java.time.OffsetDateTime::class.java)
+                        ?.toInstant(),
+                snapshotRetentionSeconds =
+                    rs.getLong("snapshot_retention_seconds")
+                        .let { if (rs.wasNull()) null else it },
+                consumerFloor = rs.getBoolean("consumer_floor"),
+                earliestSnapshotId = rs.getLong("earliest_snapshot_id"),
             )
         }
 
@@ -42,7 +62,7 @@ object CatalogRepo {
                 """
                 INSERT INTO hog_catalog (name, data_path)
                 VALUES (:name, :dataPath)
-                RETURNING catalog_id, name, data_path, last_snapshot_id, schema_version
+                RETURNING $CATALOG_COLUMNS
                 """,
             )
                 .bind("name", name)
@@ -65,24 +85,20 @@ object CatalogRepo {
         handle: Handle,
         name: String,
     ): CatalogInfo? =
-        handle.createQuery(
-            """
-            SELECT catalog_id, name, data_path, last_snapshot_id, schema_version
-            FROM hog_catalog WHERE name = :name
-            """,
-        )
+        handle.createQuery("SELECT $CATALOG_COLUMNS FROM hog_catalog WHERE name = :name")
             .bind("name", name)
             .map(catalogMapper)
             .findOne()
             .orElse(null)
 
+    /** [findByName] or [HoglakeException.NotFound]. */
+    fun require(
+        handle: Handle,
+        name: String,
+    ): CatalogInfo = findByName(handle, name) ?: throw HoglakeException.NotFound("catalog '$name'")
+
     fun listAll(handle: Handle): List<CatalogInfo> =
-        handle.createQuery(
-            """
-            SELECT catalog_id, name, data_path, last_snapshot_id, schema_version
-            FROM hog_catalog ORDER BY name
-            """,
-        )
+        handle.createQuery("SELECT $CATALOG_COLUMNS FROM hog_catalog ORDER BY name")
             .map(catalogMapper)
             .list()
 

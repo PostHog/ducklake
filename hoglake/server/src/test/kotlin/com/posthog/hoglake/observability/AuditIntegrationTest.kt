@@ -23,6 +23,7 @@ import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import net.logstash.logback.encoder.LogstashEncoder
 import org.assertj.core.api.Assertions.assertThat
+import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Tag
@@ -182,12 +183,30 @@ class AuditIntegrationTest {
                 }
             assertThat(conflictLine["detail"].asText()).contains("concurrent DDL")
 
-            // -- expiry run ----------------------------------------------------
+            // -- expiry runs ---------------------------------------------------
+            // Zero-work sweep: NO audit event (app-log debug only) — the
+            // every-minute background no-op must not flood the stream.
+            val idleExpire = client.post("/v1/catalogs/$catalog/maintenance/expire")
+            assertThat(idleExpire.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(eventsFor("expiry").filter { it["catalog"].asText() == catalog }).isEmpty()
+
+            // A sweep that actually expires something still audits.
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute(
+                    "UPDATE hog_snapshot SET snapshot_time = now() - make_interval(secs => 3600) " +
+                        "WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = ?)",
+                    catalog,
+                )
+                h.execute(
+                    "UPDATE hog_catalog SET snapshot_retention_seconds = 60 WHERE name = ?",
+                    catalog,
+                )
+            }
             val expire = client.post("/v1/catalogs/$catalog/maintenance/expire")
             assertThat(expire.status).isEqualTo(HttpStatusCode.OK)
             val expiry = eventsFor("expiry").single { it["catalog"].asText() == catalog }
             assertThat(expiry["outcome"].asText()).isEqualTo("ok")
-            assertThat(expiry["detail"].asText()).contains("snapshots_expired=0")
+            assertThat(expiry["detail"].asText()).doesNotContain("snapshots_expired=0")
 
             // Every captured line already proved JSON-parseable via events();
             // spot-check the audit lines all carry the core fields.
@@ -196,6 +215,68 @@ class AuditIntegrationTest {
                 assertThat(line["outcome"].asText()).isNotBlank()
                 assertThat(line["actor"].asText()).isEqualTo("anonymous")
             }
+        }
+
+    @Test
+    fun `an unexpected mid-commit failure emits outcome=error and maps to 500`() =
+        api { client ->
+            val catalog = "haywire"
+            seed(client, catalog)
+            assertThat(
+                client.postJson(
+                    "/v1/catalogs/$catalog/namespaces/ns/tables",
+                    """{"name": "events", "columns": [{"name": "id", "type": "long"}]}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.Created)
+            // Sabotage: delete the hog_table_stats row so the commit tail
+            // hits its IllegalStateException — a genuine unexpected
+            // (non-Hoglake) failure mid-transaction.
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute(
+                    "DELETE FROM hog_table_stats WHERE catalog_id = " +
+                        "(SELECT catalog_id FROM hog_catalog WHERE name = ?)",
+                    catalog,
+                )
+            }
+            val boom =
+                client.postJson(
+                    "/v1/catalogs/$catalog/commit",
+                    """
+                {"appends": [{"namespace": "ns", "table": "events",
+                              "files": [{"path": "s3://hog/$catalog/x.parquet",
+                                         "record_count": 1, "file_size_bytes": 1}]}]}
+                """,
+                )
+            assertThat(boom.status).isEqualTo(HttpStatusCode.InternalServerError)
+            val line =
+                eventsFor("commit").single { it["catalog"].asText() == catalog }
+            assertThat(line["outcome"].asText()).isEqualTo("error")
+            assertThat(line["detail"].asText()).contains("hog_table_stats")
+        }
+
+    @Test
+    fun `a request id outside the allowlist is regenerated, a tame one passes through`() =
+        api { client ->
+            // Tab-bearing header: hostile for structured logs; the plugin
+            // regenerates instead of echoing it.
+            val hostile =
+                client.postJson(
+                    "/v1/catalogs",
+                    """{"name":"rid","data_path":"s3://x"}""",
+                    requestId = "evil\tid",
+                )
+            val echoed = hostile.headers["X-Request-Id"]
+            assertThat(echoed).isNotNull().isNotEqualTo("evil\tid")
+            assertThat(echoed).matches("[0-9a-f-]{36}") // generated UUID shape
+            // Tame id: passthrough (already covered above with req-42, but
+            // pin dots/underscores/hyphens explicitly).
+            val tame =
+                client.postJson(
+                    "/v1/catalogs",
+                    """{"name":"rid2","data_path":"s3://x"}""",
+                    requestId = "job-1.retry_2",
+                )
+            assertThat(tame.headers["X-Request-Id"]).isEqualTo("job-1.retry_2")
         }
 
     @Test

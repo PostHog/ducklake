@@ -19,7 +19,7 @@ log = logging.getLogger("hedgerow.metrics")
 class NullMetrics:
     """Metrics disabled: every hook is a no-op."""
 
-    def observe_cycle(self, result) -> None:  # noqa: ANN001
+    def observe_cycle(self, result) -> None:
         pass
 
     def observe_error(self) -> None:
@@ -65,7 +65,7 @@ class PrometheusMetrics:
             prom.start_http_server(port, registry=self._registry)
             log.info("metrics server listening on :%d", port)
 
-    def observe_cycle(self, result) -> None:  # noqa: ANN001
+    def observe_cycle(self, result) -> None:
         try:
             self.cycles_total.inc()
             self.rows_replicated_total.inc(result.rows_appended)

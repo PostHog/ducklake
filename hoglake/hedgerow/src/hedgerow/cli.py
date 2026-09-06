@@ -2,7 +2,8 @@
 
 Exit codes: 0 clean (only with ``--once``), 1 config error, and the
 per-halt codes from :mod:`hedgerow.halts` (3 incarnation, 4 expired
-feed, 5 deletes present, 6 schema mismatch) so supervisors can tell a
+feed, 5 deletes present, 6 schema mismatch, 7 split-brain offset,
+8 data integrity, 9 persistent failure) so supervisors can tell a
 crash-loopable failure from an operator-required HALT.
 """
 
@@ -29,7 +30,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", required=True, help="path to YAML config")
     parser.add_argument(
-        "--once", action="store_true",
+        "--once",
+        action="store_true",
         help="run a single replication cycle and exit (operational/debug)",
     )
     args = parser.parse_args(argv)

@@ -10,6 +10,7 @@ import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
+import java.util.UUID
 
 /**
  * The commit endpoint (README.md commit-protocol / commit-serialization
@@ -57,14 +58,25 @@ import org.jdbi.v3.core.Jdbi
  * append with no conflict window (only legal when the commit has no
  * deletes).
  */
-class CommitService(private val jdbi: Jdbi) {
-    private companion object {
+class CommitService(
+    private val jdbi: Jdbi,
+    /**
+     * lock_timeout for the commit transaction's advisory-lock wait
+     * (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS; B2 admission control). 0 =
+     * unbounded. Expiry surfaces as CommitQueueTimeout -> 503.
+     */
+    private val commitLockTimeoutMs: Long = DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
+) {
+    companion object {
+        /** Default commit admission bound: 30s (Config's default mirrors it). */
+        const val DEFAULT_COMMIT_LOCK_TIMEOUT_MS: Long = 30_000
+
         /**
          * Per-file record_count sanity cap (2^48 ≈ 281T rows). No real
          * parquet file gets anywhere close; the cap keeps a hostile
          * registration from racing the row-id allocator toward overflow.
          */
-        const val MAX_FILE_RECORD_COUNT: Long = 1L shl 48
+        private const val MAX_FILE_RECORD_COUNT: Long = 1L shl 48
     }
 
     /**
@@ -90,6 +102,20 @@ class CommitService(private val jdbi: Jdbi) {
                     catalog = catalog,
                     obj = null,
                     outcome = Audit.failureOutcome(e),
+                    detail = e.message,
+                )
+                throw e
+            } catch (e: Throwable) {
+                // An unexpected failure mid-commit (bug, dead pool, broken
+                // state) must still leave an audit trace and a counter tick
+                // before it becomes the API's 500 — silence here was the
+                // adversarial-review finding.
+                Metrics.commitRecorded(catalog, "error")
+                Audit.event(
+                    action = "commit",
+                    catalog = catalog,
+                    obj = null,
+                    outcome = "error",
                     detail = e.message,
                 )
                 throw e
@@ -136,7 +162,7 @@ class CommitService(private val jdbi: Jdbi) {
                 .mapTo(Long::class.java)
                 .findOne()
                 .orElseThrow { HoglakeException.NotFound("catalog '$catalogName'") }
-        Locks.acquireCatalogCommitLock(h, catalogId)
+        Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
 
         val (head, schemaVersion) =
             h.createQuery(
@@ -148,16 +174,26 @@ class CommitService(private val jdbi: Jdbi) {
 
         // 2. Merge duplicate (namespace, table) appends/deletes, preserving
         // request order (first occurrence for tables, concatenation for
-        // files), then resolve each to a live table at head.
+        // files), then resolve each to a live table at head. Every
+        // expected_table_uuid supplied for a table is collected and checked
+        // against the resolved incarnation — merged duplicates that
+        // disagree cannot both match, so a stale one still conflicts.
         val mergedAppends = LinkedHashMap<Pair<String, String>, MutableList<FileRegistration>>()
+        val expectedUuids = HashMap<Pair<String, String>, MutableSet<UUID>>()
         for (append in req.appends) {
             mergedAppends.getOrPut(append.namespace to append.table) { mutableListOf() }
                 .addAll(append.files)
+            append.expectedTableUuid?.let {
+                expectedUuids.getOrPut(append.namespace to append.table) { mutableSetOf() } += it
+            }
         }
         val mergedDeletes = LinkedHashMap<Pair<String, String>, MutableList<DeleteFileRegistration>>()
         for (deletes in req.deletes) {
             mergedDeletes.getOrPut(deletes.namespace to deletes.table) { mutableListOf() }
                 .addAll(deletes.files)
+            deletes.expectedTableUuid?.let {
+                expectedUuids.getOrPut(deletes.namespace to deletes.table) { mutableSetOf() } += it
+            }
         }
         if (mergedAppends.isEmpty() && mergedDeletes.isEmpty()) {
             throw HoglakeException.Validation("commit has no appends or deletes")
@@ -173,23 +209,38 @@ class CommitService(private val jdbi: Jdbi) {
                 "read_snapshot is required when the commit contains deletes",
             )
         }
+
+        fun resolveGuarded(key: Pair<String, String>): LiveTable {
+            val (namespace, table) = key
+            val live =
+                resolveLiveTable(h, catalogId, namespace, table)
+                    ?: throw HoglakeException.Validation("unknown table $namespace.$table")
+            for (expected in expectedUuids[key].orEmpty()) {
+                // The atomic incarnation guard: the name resolved, but to a
+                // different incarnation than the writer planned against —
+                // a drop+recreate happened. Retryable conflict, never a
+                // silent write into the wrong table.
+                if (expected != live.tableUuid) {
+                    throw HoglakeException.CommitConflict(
+                        "table '$namespace.$table' is uuid ${live.tableUuid}, " +
+                            "expected $expected: the table was recreated",
+                    )
+                }
+            }
+            return live
+        }
         val resolvedAppends =
             mergedAppends.map { (key, files) ->
                 val (namespace, table) = key
-                val tableId =
-                    resolveLiveTable(h, catalogId, namespace, table)
-                        ?: throw HoglakeException.Validation("unknown table $namespace.$table")
-                ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId))
+                val live = resolveGuarded(key)
+                ResolvedAppend(namespace, table, live.tableId, files, liveSpec(h, catalogId, live.tableId))
             }
         val appendTableIdByName =
             resolvedAppends.associate { (it.namespace to it.table) to it.tableId }
         val resolvedDeletes =
             mergedDeletes.map { (key, files) ->
                 val (namespace, table) = key
-                val tableId =
-                    appendTableIdByName[key]
-                        ?: resolveLiveTable(h, catalogId, namespace, table)
-                        ?: throw HoglakeException.Validation("unknown table $namespace.$table")
+                val tableId = appendTableIdByName[key] ?: resolveGuarded(key).tableId
                 ResolvedDeletes(namespace, table, tableId, files)
             }
 
@@ -568,16 +619,19 @@ class CommitService(private val jdbi: Jdbi) {
         insertBatch.execute()
     }
 
+    /** A live table's id + identity uuid (the incarnation the name currently binds to). */
+    private data class LiveTable(val tableId: Long, val tableUuid: UUID)
+
     /** A table is live iff its head version row is open and neither it nor its namespace is dropped. */
     private fun resolveLiveTable(
         h: Handle,
         catalogId: Long,
         namespace: String,
         table: String,
-    ): Long? =
+    ): LiveTable? =
         h.createQuery(
             """
-        SELECT tv.table_id
+        SELECT tv.table_id, t.table_uuid
           FROM hog_table_version tv
           JOIN hog_namespace ns
             ON ns.catalog_id = tv.catalog_id AND ns.namespace_id = tv.namespace_id
@@ -594,7 +648,7 @@ class CommitService(private val jdbi: Jdbi) {
             .bind("catalogId", catalogId)
             .bind("namespace", namespace)
             .bind("table", table)
-            .mapTo(Long::class.java)
+            .map { rs, _ -> LiveTable(rs.getLong(1), rs.getObject(2) as UUID) }
             .findOne()
             .orElse(null)
 

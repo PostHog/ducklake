@@ -42,7 +42,7 @@ describe("api client", () => {
     );
     expect(catalogs).toEqual(catalogsFixture);
     expect(catalogs[0].data_path).toBe("s3://hog-lake/analytics");
-    expect(catalogs[0].head_snapshot_id).toBe(4211);
+    expect(catalogs[0].head_snapshot_id).toBe("4211");
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
@@ -63,20 +63,43 @@ describe("api client", () => {
         return jsonResponse(tableFixture);
       return undefined;
     });
-    await getTable("analytics", "events", "pageviews", 4100);
-    await listFiles("analytics", "events", "pageviews", 4100);
-    await planScan("analytics", "events", "pageviews", 4100);
+    await getTable("analytics", "events", "pageviews", "4100");
+    await listFiles("analytics", "events", "pageviews", "4100");
+    await planScan("analytics", "events", "pageviews", "4100");
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("passes after/limit to the snapshots endpoint", async () => {
     const fetchMock = mockFetch(() => jsonResponse(snapshotsPage1));
-    const page = await listSnapshots("analytics", { after: 4208, limit: 50 });
+    const page = await listSnapshots("analytics", { after: "4208", limit: 50 });
     expect(fetchMock).toHaveBeenCalledWith(
       "/v1/catalogs/analytics/snapshots?after=4208&limit=50",
       expect.anything(),
     );
     expect(page.has_more).toBe(true);
+  });
+
+  it("passes before/limit for descending pagination", async () => {
+    const fetchMock = mockFetch(() => jsonResponse(snapshotsPage1));
+    await listSnapshots("analytics", { before: "4212", limit: 50 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/catalogs/analytics/snapshots?before=4212&limit=50",
+      expect.anything(),
+    );
+  });
+
+  it("refuses to combine before with a non-zero after (server 422)", async () => {
+    const fetchMock = mockFetch(() => jsonResponse(snapshotsPage1));
+    expect(() =>
+      listSnapshots("analytics", { before: "4212", after: "7" }),
+    ).toThrow(/mutually exclusive/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    // after=0 is the spec's "unset" — allowed alongside before.
+    await listSnapshots("analytics", { before: "4212", after: "0" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/catalogs/analytics/snapshots?after=0&before=4212",
+      expect.anything(),
+    );
   });
 
   it("POSTs snake_case request bodies untouched", async () => {

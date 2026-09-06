@@ -1,11 +1,10 @@
 """Projection / schema-diff logic (fail-fast, lesson #6)."""
 
 import pytest
+from fakes import col
 
 from hedgerow.halts import SchemaMismatchError
 from hedgerow.projection import validate_projection
-
-from fakes import col
 
 SRC = (
     col("id", "long", 1, 0, nullable=False),
@@ -73,7 +72,9 @@ def test_type_params_participate_in_type_identity():
 
 def test_nullability_narrowing_rejected():
     dest = (col("name", "string", 2, 0, nullable=False),)
-    with pytest.raises(SchemaMismatchError, match="nullable but destination is NOT NULL"):
+    with pytest.raises(
+        SchemaMismatchError, match="nullable but destination is NOT NULL"
+    ):
         validate_projection(SRC, dest)
 
 

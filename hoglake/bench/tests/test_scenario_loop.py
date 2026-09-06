@@ -2,12 +2,11 @@
 fake of the pyhoglake surface it uses — proves the measurement loop,
 invariant checks, ratio math, and results plumbing without a server."""
 
-import argparse
 import json
 
 import pytest
 
-from hoglake_bench.cli import QUICK_PROFILE, _namespace_for, build_parser
+from hoglake_bench.cli import _namespace_for, build_parser
 from hoglake_bench.context import Bench, BenchConfig
 from hoglake_bench.runner import InvariantViolation
 from hoglake_bench.scenarios import commit_throughput
@@ -116,8 +115,9 @@ def _args(**overrides):
         {
             "preseed_snapshots": [0, 50],
             "files_per_commit": [1, 10],
-            "ops": 10,
+            "ops": 25,  # >= MIN_GUARDED_SAMPLES
             "warmup": 1,
+            "tables": 0,  # the wide stage has its own tests
             **overrides,
         },
     )
@@ -135,7 +135,7 @@ class TestCommitThroughputLoop:
         assert any(n.startswith("commit.scaling.fpc") for n in names)
         for m in report.metrics:
             if m.name.startswith("commit.preseed"):
-                assert m.ops == 10  # warmup excluded
+                assert m.ops == 25  # warmup excluded
                 assert m.p50_ms is not None
 
     def test_ratio_metric_present_and_sane(self, tmp_path):

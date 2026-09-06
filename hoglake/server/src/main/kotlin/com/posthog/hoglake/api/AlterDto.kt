@@ -3,8 +3,12 @@ package com.posthog.hoglake.api
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NullOrder
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionSpec
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.Transform
 import io.ktor.server.plugins.BadRequestException
@@ -55,6 +59,40 @@ data class AlterPartitionSpecDto(
 
 fun PartitionSpec.toAlterDto() = AlterPartitionSpecDto(specId, fields.map { it.toAlterDto() })
 
+// ---- sort order ----------------------------------------------------------
+
+data class AlterSortFieldDto(
+    val sourceFieldId: Long,
+    val direction: String,
+    val nullOrder: String,
+) {
+    fun toModel() =
+        SortFieldDef(
+            sourceFieldId = sourceFieldId,
+            direction =
+                try {
+                    SortDirection.fromWire(direction)
+                } catch (_: IllegalArgumentException) {
+                    throw HoglakeException.Validation("unknown sort direction '$direction'")
+                },
+            nullOrder =
+                try {
+                    NullOrder.fromWire(nullOrder)
+                } catch (_: IllegalArgumentException) {
+                    throw HoglakeException.Validation("unknown null order '$nullOrder'")
+                },
+        )
+}
+
+fun SortFieldDef.toAlterDto() = AlterSortFieldDto(sourceFieldId, direction.wire, nullOrder.wire)
+
+data class AlterSortSpecDto(
+    val sortId: Long,
+    val fields: List<AlterSortFieldDto>,
+)
+
+fun SortSpec.toAlterDto() = AlterSortSpecDto(sortId, fields.map { it.toAlterDto() })
+
 // ---- request -------------------------------------------------------------
 
 /** One wire AlterOp, discriminated by `op`; unused fields stay null. */
@@ -66,6 +104,7 @@ data class AlterOpDto(
     val to: String? = null,
     val newName: String? = null,
     val fields: List<AlterPartitionFieldDto>? = null,
+    val sortFields: List<AlterSortFieldDto>? = null,
 ) {
     fun toModel(): AlterOp =
         when (op) {
@@ -77,6 +116,8 @@ data class AlterOpDto(
             "rename_table" -> AlterOp.RenameTable(required(newName, "new_name"))
             "set_partition_spec" ->
                 AlterOp.SetPartitionSpec(required(fields, "fields").map { it.toModel() })
+            "set_sort_order" ->
+                AlterOp.SetSortOrder(required(sortFields, "sort_fields").map { it.toModel() })
             else -> throw BadRequestException("unknown alter op '$op'")
         }
 
@@ -97,7 +138,7 @@ data class AlterTableRequestDto(val ops: List<AlterOpDto> = emptyList())
 
 // ---- response ------------------------------------------------------------
 
-/** The spec's Table schema including partition_spec (null = unpartitioned). */
+/** The spec's Table schema including partition_spec / sort_spec (null = unpartitioned/unsorted). */
 data class AlteredTableDto(
     val name: String,
     val namespace: String,
@@ -107,6 +148,7 @@ data class AlteredTableDto(
     val fileCount: Long,
     val fileSizeBytes: Long,
     val partitionSpec: AlterPartitionSpecDto? = null,
+    val sortSpec: AlterSortSpecDto? = null,
 )
 
 fun TableInfo.toAlteredDto() =
@@ -119,4 +161,5 @@ fun TableInfo.toAlteredDto() =
         fileCount = fileCount,
         fileSizeBytes = fileSizeBytes,
         partitionSpec = partitionSpec?.toAlterDto(),
+        sortSpec = sortSpec?.toAlterDto(),
     )

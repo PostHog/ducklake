@@ -1,5 +1,6 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ExpiryResult
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Audit
@@ -11,8 +12,6 @@ import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 /**
  * Consumer-aware, incremental snapshot expiry (README.md §6). One sweep
@@ -48,49 +47,100 @@ import kotlin.concurrent.thread
  * stats and partition values). Delete-vector rows go FIRST, including
  * live DVs whose data file is expiring — deleting the data-file row
  * would cascade them away un-queued, orphaning the object.
+ *
+ * A fifth step applies the same reachability rule to the accumulating
+ * versioned DDL tables (hog_table_version, hog_column,
+ * hog_partition_spec, hog_sort_spec, hog_view): rows with
+ * end_snapshot <= newEarliest are invisible at every retained snapshot
+ * and are deleted — DDL churn no longer grows them without bound. The
+ * floor advance also captures the new floor snapshot's snapshot_time
+ * into hog_catalog.earliest_snapshot_time (the reconciliation anchor
+ * that 410s cite once the snapshot rows below the floor are gone).
  */
 class ExpiryService(private val jdbi: Jdbi) {
     private val log = KotlinLogging.logger {}
 
+    private companion object {
+        /**
+         * The end-snapshotted-but-never-deleted versioned tables (DDL
+         * churn grows them without bound); sweep step 5 deletes their
+         * below-floor corpses. Table names are a fixed compile-time
+         * vocabulary, never derived from input (invariant 9 intact).
+         */
+        val VERSIONED_RETENTION_TABLES =
+            listOf(
+                "hog_table_version",
+                "hog_column",
+                "hog_partition_spec",
+                "hog_sort_spec",
+                "hog_view",
+            )
+    }
+
     /**
      * One expiry sweep for [catalog], expiring at most [batchSize]
      * snapshots. The audit event and the expired-snapshots counter are
-     * emitted here, AFTER the sweep transaction has committed.
+     * emitted here, AFTER the sweep transaction has committed — and a
+     * ZERO-WORK sweep (nothing expired or queued, no consumer floor in
+     * play) emits no audit event at all, only an app-log debug line:
+     * every-minute background no-ops must not flood the audit stream.
      */
     fun runOnce(
         catalog: String,
         batchSize: Int,
-    ): ExpiryResult =
-        Audit.audited(
-            "expiry",
-            catalog,
-            null,
-            detail = { r ->
-                "snapshots_expired=${r.snapshotsExpired} data_files_queued=${r.dataFilesQueued} " +
-                    "delete_files_queued=${r.deleteFilesQueued} " +
-                    "new_earliest=${r.newEarliestSnapshotId}" +
-                    (r.flooredByConsumer?.let { " floored_by_consumer=$it" } ?: "")
-            },
-        ) {
-            if (batchSize <= 0) {
-                throw HoglakeException.Validation("batch size must be positive (got $batchSize)")
-            }
-            val result =
+    ): ExpiryResult {
+        val result =
+            try {
+                if (batchSize <= 0) {
+                    throw HoglakeException.Validation("batch size must be positive (got $batchSize)")
+                }
                 jdbi.inTransactionUnchecked { h ->
-                    val pre = LifecycleCatalog.require(h, catalog)
+                    val pre = CatalogRepo.require(h, catalog)
                     Locks.acquireCatalogCommitLock(h, pre.catalogId)
                     // Re-read under the lock: head/options may have moved while
                     // we queued behind a committer.
-                    val cat = LifecycleCatalog.require(h, catalog)
+                    val cat = CatalogRepo.require(h, catalog)
                     sweep(h, cat, batchSize)
                 }
-            Metrics.snapshotsExpired(catalog, result.snapshotsExpired)
-            result
+            } catch (e: Throwable) {
+                Audit.event("expiry", catalog, null, Audit.failureOutcome(e), e.message)
+                throw e
+            }
+        // The floored-by page-worthy warn lives HERE, outside the sweep
+        // transaction (and outside the advisory lock): the data is already
+        // in the result, and log I/O must never ride the commit tail.
+        result.flooredByConsumer?.let { consumer ->
+            log.warn {
+                "expiry for catalog '$catalog' floored by consumer '$consumer' " +
+                    "(earliest stays at ${result.newEarliestSnapshotId})"
+            }
         }
+        Metrics.snapshotsExpired(catalog, result.snapshotsExpired)
+        val zeroWork =
+            result.snapshotsExpired == 0L && result.dataFilesQueued == 0L &&
+                result.deleteFilesQueued == 0L && result.flooredByConsumer == null
+        if (zeroWork) {
+            log.debug { "expiry sweep for catalog '$catalog': nothing to do" }
+        } else {
+            Audit.event(
+                "expiry",
+                catalog,
+                null,
+                outcome = "ok",
+                detail =
+                    "snapshots_expired=${result.snapshotsExpired} " +
+                        "data_files_queued=${result.dataFilesQueued} " +
+                        "delete_files_queued=${result.deleteFilesQueued} " +
+                        "new_earliest=${result.newEarliestSnapshotId}" +
+                        (result.flooredByConsumer?.let { " floored_by_consumer=$it" } ?: ""),
+            )
+        }
+        return result
+    }
 
     private fun sweep(
         h: Handle,
-        cat: LifecycleCatalog,
+        cat: CatalogInfo,
         batchSize: Int,
     ): ExpiryResult {
         val retention =
@@ -150,12 +200,8 @@ class ExpiryService(private val jdbi: Jdbi) {
             minOffset
                 ?.takeIf { it.second < unfloored && unfloored > cat.earliestSnapshotId }
                 ?.first
-        if (flooredBy != null) {
-            log.warn {
-                "expiry for catalog '${cat.name}' floored by consumer '$flooredBy' at " +
-                    "snapshot ${minOffset!!.second} (time/head/batch would have allowed $unfloored)"
-            }
-        }
+        // NOTE: no logging in here — this runs inside the sweep transaction
+        // under the catalog commit lock; runOnce warns AFTER commit.
         if (newEarliest <= cat.earliestSnapshotId) {
             return ExpiryResult(0, 0, 0, cat.earliestSnapshotId, flooredBy)
         }
@@ -218,13 +264,49 @@ class ExpiryService(private val jdbi: Jdbi) {
                 .bind("newEarliest", newEarliest)
                 .execute()
 
-        // 4) Advance the floor.
+        // 4) Advance the floor, capturing the new floor snapshot's time in
+        // the SAME update: that snapshot survives this sweep (only ids
+        // BELOW newEarliest were deleted) but a later sweep will kill it,
+        // and 410 reconciliation needs "the floor was reached at T" after
+        // the times below it are gone.
         h.createUpdate(
-            "UPDATE hog_catalog SET earliest_snapshot_id = :newEarliest WHERE catalog_id = :catalogId",
+            """
+            UPDATE hog_catalog
+               SET earliest_snapshot_id = :newEarliest,
+                   earliest_snapshot_time =
+                       (SELECT snapshot_time FROM hog_snapshot
+                         WHERE catalog_id = :catalogId AND snapshot_id = :newEarliest)
+             WHERE catalog_id = :catalogId
+            """,
         )
             .bind("newEarliest", newEarliest)
             .bind("catalogId", cat.catalogId)
             .execute()
+
+        // 5) Versioned-row retention for the accumulating DDL tables.
+        // Correctness: a versioned row with end_snapshot = E is visible at
+        // S iff S < E (visibility rule: begin <= S AND (end IS NULL OR
+        // S < end)); every retained snapshot satisfies S >= newEarliest;
+        // so E <= newEarliest means NO retained snapshot can see the row —
+        // it is unreachable by any valid read (head reads see only
+        // end IS NULL rows) and can be deleted outright. Live rows
+        // (end IS NULL) and rows ending above the floor are untouched, so
+        // time travel at every S >= newEarliest is unchanged. Child tables
+        // (hog_partition_field, hog_sort_field) follow their spec headers
+        // via FK ON DELETE CASCADE. Incremental like the steps above: the
+        // range is bounded by newEarliest, which batchSize caps per sweep.
+        for (table in VERSIONED_RETENTION_TABLES) {
+            h.createUpdate(
+                """
+                DELETE FROM $table
+                WHERE catalog_id = :catalogId
+                  AND end_snapshot IS NOT NULL AND end_snapshot <= :newEarliest
+                """,
+            )
+                .bind("catalogId", cat.catalogId)
+                .bind("newEarliest", newEarliest)
+                .execute()
+        }
 
         return ExpiryResult(
             snapshotsExpired = snapshotsExpired.toLong(),
@@ -236,8 +318,9 @@ class ExpiryService(private val jdbi: Jdbi) {
     }
 
     /**
-     * One sweep across every catalog, for the background loop. Catalogs
-     * are isolated: one catalog's failure is logged and the rest proceed.
+     * One sweep across every catalog, for the background loop
+     * (BackgroundLoops in App.kt). Catalogs are isolated: one catalog's
+     * failure is logged and the rest proceed.
      */
     fun runOnceAllCatalogs(batchSize: Int): List<Pair<String, ExpiryResult>> {
         val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }
@@ -250,38 +333,5 @@ class ExpiryService(private val jdbi: Jdbi) {
             }
         }
         return results
-    }
-
-    /**
-     * Background sweep loop on a daemon thread (Hydrator.startLoop
-     * pattern). [intervalMs] <= 0 returns a no-op handle.
-     */
-    fun startLoop(
-        intervalMs: Long,
-        batchSize: Int,
-    ): AutoCloseable {
-        if (intervalMs <= 0) return AutoCloseable { }
-        val running = AtomicBoolean(true)
-        val worker =
-            thread(name = "hoglake-expiry", isDaemon = true) {
-                while (running.get()) {
-                    try {
-                        runOnceAllCatalogs(batchSize)
-                    } catch (e: Exception) {
-                        log.error(e) { "expiry sweep failed" }
-                    }
-                    try {
-                        Thread.sleep(intervalMs)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        break
-                    }
-                }
-            }
-        return AutoCloseable {
-            running.set(false)
-            worker.interrupt()
-            worker.join(5_000)
-        }
     }
 }

@@ -11,7 +11,7 @@ def _server_reachable() -> bool:
     try:
         r = httpx.get(HOGLAKE_URL.rstrip("/") + "/healthz", timeout=3.0)
         return r.status_code == 200
-    except Exception:
+    except Exception:  # noqa: BLE001 - any failure means "not reachable"
         return False
 
 

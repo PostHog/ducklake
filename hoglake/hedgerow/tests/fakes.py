@@ -11,12 +11,13 @@ sees in production.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field as dc_field
-from datetime import datetime, timezone
-from typing import Any, Iterator, Sequence
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from dataclasses import field as dc_field
+from datetime import UTC, datetime
+from typing import Any
 
 import pyarrow as pa
-
 from pyhoglake import (
     ChangesPlan,
     Column,
@@ -25,6 +26,7 @@ from pyhoglake import (
     DataFile,
     DeleteFile,
     ExpiredError,
+    IncarnationChangedError,
     NotFoundError,
 )
 
@@ -47,7 +49,9 @@ def col(
     )
 
 
-def data_file(path: str, record_count: int, begin_snapshot: int, file_id: int = 0) -> DataFile:
+def data_file(
+    path: str, record_count: int, begin_snapshot: int, file_id: int = 0
+) -> DataFile:
     return DataFile(
         data_file_id=file_id,
         path=path,
@@ -82,13 +86,17 @@ class FakeSourceTable:
     columns: tuple[Column, ...]
     # (begin_snapshot -> list[DataFile]) appended in that snapshot
     files_by_snapshot: dict[int, list[DataFile]] = dc_field(default_factory=dict)
-    delete_files_by_snapshot: dict[int, list[DeleteFile]] = dc_field(default_factory=dict)
+    delete_files_by_snapshot: dict[int, list[DeleteFile]] = dc_field(
+        default_factory=dict
+    )
     calls: list = dc_field(default_factory=list)
     expired_below: int = 0  # changes(from < expired_below) -> 410
     # if set, changes() reports this uuid in the plan (recreate-mid-flight)
     plan_uuid_override: str | None = None
 
-    def changes(self, from_snapshot: int, to_snapshot: int | None = None) -> ChangesPlan:
+    def changes(
+        self, from_snapshot: int, to_snapshot: int | None = None
+    ) -> ChangesPlan:
         self.calls.append(("changes", from_snapshot, to_snapshot))
         if from_snapshot < self.expired_below:
             raise ExpiredError(
@@ -99,8 +107,10 @@ class FakeSourceTable:
                     f"{self.expired_below}; reconcile from a full scan"
                 ),
             )
-        hi = to_snapshot if to_snapshot is not None else max(
-            [0, *self.files_by_snapshot, *self.delete_files_by_snapshot]
+        hi = (
+            to_snapshot
+            if to_snapshot is not None
+            else max([0, *self.files_by_snapshot, *self.delete_files_by_snapshot])
         )
         files = [
             f
@@ -137,6 +147,18 @@ class FakeDestTable:
         self._append_calls += 1
         if self.fail_on_append_call == self._append_calls:
             raise CrashRequested("crash injected during append")
+        # Mimic the SERVER-side atomic commit guard: expected_table_uuid
+        # rides the commit body, and the server 409s the whole commit —
+        # zero writes — when the live table's uuid differs. pyhoglake
+        # maps that 409 ("the table was recreated") to
+        # IncarnationChangedError, which is what the daemon sees.
+        expected = kwargs.get("expected_table_uuid")
+        if expected is not None and str(expected) != self.table_uuid:
+            raise IncarnationChangedError(
+                f"commit_conflict: the table was recreated — expected "
+                f"table_uuid {expected}, live table is {self.table_uuid}",
+                status_code=409,
+            )
         self.calls.append(("append", data.num_rows))
         self.appended.append(data)
         self._next_snapshot += 1
@@ -181,8 +203,21 @@ class FakeCatalog:
     def refresh(self) -> _Head:
         return _Head(head_snapshot_id=self.head_snapshot_id)
 
+    def offset(self, consumer_id: str, table_uuid: str) -> ConsumerOffset | None:
+        """Single-offset GET (pyhoglake Catalog.offset): the stored
+        offset for exactly (consumer, table_uuid), None when absent."""
+        snap = self.offsets_store.get((consumer_id, table_uuid))
+        if snap is None:
+            return None
+        return ConsumerOffset(
+            consumer_id=consumer_id,
+            table_uuid=table_uuid,
+            committed_snapshot=snap,
+            updated_at=datetime.now(UTC),
+        )
+
     def offsets(self, consumer_id: str) -> list[ConsumerOffset]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return [
             ConsumerOffset(
                 consumer_id=c, table_uuid=u, committed_snapshot=s, updated_at=now
@@ -203,7 +238,7 @@ class FakeCatalog:
             consumer_id=consumer_id,
             table_uuid=table_uuid,
             committed_snapshot=snapshot_id,
-            updated_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(UTC),
         )
 
 
@@ -227,7 +262,6 @@ def table_batch_reader(tables_by_path: dict[str, pa.Table]):
         path: str, columns: Sequence[str], batch_size: int
     ) -> Iterator[pa.RecordBatch]:
         table = tables_by_path[path].select(list(columns))
-        for batch in table.to_batches(max_chunksize=batch_size):
-            yield batch
+        yield from table.to_batches(max_chunksize=batch_size)
 
     return read

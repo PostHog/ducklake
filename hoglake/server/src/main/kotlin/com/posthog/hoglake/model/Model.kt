@@ -56,6 +56,7 @@ enum class ChangeKind {
     TABLE_ALTERED,
     TABLE_INSERTED_INTO,
     TABLE_DELETED_FROM,
+    TABLE_COMPACTED,
     VIEW_CREATED,
     VIEW_DROPPED,
     ;
@@ -96,6 +97,47 @@ data class PartitionSpec(
     val fields: List<PartitionFieldDef>,
 )
 
+/** Sort direction for one sort-spec field (hog_sort_field.direction). */
+enum class SortDirection {
+    ASC,
+    DESC,
+    ;
+
+    val wire: String get() = name.lowercase()
+
+    companion object {
+        fun fromWire(s: String) = valueOf(s.uppercase())
+    }
+}
+
+/** Null placement for one sort-spec field (hog_sort_field.null_order). */
+enum class NullOrder {
+    NULLS_FIRST,
+    NULLS_LAST,
+    ;
+
+    val wire: String get() = name.lowercase()
+
+    companion object {
+        fun fromWire(s: String) = valueOf(s.uppercase())
+    }
+}
+
+data class SortFieldDef(
+    val sourceFieldId: Long,
+    val direction: SortDirection,
+    val nullOrder: NullOrder,
+)
+
+/**
+ * A table's versioned sort order. ADVISORY for writers (the server
+ * never verifies file sortedness); BINDING for compaction rewrites.
+ */
+data class SortSpec(
+    val sortId: Long,
+    val fields: List<SortFieldDef>,
+)
+
 /** Widening promotions the ALTER path permits (Iceberg-compatible set). */
 fun ColType.canPromoteTo(target: ColType): Boolean =
     when (this) {
@@ -118,6 +160,9 @@ sealed class AlterOp {
 
     /** Replace the partition spec (empty list = unpartitioned). */
     data class SetPartitionSpec(val fields: List<PartitionFieldDef>) : AlterOp()
+
+    /** Replace the sort order (empty list = unsorted). */
+    data class SetSortOrder(val fields: List<SortFieldDef>) : AlterOp()
 }
 
 data class CatalogInfo(
@@ -126,6 +171,22 @@ data class CatalogInfo(
     val dataPath: String,
     val headSnapshotId: Long,
     val schemaVersion: Long,
+    /**
+     * snapshot_time of the expiry floor snapshot, captured when the
+     * sweep advanced the floor; null until expiry first advances it.
+     * The reconciliation anchor: 410s below the floor cite this.
+     */
+    val earliestSnapshotTime: Instant? = null,
+    /**
+     * The lifecycle slice starts here (options/expiry/cleanup read it):
+     * one hog_catalog row mapping serves every reader — the
+     * OptionsService.LifecycleCatalog duplicate that drifted behind this
+     * mapper is gone. null = snapshot expiry disabled.
+     */
+    val snapshotRetentionSeconds: Long? = null,
+    /** Expiry never passes the min consumer offset when true. */
+    val consumerFloor: Boolean = true,
+    val earliestSnapshotId: Long = 0,
 )
 
 data class NamespaceInfo(
@@ -157,6 +218,8 @@ data class TableInfo(
     val fileSizeBytes: Long,
     /** Live partition spec; null = unpartitioned. */
     val partitionSpec: PartitionSpec? = null,
+    /** Live sort order; null = unsorted. */
+    val sortSpec: SortSpec? = null,
 )
 
 data class Snapshot(
@@ -170,7 +233,8 @@ data class Snapshot(
 
 data class SnapshotChange(
     val kind: ChangeKind,
-    val objectId: Long?,
+    /** table_id, namespace_id, or view_id — every change kind names an object. */
+    val objectId: Long,
 )
 
 data class DataFile(
@@ -187,6 +251,13 @@ data class DataFile(
     val specId: Long? = null,
     /** Transformed partition values by key_index; null when unpartitioned. */
     val partitionValues: List<String?>? = null,
+    /**
+     * True for compaction outputs: row ids ride an explicit physical
+     * `_hog_row_id` column (reserved parquet field id 2147483646) because
+     * merged inputs need not be row-id-contiguous. When true,
+     * row_id_start is min(input row ids) and has no positional meaning.
+     */
+    val explicitRowIds: Boolean = false,
 )
 
 /** A registered deletion-vector file (one live DV per data file). */
@@ -246,6 +317,14 @@ data class TableAppend(
     val namespace: String,
     val table: String,
     val files: List<FileRegistration>,
+    /**
+     * Optional incarnation guard: when present, the commit fails with
+     * CommitConflict if the live table resolved by name does not carry
+     * this table_uuid — the atomic answer to the name-rebind race where
+     * a table is dropped and recreated between a replicator's read and
+     * its commit.
+     */
+    val expectedTableUuid: UUID? = null,
 )
 
 /** One deletion-vector registration: supersedes the file's live DV. */
@@ -260,6 +339,8 @@ data class TableDeletes(
     val namespace: String,
     val table: String,
     val files: List<DeleteFileRegistration>,
+    /** Optional incarnation guard; see [TableAppend.expectedTableUuid]. */
+    val expectedTableUuid: UUID? = null,
 )
 
 data class CommitRequest(
@@ -310,6 +391,42 @@ data class ExpiryResult(
     val flooredByConsumer: String?,
 )
 
+/** One compaction run's outcome (POST /maintenance/compact + the loop). */
+data class CompactionResult(
+    val groupsCompacted: Long,
+    val filesIn: Long,
+    val filesOut: Long,
+    val bytesIn: Long,
+    val bytesOut: Long,
+    /**
+     * Groups planned but aborted at commit time because an input file
+     * was no longer live or had gained a DV since planning — resolved
+     * by re-planning on the next run, never by blocking foreground.
+     */
+    val skippedConflicts: Long,
+)
+
+/**
+ * One invariant check inside a verify run (POST /maintenance/verify).
+ * [violations] is the TRUE count; [samples] is capped detail
+ * (VerifyService.MAX_SAMPLES) so a badly broken catalog cannot produce
+ * an unbounded response.
+ */
+data class VerifyCheck(
+    val check: String,
+    val status: String,
+    val violations: Long,
+    val samples: List<String>,
+)
+
+/** One verify run's report: per-check status + overall rollup. */
+data class VerifyReport(
+    val catalog: String,
+    /** "pass" iff every check passed. */
+    val status: String,
+    val checks: List<VerifyCheck>,
+)
+
 /** One cleanup drain's outcome. */
 data class CleanupResult(
     val removed: Long,
@@ -342,4 +459,20 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
 
     /** Requested range fell below the catalog's expiry floor -> HTTP 410. */
     class Expired(detail: String) : HoglakeException(detail)
+
+    /**
+     * The commit transaction's lock_timeout expired while queuing on the
+     * per-catalog advisory commit lock (B2 admission control) -> HTTP
+     * 503 `commit_queue_timeout` with Retry-After. Retryable
+     * backpressure — the catalog is convoyed, not broken.
+     */
+    class CommitQueueTimeout(detail: String) : HoglakeException(detail)
+
+    /**
+     * A column rename was refused because live data files without
+     * parquet field ids exist (`hog_data_file.missing_field_ids`):
+     * id-less files bind columns by name, so the rename would silently
+     * NULL their history in readers -> HTTP 409.
+     */
+    class IdlessFilesPresent(detail: String) : HoglakeException(detail)
 }

@@ -88,12 +88,8 @@ def test_stats_across_multiple_row_groups():
     assert s_day.upper_bound == encode_bound("date", date(2026, 1, 28))
 
     s_ts = stats[5]
-    assert s_ts.lower_bound == encode_bound(
-        "timestamp", datetime(2026, 1, 1, 0, 0, 0)
-    )
-    assert s_ts.upper_bound == encode_bound(
-        "timestamp", datetime(2026, 1, 1, 0, 0, 59)
-    )
+    assert s_ts.lower_bound == encode_bound("timestamp", datetime(2026, 1, 1, 0, 0, 0))
+    assert s_ts.upper_bound == encode_bound("timestamp", datetime(2026, 1, 1, 0, 0, 59))
 
     s_amount = stats[6]
     assert s_amount.lower_bound == b"\x00"  # unscaled 0
@@ -117,9 +113,7 @@ def test_all_null_row_group_does_not_suppress_bounds():
     columns = (Column(name="x", type="long", field_id=1, ordinal=0),)
     schema = columns_to_arrow_schema(columns)
     # first row group all null, second has values
-    table = pa.table(
-        {"x": pa.array([None, None, 5, 9], pa.int64())}, schema=schema
-    )
+    table = pa.table({"x": pa.array([None, None, 5, 9], pa.int64())}, schema=schema)
     meta = _write(table, row_group_size=2)
     assert meta.num_row_groups == 2
     (s,) = extract_column_stats(meta, columns)

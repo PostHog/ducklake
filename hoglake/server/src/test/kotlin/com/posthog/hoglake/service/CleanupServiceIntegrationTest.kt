@@ -97,10 +97,44 @@ class CleanupServiceIntegrationTest {
 
     private fun putObject(path: String) = objects.put(path, "bytes".toByteArray())
 
+    /** Paths still awaiting drain (soft-deleted ledger rows excluded). */
     private fun queuedPaths(catalogId: Long): List<String> =
         jdbi.withHandleUnchecked { h ->
-            h.createQuery("SELECT path FROM hog_file_removal WHERE catalog_id = ? ORDER BY removal_id")
+            h.createQuery(
+                "SELECT path FROM hog_file_removal " +
+                    "WHERE catalog_id = ? AND drained_at IS NULL ORDER BY removal_id",
+            )
                 .bind(0, catalogId).mapTo(String::class.java).list()
+        }
+
+    private data class LedgerRow(
+        val path: String,
+        val attempts: Int,
+        val lastAttemptAt: java.time.OffsetDateTime?,
+        val drainedAt: java.time.OffsetDateTime?,
+        val drainedOutcome: String?,
+    )
+
+    /** Every ledger row (drained or not), in queue order. */
+    private fun ledgerRows(catalogId: Long): List<LedgerRow> =
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT path, attempts, last_attempt_at, drained_at, drained_outcome
+                FROM hog_file_removal WHERE catalog_id = ? ORDER BY removal_id
+                """,
+            )
+                .bind(0, catalogId)
+                .map { rs, _ ->
+                    LedgerRow(
+                        path = rs.getString("path"),
+                        attempts = rs.getInt("attempts"),
+                        lastAttemptAt = rs.getObject("last_attempt_at", java.time.OffsetDateTime::class.java),
+                        drainedAt = rs.getObject("drained_at", java.time.OffsetDateTime::class.java),
+                        drainedOutcome = rs.getString("drained_outcome"),
+                    )
+                }
+                .list()
         }
 
     // ---- tests -------------------------------------------------------------
@@ -120,10 +154,20 @@ class CleanupServiceIntegrationTest {
         assertThat(result.stillReferenced).isEqualTo(0)
         assertThat(queuedPaths(catalogId)).isEmpty()
         paths.forEach { assertThat(removals.exists(it)).isFalse() }
+
+        // Soft-delete: the rows SURVIVE as the ledger, marked drained.
+        val ledger = ledgerRows(catalogId)
+        assertThat(ledger).hasSize(3)
+        for (row in ledger) {
+            assertThat(row.drainedAt).isNotNull()
+            assertThat(row.drainedOutcome).isEqualTo("deleted")
+            assertThat(row.lastAttemptAt).isNotNull()
+            assertThat(row.attempts).isEqualTo(0) // settled first touch: no failed attempts
+        }
     }
 
     @Test
-    fun `missing object counts as missing and drains its queue row`() {
+    fun `missing object counts as missing and drains its queue row as absent`() {
         val catalogId = seedCatalog("cl-missing")
         queue(catalogId, "s3://$BUCKET/cl-missing/never-existed.parquet")
 
@@ -132,6 +176,9 @@ class CleanupServiceIntegrationTest {
         assertThat(result.missing).isEqualTo(1)
         assertThat(result.stillReferenced).isEqualTo(0)
         assertThat(queuedPaths(catalogId)).isEmpty()
+        val row = ledgerRows(catalogId).single()
+        assertThat(row.drainedAt).isNotNull()
+        assertThat(row.drainedOutcome).isEqualTo("absent")
     }
 
     @Test
@@ -175,6 +222,48 @@ class CleanupServiceIntegrationTest {
         assertThat(removals.exists(dataPath)).isTrue()
         assertThat(removals.exists(dvPath)).isTrue()
         assertThat(queuedPaths(catalogId)).containsExactly(dataPath, dvPath)
+        // Each skip recorded an attempt; a second run records another.
+        for (row in ledgerRows(catalogId)) {
+            assertThat(row.attempts).isEqualTo(1)
+            assertThat(row.lastAttemptAt).isNotNull()
+            assertThat(row.drainedAt).isNull()
+        }
+        svc.runOnce("cl-live", batchSize = 100)
+        assertThat(ledgerRows(catalogId).map { it.attempts }).containsOnly(2)
+    }
+
+    @Test
+    fun `purge removes only drained rows older than the ledger retention`() {
+        val catalogId = seedCatalog("cl-purge")
+        // Three ledger states: an OLD drained row (past retention), a fresh
+        // drained row, and an undrained entry (whose object is absent, so
+        // this run drains it as 'absent').
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason, drained_at, drained_outcome) " +
+                    "VALUES (?, 's3://$BUCKET/cl-purge/old-drained', 'data', 'snapshot_expiry', " +
+                    "now() - interval '2 hours', 'deleted')",
+                catalogId,
+            )
+            h.execute(
+                "INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason, drained_at, drained_outcome) " +
+                    "VALUES (?, 's3://$BUCKET/cl-purge/fresh-drained', 'data', 'snapshot_expiry', " +
+                    "now(), 'absent')",
+                catalogId,
+            )
+        }
+        queue(catalogId, "s3://$BUCKET/cl-purge/pending")
+
+        // Retention of one hour: only the 2-hours-old drained row purges.
+        val shortRetention = CleanupService(jdbi, removals, ledgerRetentionSeconds = 3600)
+        val result = shortRetention.runOnce("cl-purge", batchSize = 100)
+        assertThat(result.missing).isEqualTo(1) // the pending entry drained as absent
+
+        val paths = ledgerRows(catalogId).map { it.path }
+        assertThat(paths).containsExactlyInAnyOrder(
+            "s3://$BUCKET/cl-purge/fresh-drained",
+            "s3://$BUCKET/cl-purge/pending",
+        )
     }
 
     @Test
@@ -235,6 +324,10 @@ class CleanupServiceIntegrationTest {
         assertThat(result.stillReferenced).isEqualTo(0)
         assertThat(removals.exists(good)).isFalse()
         assertThat(queuedPaths(catalogId)).containsExactly("file:///not-s3")
+        // The transient failure recorded an attempt on the surviving entry.
+        val badRow = ledgerRows(catalogId).single { it.path == "file:///not-s3" }
+        assertThat(badRow.attempts).isEqualTo(1)
+        assertThat(badRow.drainedAt).isNull()
     }
 
     @Test
@@ -265,8 +358,8 @@ class CleanupServiceIntegrationTest {
 
     @Test
     fun `background loop drains all catalogs and a non-positive interval is a no-op`() {
-        svc.startLoop(0, 100).close()
-        svc.startLoop(-1, 100).close()
+        com.posthog.hoglake.BackgroundLoops().use { it.register("cleanup", 0) { svc.runOnceAllCatalogs(100) } }
+        com.posthog.hoglake.BackgroundLoops().use { it.register("cleanup", -1) { svc.runOnceAllCatalogs(100) } }
 
         val idA = seedCatalog("cl-loop-a")
         val idB = seedCatalog("cl-loop-b")
@@ -277,7 +370,8 @@ class CleanupServiceIntegrationTest {
         putObject(pathB)
         queue(idB, pathB)
 
-        svc.startLoop(50, 100).use {
+        com.posthog.hoglake.BackgroundLoops().use { loops ->
+            loops.register("cleanup", 50) { svc.runOnceAllCatalogs(100) }
             await().atMost(Duration.ofSeconds(30)).untilAsserted {
                 assertThat(queuedPaths(idA)).isEmpty()
                 assertThat(queuedPaths(idB)).isEmpty()
@@ -285,6 +379,99 @@ class CleanupServiceIntegrationTest {
         }
         assertThat(removals.exists(pathA)).isFalse()
         assertThat(removals.exists(pathB)).isFalse()
+    }
+
+    /** Captures audit-logger events; assertions read the structured kv args. */
+    private class AuditCapture : ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent>() {
+        val events = java.util.concurrent.CopyOnWriteArrayList<ch.qos.logback.classic.spi.ILoggingEvent>()
+
+        override fun append(event: ch.qos.logback.classic.spi.ILoggingEvent) {
+            events += event
+        }
+
+        fun lines(): List<String> = events.map { e -> e.argumentArray.orEmpty().joinToString(" ") { it.toString() } }
+    }
+
+    private fun <T> withAuditCapture(block: (AuditCapture) -> T): T {
+        val ctx = org.slf4j.LoggerFactory.getILoggerFactory() as ch.qos.logback.classic.LoggerContext
+        val capture = AuditCapture().apply { context = ctx }
+        capture.start()
+        val logger =
+            org.slf4j.LoggerFactory.getLogger(com.posthog.hoglake.observability.Audit.LOGGER_NAME)
+                as ch.qos.logback.classic.Logger
+        logger.addAppender(capture)
+        try {
+            return block(capture)
+        } finally {
+            logger.detachAppender(capture)
+            capture.stop()
+        }
+    }
+
+    @Test
+    fun `audit trail - per-path file_deleted and cleanup_violation events, silence when idle`() {
+        val catalogId = seedCatalog("cl-audit")
+        // One referenced path (violation) + two deletable ones.
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (?, 1, 0)",
+                catalogId,
+            )
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start)
+                VALUES (?, 1, 1, 1, 's3://$BUCKET/cl-audit/live.parquet', 10, 100, 0)
+                """,
+                catalogId,
+            )
+        }
+        val live = "s3://$BUCKET/cl-audit/live.parquet"
+        val dead1 = "s3://$BUCKET/cl-audit/dead1.parquet"
+        val dead2 = "s3://$BUCKET/cl-audit/dead2.parquet"
+        for (p in listOf(live, dead1, dead2)) {
+            putObject(p)
+            queue(catalogId, p)
+        }
+
+        withAuditCapture { capture ->
+            val result = svc.runOnce("cl-audit", batchSize = 100)
+            assertThat(result.removed).isEqualTo(2)
+            assertThat(result.stillReferenced).isEqualTo(1)
+            val lines = capture.lines()
+            // One file_deleted event per physically removed object, keyed
+            // by path.
+            for (p in listOf(dead1, dead2)) {
+                assertThat(lines)
+                    .describedAs("file_deleted event for %s", p)
+                    .anySatisfy {
+                        assertThat(it).contains("action=file_deleted").contains("object=$p")
+                    }
+            }
+            // The invariant violation names its path too.
+            assertThat(lines).anySatisfy {
+                assertThat(it)
+                    .contains("action=cleanup_violation")
+                    .contains("outcome=invariant_violation")
+                    .contains("object=$live")
+            }
+            // Summary event flags the violation.
+            assertThat(lines).anySatisfy {
+                assertThat(it).contains("action=cleanup").contains("outcome=invariant_violation")
+            }
+        }
+
+        // Zero-work drain (only the still-referenced entry remains — and it
+        // still counts as work): drain a catalog with an EMPTY queue and
+        // expect audit silence.
+        seedCatalog("cl-audit-idle")
+        withAuditCapture { capture ->
+            val idle = svc.runOnce("cl-audit-idle", batchSize = 100)
+            assertThat(idle).isEqualTo(com.posthog.hoglake.model.CleanupResult(0, 0, 0))
+            assertThat(capture.lines())
+                .describedAs("zero-work drain stays out of the audit stream")
+                .noneSatisfy { assertThat(it).contains("action=cleanup") }
+        }
     }
 
     @Test

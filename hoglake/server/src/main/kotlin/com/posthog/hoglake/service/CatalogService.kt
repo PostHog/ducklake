@@ -20,6 +20,7 @@ import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.OffsetRepo
 import com.posthog.hoglake.persistence.SnapshotRepo
+import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TimeTravelRepo
@@ -71,7 +72,7 @@ class CatalogService(private val jdbi: Jdbi) {
             catalog,
             name,
         ) {
-            if (name.isBlank()) throw HoglakeException.Validation("namespace name must not be blank")
+            Identifiers.validate("namespace", name)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
                 Locks.acquireCatalogCommitLock(h, cat.catalogId)
@@ -121,10 +122,11 @@ class CatalogService(private val jdbi: Jdbi) {
             "$namespace.$name",
             detail = { "columns=${columns.size}" },
         ) {
-            if (name.isBlank()) throw HoglakeException.Validation("table name must not be blank")
+            Identifiers.validate("table", name)
             if (columns.isEmpty()) {
                 throw HoglakeException.Validation("table '$name' must have at least one column")
             }
+            columns.forEach { Identifiers.validate("column", it.name) }
             val dupes = columns.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
             if (dupes.isNotEmpty()) {
                 throw HoglakeException.Validation("duplicate column names: ${dupes.sorted()}")
@@ -229,9 +231,10 @@ class CatalogService(private val jdbi: Jdbi) {
                 recordCount = agg.recordCount,
                 fileCount = agg.fileCount,
                 fileSizeBytes = agg.fileSizeBytes,
-                // The spec visible at the requested snapshot (null =
-                // unpartitioned there); listTables deliberately skips it.
+                // The specs visible at the requested snapshot (null =
+                // unpartitioned/unsorted there); listTables skips both.
                 partitionSpec = SpecRepo.specAt(h, cat.catalogId, t.tableId, at),
+                sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at),
             )
         }
 
@@ -311,11 +314,12 @@ class CatalogService(private val jdbi: Jdbi) {
                     "from_snapshot $fromSnapshot is beyond to_snapshot $to",
                 )
             }
-            val earliest = TimeTravelRepo.earliestSnapshotId(h, cat.catalogId)
-            if (fromSnapshot < earliest - 1) {
+            val floor = TimeTravelRepo.expiryFloor(h, cat.catalogId)
+            if (fromSnapshot < floor.earliestSnapshotId - 1) {
                 throw HoglakeException.Expired(
                     "from_snapshot $fromSnapshot reaches below the expiry floor " +
-                        "(earliest retained snapshot is $earliest): part of the range is " +
+                        "(earliest retained snapshot is ${floor.earliestSnapshotId}" +
+                        "${floor.reachedAtSuffix()}): part of the range is " +
                         "gone; reconcile by re-reading from a full scan at a retained " +
                         "snapshot instead of consuming this feed",
                 )
@@ -345,27 +349,46 @@ class CatalogService(private val jdbi: Jdbi) {
     // ---- snapshots -------------------------------------------------------
 
     /**
-     * One page of snapshots with id > [after] (changes populated),
-     * plus whether more pages exist.
+     * One page of snapshots (changes populated), plus whether more pages
+     * exist. Two mutually exclusive cursors:
+     *
+     *  - [after] (default): ids > after, ascending — the original feed.
+     *  - [before] non-null: ids < before, DESCENDING — a UI walks
+     *    newest-first starting at head + 1 and pages down with the last
+     *    id of each page. Supplying [before] alongside a non-zero
+     *    [after] is a Validation (422).
      */
     fun listSnapshots(
         catalog: String,
         after: Long,
         limit: Int,
+        before: Long? = null,
     ): Pair<List<Snapshot>, Boolean> {
         if (limit < 1) throw HoglakeException.Validation("limit must be >= 1, got $limit")
+        if (before != null && after != 0L) {
+            throw HoglakeException.Validation(
+                "'before' and a non-zero 'after' are mutually exclusive; supply at most one cursor",
+            )
+        }
         return jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
-            val raw = SnapshotRepo.page(h, cat.catalogId, after, limit + 1)
+            val raw =
+                if (before != null) {
+                    SnapshotRepo.pageBefore(h, cat.catalogId, before, limit + 1)
+                } else {
+                    SnapshotRepo.page(h, cat.catalogId, after, limit + 1)
+                }
             val hasMore = raw.size > limit
             val page = raw.take(limit)
             if (page.isEmpty()) return@withHandleUnchecked Pair(emptyList(), false)
+            // The page is contiguous in either direction; changesFor takes
+            // the range low-to-high.
             val changes =
                 SnapshotRepo.changesFor(
                     h,
                     cat.catalogId,
-                    page.first().snapshotId,
-                    page.last().snapshotId,
+                    minOf(page.first().snapshotId, page.last().snapshotId),
+                    maxOf(page.first().snapshotId, page.last().snapshotId),
                 )
             Pair(
                 page.map { it.copy(changes = changes[it.snapshotId] ?: emptyList()) },
@@ -429,6 +452,21 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             OffsetRepo.list(h, cat.catalogId, consumerId)
+        }
+
+    /** One (consumer, table_uuid) offset; no stored row -> NotFound (404). */
+    fun getOffset(
+        catalog: String,
+        consumerId: String,
+        tableUuid: java.util.UUID,
+    ): ConsumerOffset =
+        jdbi.withHandleUnchecked { h ->
+            val cat = requireCatalog(h, catalog)
+            OffsetRepo.find(h, cat.catalogId, consumerId, tableUuid)
+                ?: throw HoglakeException.NotFound(
+                    "no offset for consumer '$consumerId' on table $tableUuid " +
+                        "in catalog '$catalog'",
+                )
         }
 
     // ---- time travel -----------------------------------------------------
@@ -513,11 +551,12 @@ class CatalogService(private val jdbi: Jdbi) {
         }
         val at = resolveSnapshot(cat, snapshot)
         if (snapshot != null) {
-            val earliest = TimeTravelRepo.earliestSnapshotId(h, cat.catalogId)
-            if (at < earliest) {
+            val floor = TimeTravelRepo.expiryFloor(h, cat.catalogId)
+            if (at < floor.earliestSnapshotId) {
                 throw HoglakeException.Expired(
                     "snapshot $at is below the expiry floor (earliest retained snapshot " +
-                        "is $earliest) for catalog '${cat.name}'",
+                        "is ${floor.earliestSnapshotId}${floor.reachedAtSuffix()}) " +
+                        "for catalog '${cat.name}'",
                 )
             }
         }

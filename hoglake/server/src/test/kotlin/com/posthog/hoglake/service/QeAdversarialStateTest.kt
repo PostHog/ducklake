@@ -74,45 +74,78 @@ class QeAdversarialStateTest {
     // ---- hostile namespace/table/column identifiers -----------------------
 
     @Test
-    fun `injection unicode and 10KB names round-trip and the catalog survives`() {
+    fun `injection unicode slash and 10KB names are 422 at every DDL surface`() {
+        // POLICY CHANGE (2026-09-05, confirmed consequential by two
+        // reviews): namespace/table/view/column names are now validated
+        // against ^[A-Za-z_][A-Za-z0-9_-]{0,127}$ (service Validation +
+        // DB CHECKs). This test previously pinned VERBATIM STORAGE of
+        // these hostile names; it now pins their rejection — and that
+        // the catalog survives every attempt untouched.
         val cat = "adv-names"
         catalogs.createCatalog(cat, "s3://qe/$cat")
-        val injection = "'); DROP TABLE hog_catalog;--"
-        val unicode = "таблица_🦔_ライブ"
-        val huge = "n".repeat(10_240)
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val headBefore = catalogs.getCatalog(cat).headSnapshotId
 
-        catalogs.createNamespace(cat, injection)
-        for (name in listOf(injection, unicode, huge)) {
-            val created =
-                catalogs.createTable(
-                    cat,
-                    injection,
-                    name,
-                    listOf(ColumnDef(name, ColType.STRING)),
-                )
-            assertThat(created.name).isEqualTo(name)
-            assertThat(created.columns.single().def.name).isEqualTo(name)
-            val fetched = catalogs.getTable(cat, injection, name)
-            assertThat(fetched.tableUuid).isEqualTo(created.tableUuid)
-            assertThat(fetched.columns.single().def.name).isEqualTo(name)
+        val hostile =
+            listOf(
+                "'); DROP TABLE hog_catalog;--",
+                "таблица_🦔_ライブ",
+                "n".repeat(10_240),
+                "a/b",
+                "<script>alert(1)</script>",
+                "a b",
+                "a.b",
+                "1leading-digit",
+                "-leading-hyphen",
+                "",
+            )
+        for (name in hostile) {
+            assertThatThrownBy { catalogs.createNamespace(cat, name) }
+                .describedAs("namespace name %s", name.take(32))
+                .isInstanceOf(HoglakeException.Validation::class.java)
+            assertThatThrownBy {
+                catalogs.createTable(cat, "ns", name, listOf(ColumnDef("id", ColType.LONG)))
+            }.describedAs("table name %s", name.take(32))
+                .isInstanceOf(HoglakeException.Validation::class.java)
+            assertThatThrownBy {
+                catalogs.createTable(cat, "ns", "ok", listOf(ColumnDef(name, ColType.LONG)))
+            }.describedAs("column name %s", name.take(32))
+                .isInstanceOf(HoglakeException.Validation::class.java)
+            assertThatThrownBy { views.create(cat, "ns", name, "SELECT 1") }
+                .describedAs("view name %s", name.take(32))
+                .isInstanceOf(HoglakeException.Validation::class.java)
+            // ALTER rename surfaces enforce the same policy.
+            assertThatThrownBy {
+                alters.alterTable(cat, "ns", "t", listOf(AlterOp.RenameTable(name)))
+            }.isInstanceOf(HoglakeException.Validation::class.java)
+            assertThatThrownBy {
+                alters.alterTable(cat, "ns", "t", listOf(AlterOp.RenameColumn("id", name)))
+            }.isInstanceOf(HoglakeException.Validation::class.java)
+            assertThatThrownBy {
+                alters.alterTable(cat, "ns", "t", listOf(AlterOp.AddColumn(ColumnDef(name, ColType.INT))))
+            }.isInstanceOf(HoglakeException.Validation::class.java)
         }
-        // Parameterization proof: hog_catalog is intact and the names are
-        // stored verbatim, not interpreted.
+
+        // Boundary: exactly 128 chars is legal, 129 is not; underscore
+        // start and mixed case are legal.
+        val ok128 = "_" + "A".repeat(127)
+        assertThat(catalogs.createTable(cat, "ns", ok128, listOf(ColumnDef("Id_9-x", ColType.LONG))).name)
+            .isEqualTo(ok128)
+        assertThatThrownBy {
+            catalogs.createTable(cat, "ns", "_" + "A".repeat(128), listOf(ColumnDef("id", ColType.LONG)))
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+
+        // The catalog itself survived every attempt, and no rejected DDL
+        // minted a snapshot (the ok128 create minted exactly one).
         db.jdbi.withHandleUnchecked { h ->
             val tables =
                 h.createQuery(
                     "SELECT count(*) FROM information_schema.tables WHERE table_name = 'hog_catalog'",
                 ).mapTo(Long::class.java).one()
             assertThat(tables).isEqualTo(1)
-            val stored =
-                h.createQuery(
-                    "SELECT name FROM hog_namespace WHERE name = ?",
-                ).bind(0, injection).mapTo(String::class.java).one()
-            assertThat(stored).isEqualTo(injection)
         }
-        // Views take the same identifiers.
-        val v = views.create(cat, injection, injection, "SELECT 1 -- $injection")
-        assertThat(views.get(cat, injection, injection).viewUuid).isEqualTo(v.viewUuid)
+        assertThat(catalogs.getCatalog(cat).headSnapshotId).isEqualTo(headBefore + 1)
     }
 
     @Test

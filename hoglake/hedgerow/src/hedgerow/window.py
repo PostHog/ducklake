@@ -25,9 +25,7 @@ class Window:
         return self.to_snapshot < self.head_snapshot
 
 
-def plan_window(
-    committed: int, head: int, max_snapshot_window: int
-) -> Window | None:
+def plan_window(committed: int, head: int, max_snapshot_window: int) -> Window | None:
     """The next window after ``committed`` given catalog ``head``, or
     None when fully caught up (nothing to do this cycle)."""
     if max_snapshot_window < 1:

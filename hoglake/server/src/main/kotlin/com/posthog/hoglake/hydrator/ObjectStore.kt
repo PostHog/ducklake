@@ -65,15 +65,6 @@ class ObjectStore(
         return getRange(pathUri, "bytes=$startInclusive-")
     }
 
-    /** Ranged read of the object's first [length] bytes. */
-    fun getPrefix(
-        pathUri: String,
-        length: Int,
-    ): ByteArray {
-        require(length > 0) { "non-positive prefix length $length for $pathUri" }
-        return getRange(pathUri, "bytes=0-${length - 1}")
-    }
-
     private fun getRange(
         pathUri: String,
         range: String,

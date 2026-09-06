@@ -104,6 +104,66 @@ class AlterServiceIntegrationTest {
     }
 
     @Test
+    fun `rename column is refused while a live id-less data file exists`() {
+        val (cat, ns) = fixture()
+        val tableId = catalogs.getTable(cat, ns, "t").tableId
+        // A LIVE file flagged missing_field_ids: it binds columns by name,
+        // so a rename would silently NULL its history in readers.
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start, missing_field_ids)
+                VALUES (?, 1, ?, 2, 's3://bucket/idless.parquet', 10, 100, 0, true)
+                """,
+                catId(cat),
+                tableId,
+            )
+        }
+        assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
+        }
+            .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+            .hasMessageContaining("1 live data file(s)")
+            .hasMessageContaining("field ids")
+        // The refused request minted nothing: head unchanged, column intact.
+        assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name }).contains("name")
+
+        // RenameTable is unaffected — table binding rides table_uuid.
+        alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameTable("t_renamed")))
+        assertThat(catalogs.getTable(cat, ns, "t_renamed").tableId).isEqualTo(tableId)
+
+        // Once the flagged file is retired (end-snapshotted), rename works.
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_data_file SET end_snapshot = 4 WHERE catalog_id = ? AND data_file_id = 1",
+                catId(cat),
+            )
+        }
+        val info = alter.alterTable(cat, ns, "t_renamed", listOf(AlterOp.RenameColumn("name", "label")))
+        assertThat(info.columns.map { it.def.name }).contains("label")
+    }
+
+    @Test
+    fun `rename column ignores flagged files that are not live`() {
+        val (cat, ns) = fixture()
+        val tableId = catalogs.getTable(cat, ns, "t").tableId
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    end_snapshot, path, record_count, file_size_bytes, row_id_start, missing_field_ids)
+                VALUES (?, 1, ?, 2, 3, 's3://bucket/idless-historical.parquet', 10, 100, 0, true)
+                """,
+                catId(cat),
+                tableId,
+            )
+        }
+        val info = alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
+        assertThat(info.columns.map { it.def.name }).contains("label")
+    }
+
+    @Test
     fun `promote int to long and float to double`() {
         val (cat, ns) = fixture()
         val before = head(cat)

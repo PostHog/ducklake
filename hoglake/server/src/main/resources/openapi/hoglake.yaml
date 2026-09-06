@@ -85,7 +85,9 @@ paths:
               type: object
               required: [name]
               properties:
-                name: { type: string }
+                name:
+                  type: string
+                  pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
       responses:
         "201":
           description: Created
@@ -93,6 +95,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Namespace" }
         "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Name fails the identifier pattern.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}/namespaces/{namespace}:
     get:
@@ -186,7 +193,8 @@ paths:
       summary: >
         Schema evolution as one DDL commit: typed ops applied atomically
         in order (add/drop/rename/promote column, rename table, set
-        partition spec). Produces a snapshot with a table_altered change.
+        partition spec, set sort order). Produces a snapshot with a
+        table_altered change.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -210,7 +218,18 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Table" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "409":
+          description: >
+            Conflict. rename_column additionally fails with error
+            `idless_files_present` while any LIVE data file of the table
+            is flagged missing_field_ids (its parquet schema carries no
+            field ids): such files bind columns by name, so the rename
+            would silently NULL their history in readers. Rewrite
+            (compact) or retire the id-less files first. rename_table is
+            unaffected.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "422":
           description: Invalid op (unknown column, illegal promotion,
             duplicate name, bad spec)
@@ -359,6 +378,58 @@ paths:
               schema: { $ref: "#/components/schemas/ExpiryResult" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /catalogs/{catalog}/maintenance/compact:
+    post:
+      operationId: runCompaction
+      summary: >
+        Run one compaction sweep now (the background loop calls the same
+        path; batch = groups rewritten this run, default 1 — tiny bites
+        by construction). Merges live small files (same partition spec +
+        values, no live deletion vector) into one file per group whose
+        rows carry their hoglake row ids in an explicit _hog_row_id
+        column (data_file.explicit_row_ids), sorted by the table's live
+        sort order when one exists. Inputs are end-snapshotted (time
+        travel keeps them; expiry reclaims them later); compacted
+        outputs never appear in the changefeed.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/maintenanceBatch" }
+      responses:
+        "200":
+          description: Sweep result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CompactionResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/maintenance/verify:
+    post:
+      operationId: runVerify
+      summary: >
+        Metadata-only invariant scan, on demand: the QE suite's global
+        invariants promoted to a production endpoint. Read-only (one
+        REPEATABLE READ MVCC snapshot, no catalog lock — never blocks
+        writers). Checks row-id tiling (no positional overlap;
+        compaction outputs with explicit_row_ids are exempt by design),
+        deletion-vector uniqueness/monotonicity/bounds, orphaned live
+        child rows on dropped tables, still-referenced removal-queue
+        entries, true snapshot density (count(*) equals
+        head - earliest + 1), and next_row_id allocator consistency.
+        NOT covered: the field-id contract for inline-stats files
+        (needs S3 footer reads; out of scope for a metadata-only scan).
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+      responses:
+        "200":
+          description: >
+            Verification report. status "pass" only when every check
+            passed; per-check violation counts with sample details
+            capped at 20 per check.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VerifyReport" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /catalogs/{catalog}/maintenance/cleanup:
     post:
       operationId: runCleanup
@@ -406,7 +477,9 @@ paths:
               type: object
               required: [name, sql]
               properties:
-                name: { type: string }
+                name:
+                  type: string
+                  pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
                 sql: { type: string }
                 dialect: { type: string, default: trino }
       responses:
@@ -459,8 +532,16 @@ paths:
         - { $ref: "#/components/parameters/catalog" }
         - name: after
           in: query
-          description: Return snapshots with id > after
+          description: Return snapshots with id > after, ascending.
           schema: { type: integer, format: int64, default: 0 }
+        - name: before
+          in: query
+          description: >
+            Return snapshots with id < before, DESCENDING (newest
+            first): a UI walks from head + 1 and pages down with the
+            last id of each page. Mutually exclusive with a non-zero
+            `after` (422 if both cursors are supplied).
+          schema: { type: integer, format: int64 }
         - name: limit
           in: query
           schema: { type: integer, default: 1000, maximum: 10000 }
@@ -471,6 +552,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/SnapshotPage" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: Both `before` and a non-zero `after` supplied.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}/commit:
     post:
@@ -502,6 +588,21 @@ paths:
         "422":
           description: Validation failure (unknown table, bad stats shape,
             unknown field ids)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "503":
+          description: >
+            Commit admission timed out: the commit transaction's
+            lock_timeout (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS, default 30s,
+            0 disables) expired while queuing on the per-catalog commit
+            lock. Error code `commit_queue_timeout`. Explicit, retryable
+            backpressure — never a generic 500; back off per the
+            Retry-After header and retry the identical commit.
+          headers:
+            Retry-After:
+              description: Seconds to back off before retrying.
+              schema: { type: integer }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -571,6 +672,31 @@ paths:
         "204": { description: Removed (its consumer offset is released) }
         "501": { $ref: "#/components/responses/NotImplemented" }
 
+  # ---- DR / export (SPECIFIED, NOT YET IMPLEMENTED: returns 501) ----
+  # The consistent-export half of the DR story (README "PITR + consistent
+  # export"): one response proving what the object store must contain for
+  # the catalog to be whole. Everything is read at ONE snapshot (head at
+  # request time), so a PITR-restored catalog can be diffed against the
+  # bucket: every listed path must exist; anything else is orphaned.
+  /catalogs/{catalog}/export:
+    get:
+      operationId: exportCatalog
+      summary: >
+        Consistent catalog export manifest: the snapshot range
+        (earliest..head, with the floor time), the live-file manifest
+        (data files + live deletion vectors per table, read at head),
+        and every consumer offset. JSON in v1; an Arrow variant may
+        follow.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      responses:
+        "200":
+          description: Export manifest, consistent at head_snapshot_id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExportManifest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "501": { $ref: "#/components/responses/NotImplemented" }
+
   /catalogs/{catalog}/consumers/{consumer}/offsets:
     get:
       operationId: listConsumerOffsets
@@ -588,6 +714,23 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
 
   /catalogs/{catalog}/consumers/{consumer}/offsets/{tableUuid}:
+    get:
+      operationId: getConsumerOffset
+      summary: One (consumer, table_uuid) offset; 404 when none is stored.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/consumer" }
+        - name: tableUuid
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Stored offset
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsumerOffset" }
+        "404": { $ref: "#/components/responses/NotFound" }
     put:
       operationId: commitConsumerOffset
       summary: >
@@ -664,7 +807,8 @@ components:
       in: query
       required: false
       description: Per-run bound override (expire default 10000
-        snapshots, cleanup default 2000 queue entries).
+        snapshots, cleanup default 2000 queue entries, compact
+        default 1 group).
       schema: { type: integer }
 
   responses:
@@ -682,7 +826,9 @@ components:
       description: >
         The requested snapshot (or resolved timestamp) is below the
         expiry floor — that history has been expired. Re-read at a
-        retained snapshot.
+        retained snapshot. The detail names the floor and, once expiry
+        has advanced it, the time the floor was reached
+        (Catalog.earliest_snapshot_time).
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ApiError" }
@@ -708,6 +854,16 @@ components:
         data_path: { type: string }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
+        earliest_snapshot_time:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            snapshot_time of the expiry-floor snapshot
+            (earliest_snapshot_id), captured when expiry advanced the
+            floor. Absent/null until expiry has ever advanced it. 410
+            responses below the floor cite this time so consumers know
+            WHEN their range was lost.
 
     CreateCatalogRequest:
       type: object
@@ -726,7 +882,13 @@ components:
       type: object
       required: [name, type]
       properties:
-        name: { type: string }
+        name:
+          type: string
+          pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+          description: >
+            Identifier policy (shared by namespace/table/view/column
+            names): letter or underscore start, then letters, digits,
+            underscore, hyphen; max 128 chars. Violations are 422.
         type:
           type: string
           enum: [boolean, int, long, float, double, decimal, date, time,
@@ -749,7 +911,9 @@ components:
       type: object
       required: [name, columns]
       properties:
-        name: { type: string }
+        name:
+          type: string
+          pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
         columns:
           type: array
           minItems: 1
@@ -777,6 +941,7 @@ components:
         file_count: { type: integer, format: int64 }
         file_size_bytes: { type: integer, format: int64 }
         partition_spec: { $ref: "#/components/schemas/PartitionSpec" }
+        sort_spec: { $ref: "#/components/schemas/SortSpec" }
 
     ColumnStats:
       type: object
@@ -821,6 +986,15 @@ components:
       properties:
         namespace: { type: string }
         table: { type: string }
+        expected_table_uuid:
+          type: string
+          format: uuid
+          description: >
+            Optional incarnation guard. When present, the commit fails
+            with 409 commit_conflict if the live table resolved by name
+            carries a different table_uuid — i.e. the table was dropped
+            and recreated since the writer read it. Absent = today's
+            name-only resolution.
         files:
           type: array
           minItems: 1
@@ -868,6 +1042,12 @@ components:
       properties:
         namespace: { type: string }
         table: { type: string }
+        expected_table_uuid:
+          type: string
+          format: uuid
+          description: >
+            Optional incarnation guard; same semantics as
+            TableAppend.expected_table_uuid (mismatch -> 409).
         files:
           type: array
           minItems: 1
@@ -914,6 +1094,33 @@ components:
           type: array
           items: { $ref: "#/components/schemas/PartitionField" }
 
+    SortField:
+      type: object
+      required: [source_field_id, direction, null_order]
+      properties:
+        source_field_id: { type: integer, format: int64 }
+        direction:
+          type: string
+          enum: [asc, desc]
+        null_order:
+          type: string
+          enum: [nulls_first, nulls_last]
+
+    SortSpec:
+      type: object
+      description: >
+        The table's versioned sort order. ADVISORY for writers — the
+        server never verifies that registered files are actually sorted —
+        and BINDING for compaction rewrites, which sort merged rows by
+        the live spec (safe because compaction outputs carry explicit
+        row ids; see DataFile.explicit_row_ids).
+      required: [sort_id, fields]
+      properties:
+        sort_id: { type: integer, format: int64 }
+        fields:
+          type: array
+          items: { $ref: "#/components/schemas/SortField" }
+
     AlterOp:
       type: object
       required: [op]
@@ -922,15 +1129,22 @@ components:
         op:
           type: string
           enum: [add_column, drop_column, rename_column, promote_column,
-                 rename_table, set_partition_spec]
+                 rename_table, set_partition_spec, set_sort_order]
         column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
         name: { type: string }        # drop_column, promote_column
         from: { type: string }        # rename_column
-        to: { type: string }          # rename_column; promote_column target type
-        new_name: { type: string }    # rename_table
+        # rename_column target (must satisfy the ColumnDef.name identifier
+        # pattern); promote_column target type
+        to: { type: string }
+        new_name:                     # rename_table
+          type: string
+          pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
         fields:                       # set_partition_spec ([] = unpartitioned)
           type: array
           items: { $ref: "#/components/schemas/PartitionField" }
+        sort_fields:                  # set_sort_order ([] = unsorted)
+          type: array
+          items: { $ref: "#/components/schemas/SortField" }
 
     CommitResult:
       type: object
@@ -957,6 +1171,16 @@ components:
         partition_values:
           type: array
           items: { type: string, nullable: true }
+        explicit_row_ids:
+          type: boolean
+          default: false
+          description: >
+            True for compaction outputs: the file's hoglake row ids ride
+            an explicit physical int64 column `_hog_row_id` (reserved
+            parquet field id 2147483646) because merged inputs need not
+            be row-id-contiguous. When true, row_id_start is
+            min(input row ids) and has no positional meaning; readers
+            needing row identity must read the column.
 
     ChangePlan:
       type: object
@@ -1015,6 +1239,105 @@ components:
         missing: { type: integer, format: int64 }
         still_referenced: { type: integer, format: int64 }
 
+    VerifyCheck:
+      type: object
+      required: [check, status, violations, samples]
+      properties:
+        check:
+          type: string
+          description: >
+            One of row_id_tiling, delete_vectors, orphans,
+            removal_queue, snapshot_density, next_row_id.
+        status:
+          type: string
+          enum: [pass, fail]
+        violations:
+          type: integer
+          format: int64
+          description: True violation count (not capped).
+        samples:
+          type: array
+          description: Human-readable violation details, capped at 20.
+          items: { type: string }
+
+    VerifyReport:
+      type: object
+      required: [catalog, status, checks]
+      properties:
+        catalog: { type: string }
+        status:
+          type: string
+          enum: [pass, fail]
+          description: pass iff every check passed.
+        checks:
+          type: array
+          items: { $ref: "#/components/schemas/VerifyCheck" }
+
+    ExportTableManifest:
+      type: object
+      required: [namespace, table, table_uuid, files, delete_files]
+      properties:
+        namespace: { type: string }
+        table: { type: string }
+        table_uuid: { type: string, format: uuid }
+        files:
+          type: array
+          description: Data files live at head_snapshot_id.
+          items: { $ref: "#/components/schemas/DataFile" }
+        delete_files:
+          type: array
+          description: Live deletion vectors at head_snapshot_id.
+          items: { $ref: "#/components/schemas/DeleteFile" }
+
+    ExportManifest:
+      type: object
+      description: >
+        Everything read consistently at head_snapshot_id: restore the
+        catalog via PITR, fetch this manifest, and every listed path
+        must exist in the object store — that is the "and we can prove
+        the object store matches" half of DR.
+      required: [catalog, data_path, head_snapshot_id,
+                 earliest_snapshot_id, tables, consumer_offsets]
+      properties:
+        catalog: { type: string }
+        data_path: { type: string }
+        head_snapshot_id:
+          type: integer
+          format: int64
+          description: The snapshot the whole manifest was read at.
+        earliest_snapshot_id: { type: integer, format: int64 }
+        earliest_snapshot_time:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the expiry floor was reached (null = never advanced).
+        tables:
+          type: array
+          description: Live tables with their live files + DVs.
+          items: { $ref: "#/components/schemas/ExportTableManifest" }
+        consumer_offsets:
+          type: array
+          description: All stored offsets (replication resume points).
+          items: { $ref: "#/components/schemas/ConsumerOffset" }
+
+    CompactionResult:
+      type: object
+      required: [groups_compacted, files_in, files_out, bytes_in,
+                 bytes_out, skipped_conflicts]
+      properties:
+        groups_compacted: { type: integer, format: int64 }
+        files_in: { type: integer, format: int64 }
+        files_out: { type: integer, format: int64 }
+        bytes_in: { type: integer, format: int64 }
+        bytes_out: { type: integer, format: int64 }
+        skipped_conflicts:
+          type: integer
+          format: int64
+          description: >
+            Groups aborted at commit time because an input file was no
+            longer live or had gained a deletion vector since planning;
+            re-planned on the next run.
+
     Snapshot:
       type: object
       required: [snapshot_id, snapshot_time, schema_version]
@@ -1026,12 +1349,25 @@ components:
         message: { type: string }
         changes:
           type: array
+          description: >
+            Typed change rows. kind is the closed conflict vocabulary:
+            namespace_created/dropped, table_created/dropped/altered,
+            table_inserted_into, table_deleted_from, table_compacted
+            (a maintenance rewrite — object_id is the table; never a
+            conflict for appenders and its files never enter the
+            changefeed), view_created/dropped.
           items:
             type: object
-            required: [kind]
+            required: [kind, object_id]
             properties:
               kind: { type: string }
-              object_id: { type: integer, format: int64 }
+              object_id:
+                type: integer
+                format: int64
+                description: >
+                  The changed object (table_id, namespace_id, or
+                  view_id). Every change kind names an object — never
+                  null.
 
     SnapshotPage:
       type: object

@@ -1,11 +1,23 @@
 """Daemon cycle logic against scripted fakes: offset-commit ordering,
 halt paths, at-least-once replay, batching/bounded memory, pacing."""
 
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 
 import pyarrow as pa
 import pytest
-
+from fakes import (
+    CrashRequested,
+    FakeCatalog,
+    FakeClient,
+    FakeDestTable,
+    FakeNamespace,
+    FakeSourceTable,
+    col,
+    data_file,
+    delete_file,
+    table_batch_reader,
+)
 from pyhoglake import NotFoundError
 
 from hedgerow import (
@@ -20,19 +32,6 @@ from hedgerow import (
     ReplicationConfig,
     SchemaMismatchError,
     SourceConfig,
-)
-
-from fakes import (
-    CrashRequested,
-    FakeCatalog,
-    FakeClient,
-    FakeDestTable,
-    FakeNamespace,
-    FakeSourceTable,
-    col,
-    data_file,
-    delete_file,
-    table_batch_reader,
 )
 
 SRC_COLS = (
@@ -129,11 +128,9 @@ def build_env(
     journal: list = []
     tables_by_path: dict[str, pa.Table] = {}
     files_by_snapshot: dict[int, list] = {}
-    fid = 0
-    for snap, tbl in (files or {}).items():
+    for fid, (snap, tbl) in enumerate((files or {}).items(), start=1):
         path = f"s3://fake/{snap}.parquet"
         tables_by_path[path] = tbl
-        fid += 1
         files_by_snapshot[snap] = [data_file(path, tbl.num_rows, snap, fid)]
 
     source_table = FakeSourceTable("src-uuid-1", SRC_COLS, files_by_snapshot)
@@ -141,7 +138,9 @@ def build_env(
     source_catalog = FakeCatalog(
         "cat",
         {"ns": source_ns},
-        head_snapshot_id=head if head is not None else max(files_by_snapshot, default=0),
+        head_snapshot_id=head
+        if head is not None
+        else max(files_by_snapshot, default=0),
         calls=journal,
     )
     if offsets:
@@ -381,7 +380,9 @@ def test_halt_on_source_recreate():
     env.daemon.run_once()
     # drop + recreate: same name, new uuid
     env.source_ns.tables["events"] = FakeSourceTable("src-uuid-NEW", SRC_COLS, {})
-    with pytest.raises(IncarnationChangedError, match="recreated.*src-uuid-1.*src-uuid-NEW"):
+    with pytest.raises(
+        IncarnationChangedError, match="recreated.*src-uuid-1.*src-uuid-NEW"
+    ):
         env.daemon.run_once()
 
 
@@ -528,7 +529,7 @@ def test_run_forever_retries_transient_errors():
     def flaky_reader(path, columns, batch_size):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise IOError("transient S3 blip")
+            raise OSError("transient S3 blip")
         return real_reader(path, columns, batch_size)
 
     env.daemon.start()
@@ -567,7 +568,9 @@ def test_metrics_observed_per_cycle():
     assert registry.get_sample_value("hedgerow_cycles_total") == 1
     assert registry.get_sample_value("hedgerow_rows_replicated_total") == 2
     assert registry.get_sample_value("hedgerow_last_committed_snapshot") == 1
-    assert registry.get_sample_value("hedgerow_lag_snapshots") == 1  # head 2, committed 1
+    assert (
+        registry.get_sample_value("hedgerow_lag_snapshots") == 1
+    )  # head 2, committed 1
 
     env.daemon.run_once()
     assert registry.get_sample_value("hedgerow_cycles_total") == 2

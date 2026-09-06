@@ -21,12 +21,19 @@ private val RequestIdKey = AttributeKey<String>("HoglakeRequestId")
 
 const val REQUEST_ID_HEADER = "X-Request-Id"
 
+/**
+ * Allowlist for caller-supplied ids: the value lands in structured audit
+ * lines and response headers, so control characters, separators, and
+ * anything else outside this tame set means we regenerate instead.
+ */
+private val REQUEST_ID_SHAPE = Regex("^[A-Za-z0-9._-]{1,128}$")
+
 val RequestId =
     createApplicationPlugin("HoglakeRequestId") {
         onCall { call ->
             val incoming =
                 call.request.headers[REQUEST_ID_HEADER]
-                    ?.takeIf { it.isNotBlank() && it.length <= 128 }
+                    ?.takeIf { REQUEST_ID_SHAPE.matches(it) }
             val id = incoming ?: UUID.randomUUID().toString()
             call.attributes.put(RequestIdKey, id)
             call.response.headers.append(REQUEST_ID_HEADER, id)

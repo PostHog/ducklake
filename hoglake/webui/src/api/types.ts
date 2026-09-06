@@ -1,6 +1,14 @@
 // Hand-written TypeScript mirrors of the OpenAPI schemas in
 // server/src/main/resources/openapi/hoglake.yaml. Wire format is snake_case;
 // these types pass it through untouched.
+//
+// Every field the spec types as `integer, format: int64` is carried as an
+// exact decimal string (`Int64`), never a JS number: snapshot ids, row
+// counts, file sizes and row-id starts can exceed 2^53 and would be silently
+// rounded by JSON.parse. See src/api/int64.ts.
+
+/** An int64 wire value, held as its exact decimal string representation. */
+export type Int64 = string;
 
 export interface ApiErrorBody {
   error: string;
@@ -10,8 +18,8 @@ export interface ApiErrorBody {
 export interface Catalog {
   name: string;
   data_path: string;
-  head_snapshot_id: number;
-  schema_version: number;
+  head_snapshot_id: Int64;
+  schema_version: Int64;
 }
 
 export interface CreateCatalogRequest {
@@ -49,7 +57,7 @@ export interface ColumnDef {
 }
 
 export interface Column extends ColumnDef {
-  field_id: number;
+  field_id: Int64;
   ordinal: number;
 }
 
@@ -72,13 +80,13 @@ export type PartitionTransform =
   | "hour";
 
 export interface PartitionField {
-  source_field_id: number;
+  source_field_id: Int64;
   transform: PartitionTransform;
   transform_param?: number;
 }
 
 export interface PartitionSpec {
-  spec_id: number;
+  spec_id: Int64;
   fields: PartitionField[];
 }
 
@@ -87,36 +95,36 @@ export interface Table {
   namespace: string;
   table_uuid: string;
   columns: Column[];
-  record_count: number;
-  file_count: number;
-  file_size_bytes: number;
+  record_count: Int64;
+  file_count: Int64;
+  file_size_bytes: Int64;
   partition_spec?: PartitionSpec;
 }
 
 export type StatsState = "provided" | "pending" | "failed";
 
 export interface DataFile {
-  data_file_id: number;
+  data_file_id: Int64;
   path: string;
   file_format: string;
-  record_count: number;
-  file_size_bytes: number;
-  footer_size?: number;
-  row_id_start: number;
+  record_count: Int64;
+  file_size_bytes: Int64;
+  footer_size?: Int64;
+  row_id_start: Int64;
   stats_state: StatsState;
-  begin_snapshot: number;
-  spec_id?: number;
+  begin_snapshot: Int64;
+  spec_id?: Int64;
   partition_values?: (string | null)[];
 }
 
 export interface DeleteFile {
-  delete_file_id: number;
-  data_file_id: number;
+  delete_file_id: Int64;
+  data_file_id: Int64;
   path: string;
   file_format: "puffin-dv";
-  delete_count: number;
-  file_size_bytes: number;
-  begin_snapshot: number;
+  delete_count: Int64;
+  file_size_bytes: Int64;
+  begin_snapshot: Int64;
 }
 
 export interface ScanFile {
@@ -126,13 +134,13 @@ export interface ScanFile {
 
 export interface SnapshotChange {
   kind: string;
-  object_id?: number;
+  object_id?: Int64;
 }
 
 export interface Snapshot {
-  snapshot_id: number;
+  snapshot_id: Int64;
   snapshot_time: string;
-  schema_version: number;
+  schema_version: Int64;
   author?: string;
   message?: string;
   changes?: SnapshotChange[];
@@ -146,11 +154,11 @@ export interface SnapshotPage {
 export interface ConsumerOffset {
   consumer_id: string;
   table_uuid: string;
-  committed_snapshot: number;
+  committed_snapshot: Int64;
   updated_at: string;
 }
 
 export interface CommitResult {
-  snapshot_id: number;
-  schema_version?: number;
+  snapshot_id: Int64;
+  schema_version?: Int64;
 }

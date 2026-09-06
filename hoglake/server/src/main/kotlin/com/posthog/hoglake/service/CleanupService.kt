@@ -20,8 +20,6 @@ import software.amazon.awssdk.services.s3.model.HeadObjectRequest
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException
 import software.amazon.awssdk.services.s3.model.S3Exception
 import java.net.URI
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 /**
  * Physical-delete side of the file-removal queue [ObjectStore] cannot
@@ -99,55 +97,85 @@ class RemovalStore(
  * hog_data_file AND hog_delete_file (any row, live or historical, in
  * the entry's catalog); a still-referenced path is counted as an
  * invariant violation (`still_referenced` — alert-worthy), skipped,
- * and its queue row LEFT IN PLACE: the reference may legitimately go
- * away later (v1 accepts that a permanently-referenced entry is
- * re-checked every run — bounded by batch order, never a deletion).
+ * and its queue row LEFT UNDRAINED with attempts/last_attempt_at
+ * bumped: the reference may legitimately go away later (v1 accepts
+ * that a permanently-referenced entry is re-checked every run —
+ * bounded by batch order, never a deletion).
+ *
+ * Draining SOFT-deletes (the forensics lesson: "we reconstructed
+ * split-brain forensics from S3 delete markers"): a settled entry is
+ * marked drained_at + drained_outcome ('deleted' for a physical
+ * removal, 'absent' for verified-already-gone) instead of losing its
+ * row, so what cleanup touched, when, and after how many attempts
+ * stays queryable. The drain query reads only undrained rows (partial
+ * index), and every sweep also PURGES drained rows older than
+ * [ledgerRetentionSeconds] — the ledger must not itself become the
+ * unbounded-accumulation problem it documents.
  *
  * Deletes run in sub-batches of [subBatchSize] (500 in production;
  * constructor-tunable for tests). Each sub-batch deletes its objects
- * and then drains their queue rows in one transaction of its own, so a
- * later sub-batch failure never rolls back completed ones. A
- * missing object (404) is success ("already gone") and drains its row;
- * a per-object delete failure is logged and leaves its row queued for
- * the next run without wedging the rest of the batch.
+ * and then settles their ledger rows in one transaction of its own, so
+ * a later sub-batch failure never rolls back completed ones. A missing
+ * object (404) is success ("already gone") and drains its row as
+ * 'absent'; a per-object delete failure bumps attempts and leaves the
+ * row queued for the next run without wedging the rest of the batch.
  */
 class CleanupService(
     private val jdbi: Jdbi,
     private val store: RemovalStore,
     private val subBatchSize: Int = SUB_BATCH,
+    private val ledgerRetentionSeconds: Long = LEDGER_RETENTION_SECONDS,
 ) {
     private val log = KotlinLogging.logger {}
 
     init {
         require(subBatchSize > 0) { "subBatchSize must be positive (got $subBatchSize)" }
+        require(ledgerRetentionSeconds > 0) {
+            "ledgerRetentionSeconds must be positive (got $ledgerRetentionSeconds)"
+        }
     }
 
     private data class Entry(val removalId: Long, val path: String)
 
     /**
-     * Drain up to [batchSize] queue entries for [catalog]. The audit
-     * event and the files-removed counter are emitted at the end of the
-     * run (each sub-batch's queue drain is its own transaction; nothing
-     * is emitted inside one). still_referenced > 0 is an invariant
-     * violation and flags the run's audit outcome accordingly.
+     * Drain up to [batchSize] queue entries for [catalog]. The summary
+     * audit event and the files-removed counter are emitted at the end
+     * of the run (each sub-batch's queue drain is its own transaction;
+     * nothing is emitted inside one); per-path events (file_deleted /
+     * cleanup_violation) are emitted as the drain progresses, bounded by
+     * the batch size. still_referenced > 0 is an invariant violation and
+     * flags the run's audit outcome accordingly. A ZERO-WORK drain
+     * (nothing removed, missing, or violated) emits no audit event —
+     * app-log debug only, so idle background loops stay out of the
+     * audit stream.
      */
     fun runOnce(
         catalog: String,
         batchSize: Int,
-    ): CleanupResult =
-        Audit.audited(
-            "cleanup",
-            catalog,
-            null,
-            successOutcome = { r -> if (r.stillReferenced > 0) "invariant_violation" else "ok" },
-            detail = { r ->
-                "removed=${r.removed} missing=${r.missing} still_referenced=${r.stillReferenced}"
-            },
-        ) {
-            val result = doRunOnce(catalog, batchSize)
-            Metrics.filesRemoved(catalog, result.removed)
-            result
+    ): CleanupResult {
+        val result =
+            try {
+                doRunOnce(catalog, batchSize)
+            } catch (e: Throwable) {
+                Audit.event("cleanup", catalog, null, Audit.failureOutcome(e), e.message)
+                throw e
+            }
+        Metrics.filesRemoved(catalog, result.removed)
+        if (result.removed == 0L && result.missing == 0L && result.stillReferenced == 0L) {
+            log.debug { "cleanup drain for catalog '$catalog': nothing to do" }
+        } else {
+            Audit.event(
+                "cleanup",
+                catalog,
+                null,
+                outcome = if (result.stillReferenced > 0) "invariant_violation" else "ok",
+                detail =
+                    "removed=${result.removed} missing=${result.missing} " +
+                        "still_referenced=${result.stillReferenced}",
+            )
         }
+        return result
+    }
 
     private fun doRunOnce(
         catalog: String,
@@ -158,14 +186,14 @@ class CleanupService(
         }
         val catalogId =
             jdbi.withHandleUnchecked { h ->
-                LifecycleCatalog.require(h, catalog).catalogId
+                CatalogRepo.require(h, catalog).catalogId
             }
         val batch =
             jdbi.withHandleUnchecked { h ->
                 h.createQuery(
                     """
                 SELECT removal_id, path FROM hog_file_removal
-                WHERE catalog_id = :catalogId
+                WHERE catalog_id = :catalogId AND drained_at IS NULL
                 ORDER BY removal_id
                 LIMIT :limit
                 """,
@@ -184,48 +212,120 @@ class CleanupService(
             // the batch was selected: the freshest answer we can get
             // before touching the object.
             val referenced = referencedPaths(catalogId, sub.map { it.path })
-            val drained = mutableListOf<Long>()
+            // Ledger outcomes for this sub-batch: settled entries by
+            // outcome, plus the ones that stay queued (attempts bump).
+            val drainedByOutcome = mapOf("deleted" to mutableListOf<Long>(), "absent" to mutableListOf())
+            val attempted = mutableListOf<Long>()
             for (entry in sub) {
                 if (entry.path in referenced) {
                     log.error {
                         "cleanup: path '${entry.path}' (removal_id ${entry.removalId}) is " +
                             "still referenced by the catalog — invariant violation; skipping"
                     }
+                    // Per-path audit trail for the alert-worthy case: WHICH
+                    // path the queue wrongly suggested. Bounded by batch size.
+                    Audit.event(
+                        "cleanup_violation",
+                        catalog,
+                        entry.path,
+                        outcome = "invariant_violation",
+                        detail = "removal_id=${entry.removalId} still referenced; not deleted",
+                    )
                     stillReferenced++
+                    attempted += entry.removalId
                     continue
                 }
                 try {
                     when (store.deleteIfExists(entry.path)) {
-                        RemovalStore.Outcome.REMOVED -> removed++
+                        RemovalStore.Outcome.REMOVED -> {
+                            // Physical deletions are the audit log's whole
+                            // point: one event per object actually removed.
+                            Audit.event("file_deleted", catalog, entry.path, outcome = "ok")
+                            removed++
+                            drainedByOutcome.getValue("deleted") += entry.removalId
+                        }
                         RemovalStore.Outcome.MISSING -> {
                             log.info { "cleanup: '${entry.path}' already gone; draining queue row" }
                             missing++
+                            drainedByOutcome.getValue("absent") += entry.removalId
                         }
                     }
-                    drained += entry.removalId
                 } catch (e: Exception) {
-                    // Leave the row queued; the next run retries it.
+                    // Leave the row queued (attempts bumped); the next run
+                    // retries it.
                     log.error(e) {
                         "cleanup: delete failed for '${entry.path}' " +
                             "(removal_id ${entry.removalId}); leaving queued"
                     }
+                    attempted += entry.removalId
                 }
             }
-            if (drained.isNotEmpty()) {
+            if (drainedByOutcome.values.any { it.isNotEmpty() } || attempted.isNotEmpty()) {
                 jdbi.useHandleUnchecked { h ->
-                    h.createUpdate(
-                        """
-                        DELETE FROM hog_file_removal
-                        WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
-                        """,
-                    )
-                        .bind("catalogId", catalogId)
-                        .bindArray("ids", Long::class.javaObjectType, drained)
-                        .execute()
+                    // Soft-delete the settled entries: the row survives as
+                    // the queryable ledger of what cleanup did and when.
+                    for ((outcome, ids) in drainedByOutcome) {
+                        if (ids.isEmpty()) continue
+                        h.createUpdate(
+                            """
+                            UPDATE hog_file_removal
+                               SET drained_at = now(), drained_outcome = :outcome,
+                                   last_attempt_at = now()
+                             WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
+                            """,
+                        )
+                            .bind("outcome", outcome)
+                            .bind("catalogId", catalogId)
+                            .bindArray("ids", Long::class.javaObjectType, ids)
+                            .execute()
+                    }
+                    // Undrained entries (still-referenced, transient S3
+                    // failure) record the attempt and stay queued.
+                    if (attempted.isNotEmpty()) {
+                        h.createUpdate(
+                            """
+                            UPDATE hog_file_removal
+                               SET attempts = attempts + 1, last_attempt_at = now()
+                             WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
+                            """,
+                        )
+                            .bind("catalogId", catalogId)
+                            .bindArray("ids", Long::class.javaObjectType, attempted)
+                            .execute()
+                    }
                 }
             }
         }
+        purgeDrainedLedger(catalog, catalogId)
         return CleanupResult(removed, missing, stillReferenced)
+    }
+
+    /**
+     * Ledger retention: drained rows older than [ledgerRetentionSeconds]
+     * are hard-deleted so the soft-delete ledger cannot itself
+     * accumulate without bound (the A1 lesson, applied to the fix for
+     * A3). Undrained rows are never touched here.
+     */
+    private fun purgeDrainedLedger(
+        catalog: String,
+        catalogId: Long,
+    ) {
+        val purged =
+            jdbi.withHandleUnchecked { h ->
+                h.createUpdate(
+                    """
+                    DELETE FROM hog_file_removal
+                    WHERE catalog_id = :catalogId
+                      AND drained_at < now() - make_interval(secs => :retention)
+                    """,
+                )
+                    .bind("catalogId", catalogId)
+                    .bind("retention", ledgerRetentionSeconds)
+                    .execute()
+            }
+        if (purged > 0) {
+            log.debug { "cleanup: purged $purged drained ledger rows for catalog '$catalog'" }
+        }
     }
 
     /** Paths from [paths] that any file row (live or not) still claims. */
@@ -251,8 +351,9 @@ class CleanupService(
         }
 
     /**
-     * One drain across every catalog, for the background loop. Catalogs
-     * are isolated: one catalog's failure is logged and the rest proceed.
+     * One drain across every catalog, for the background loop
+     * (BackgroundLoops in App.kt). Catalogs are isolated: one catalog's
+     * failure is logged and the rest proceed.
      */
     fun runOnceAllCatalogs(batchSize: Int): List<Pair<String, CleanupResult>> {
         val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }
@@ -267,41 +368,11 @@ class CleanupService(
         return results
     }
 
-    /**
-     * Background drain loop on a daemon thread (Hydrator.startLoop
-     * pattern), draining all catalogs. [intervalMs] <= 0 is a no-op.
-     */
-    fun startLoop(
-        intervalMs: Long,
-        batchSize: Int,
-    ): AutoCloseable {
-        if (intervalMs <= 0) return AutoCloseable { }
-        val running = AtomicBoolean(true)
-        val worker =
-            thread(name = "hoglake-cleanup", isDaemon = true) {
-                while (running.get()) {
-                    try {
-                        runOnceAllCatalogs(batchSize)
-                    } catch (e: Exception) {
-                        log.error(e) { "cleanup drain failed" }
-                    }
-                    try {
-                        Thread.sleep(intervalMs)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        break
-                    }
-                }
-            }
-        return AutoCloseable {
-            running.set(false)
-            worker.interrupt()
-            worker.join(5_000)
-        }
-    }
-
     private companion object {
         /** Production sub-batch size for physical deletes. */
         const val SUB_BATCH = 500
+
+        /** Default drained-ledger retention: 30 days (HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS). */
+        const val LEDGER_RETENTION_SECONDS = 30L * 24 * 60 * 60
     }
 }

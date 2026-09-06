@@ -2,6 +2,7 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.model.HoglakeException
 import io.github.oshai.kotlinlogging.KotlinLogging
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.JsonConvertException
 import io.ktor.server.plugins.BadRequestException
@@ -17,11 +18,15 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * catch-all handlers. Every error body is an ApiError {error, detail}
  * (the spec's schema); Ktor's default HTML pages never escape.
  *
- * - NotFound          -> 404
- * - AlreadyExists     -> 409
- * - CommitConflict    -> 409
- * - OffsetRegression  -> 409
- * - Validation        -> 422
+ * - NotFound            -> 404
+ * - AlreadyExists       -> 409
+ * - CommitConflict      -> 409
+ * - OffsetRegression    -> 409
+ * - IdlessFilesPresent  -> 409
+ * - Validation          -> 422
+ * - Expired             -> 410
+ * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
+ *                          never a generic 500)
  * - malformed body / unparseable query or path params -> 400
  * - anything else     -> 500 (logged; generic body, no internals)
  */
@@ -33,8 +38,15 @@ fun StatusPagesConfig.installErrorMapping() {
                 is HoglakeException.AlreadyExists -> HttpStatusCode.Conflict to "already_exists"
                 is HoglakeException.CommitConflict -> HttpStatusCode.Conflict to "commit_conflict"
                 is HoglakeException.OffsetRegression -> HttpStatusCode.Conflict to "offset_regression"
+                is HoglakeException.IdlessFilesPresent -> HttpStatusCode.Conflict to "idless_files_present"
                 is HoglakeException.Validation -> HttpStatusCode.UnprocessableEntity to "validation"
                 is HoglakeException.Expired -> HttpStatusCode.Gone to "expired"
+                is HoglakeException.CommitQueueTimeout -> {
+                    // Explicit backpressure: the commit queued too long on
+                    // the catalog lock. Clients back off and retry.
+                    call.response.headers.append(HttpHeaders.RetryAfter, RETRY_AFTER_SECONDS)
+                    HttpStatusCode.ServiceUnavailable to "commit_queue_timeout"
+                }
             }
         call.respond(status, ApiErrorDto(error = code, detail = cause.message))
     }
@@ -56,6 +68,9 @@ fun StatusPagesConfig.installErrorMapping() {
         )
     }
 }
+
+/** Retry-After for 503 commit_queue_timeout: back off a beat, then retry. */
+private const val RETRY_AFTER_SECONDS = "1"
 
 private fun rootMessage(t: Throwable): String =
     generateSequence(t) { it.cause }.mapNotNull { it.message }.lastOrNull() ?: "malformed request"

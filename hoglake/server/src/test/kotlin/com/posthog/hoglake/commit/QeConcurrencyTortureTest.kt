@@ -347,7 +347,7 @@ class QeConcurrencyTortureTest {
                 h.createQuery(
                     """
                 SELECT count(*) FROM hog_file_removal q
-                WHERE q.catalog_id = :c AND EXISTS (
+                WHERE q.catalog_id = :c AND q.drained_at IS NULL AND EXISTS (
                     SELECT 1 FROM hog_data_file f
                     WHERE f.catalog_id = q.catalog_id AND f.path = q.path
                     UNION
@@ -430,9 +430,11 @@ class QeConcurrencyTortureTest {
         val last = cleanup.runOnce(cat, batchSize = 10_000)
         assertThat(last.stillReferenced).isEqualTo(0)
         db.jdbi.withHandleUnchecked { h ->
+            // Draining soft-deletes: rows persist as the ledger, so "fully
+            // drained" means no UNDRAINED entries remain.
             val left =
                 h.createQuery(
-                    "SELECT count(*) FROM hog_file_removal WHERE catalog_id = ?",
+                    "SELECT count(*) FROM hog_file_removal WHERE catalog_id = ? AND drained_at IS NULL",
                 ).bind(0, cid).mapTo(Long::class.java).one()
             assertThat(left).describedAs("queue fully drained").isEqualTo(0)
             val earliest =

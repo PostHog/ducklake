@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionSpec
+import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.model.canPromoteTo
@@ -15,6 +16,7 @@ import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.SnapshotRepo
+import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import org.jdbi.v3.core.Handle
@@ -86,6 +88,7 @@ class AlterService(private val jdbi: Jdbi) {
                                 .toMutableList(),
                         name = t.name,
                         spec = SpecRepo.specAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
+                        sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                     )
                 for (op in ops) {
                     applyOp(h, cat.catalogId, t.tableId, ns.namespaceId, namespace, alloc.snapshotId, state, op)
@@ -102,6 +105,7 @@ class AlterService(private val jdbi: Jdbi) {
                     fileCount = agg.fileCount,
                     fileSizeBytes = agg.fileSizeBytes,
                     partitionSpec = state.spec,
+                    sortSpec = state.sortSpec,
                 )
             }
         }
@@ -120,6 +124,7 @@ class AlterService(private val jdbi: Jdbi) {
         val cols: MutableList<Column>,
         var name: String,
         var spec: PartitionSpec?,
+        var sortSpec: SortSpec?,
     )
 
     private fun applyOp(
@@ -139,6 +144,7 @@ class AlterService(private val jdbi: Jdbi) {
         is AlterOp.RenameTable ->
             renameTable(h, catalogId, tableId, namespaceId, namespaceName, snapshot, state, op)
         is AlterOp.SetPartitionSpec -> setPartitionSpec(h, catalogId, tableId, snapshot, state, op)
+        is AlterOp.SetSortOrder -> setSortOrder(h, catalogId, tableId, snapshot, state, op)
     }
 
     private fun addColumn(
@@ -149,6 +155,7 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.AddColumn,
     ) {
+        Identifiers.validate("column", op.def.name)
         if (state.cols.any { it.def.name == op.def.name }) {
             throw HoglakeException.Validation("column '${op.def.name}' already exists")
         }
@@ -181,6 +188,12 @@ class AlterService(private val jdbi: Jdbi) {
                 "cannot drop column '${op.name}': it is a source of the live partition spec",
             )
         }
+        val sortSpec = state.sortSpec
+        if (sortSpec != null && sortSpec.fields.any { it.sourceFieldId == col.fieldId }) {
+            throw HoglakeException.Validation(
+                "cannot drop column '${op.name}': it is a source of the live sort order",
+            )
+        }
         endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
         state.cols.remove(col)
     }
@@ -193,9 +206,36 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.RenameColumn,
     ) {
+        Identifiers.validate("column", op.to)
         val col = requireColumn(state, op.from)
         if (state.cols.any { it.def.name == op.to }) {
             throw HoglakeException.Validation("column '${op.to}' already exists")
+        }
+        // The field-id contract guard: files whose parquet schema carries
+        // no field ids bind columns by NAME. Renaming while any such file
+        // is live (visible at head) would silently NULL that column's
+        // history in readers, so the rename is refused (409) until the
+        // id-less files are compacted, expired, or otherwise retired.
+        // RenameTable is unaffected — table binding rides table_uuid.
+        val idlessLive =
+            h.createQuery(
+                """
+                SELECT count(*) FROM hog_data_file
+                WHERE catalog_id = :catalogId AND table_id = :tableId
+                  AND end_snapshot IS NULL AND missing_field_ids
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .mapTo(Long::class.javaObjectType)
+                .one()
+        if (idlessLive > 0) {
+            throw HoglakeException.IdlessFilesPresent(
+                "cannot rename column '${op.from}' to '${op.to}': $idlessLive live data " +
+                    "file(s) lack parquet field ids and bind columns by name — renaming " +
+                    "would silently NULL their history in readers; rewrite or retire the " +
+                    "id-less files first",
+            )
         }
         endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
         val renamed = col.copy(def = col.def.copy(name = op.to))
@@ -233,9 +273,7 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.RenameTable,
     ) {
-        if (op.newName.isBlank()) {
-            throw HoglakeException.Validation("table name must not be blank")
-        }
+        Identifiers.validate("table", op.newName)
         val existing = TableRepo.findLive(h, catalogId, namespaceId, op.newName)
         if (existing != null && existing.tableId != tableId) {
             throw HoglakeException.AlreadyExists(
@@ -330,6 +368,83 @@ class AlterService(private val jdbi: Jdbi) {
         }
         batch.execute()
         state.spec = PartitionSpec(specId, op.fields)
+    }
+
+    /**
+     * SetPartitionSpec's twin for sort orders: validate every source
+     * field against the post-ops live columns, retire the live spec,
+     * mint sort_id = max + 1 with the new fields (empty = unsorted).
+     * Advisory for writers, binding for compaction rewrites.
+     */
+    private fun setSortOrder(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+        state: TableState,
+        op: AlterOp.SetSortOrder,
+    ) {
+        val seen = HashSet<Long>()
+        for (f in op.fields) {
+            if (state.cols.none { it.fieldId == f.sourceFieldId }) {
+                throw HoglakeException.Validation(
+                    "sort source field_id ${f.sourceFieldId} is not a live column",
+                )
+            }
+            if (!seen.add(f.sourceFieldId)) {
+                throw HoglakeException.Validation(
+                    "duplicate sort source field_id ${f.sourceFieldId}",
+                )
+            }
+        }
+        endOrDeleteSortSpec(h, catalogId, tableId, snapshot)
+        if (op.fields.isEmpty()) {
+            state.sortSpec = null
+            return
+        }
+        val sortId =
+            h.createQuery(
+                """
+            SELECT COALESCE(MAX(sort_id), 0) + 1 FROM hog_sort_spec
+            WHERE catalog_id = :catalogId AND table_id = :tableId
+            """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .mapTo(Long::class.javaObjectType)
+                .one()
+        h.createUpdate(
+            """
+            INSERT INTO hog_sort_spec (catalog_id, table_id, sort_id, begin_snapshot)
+            VALUES (:catalogId, :tableId, :sortId, :beginSnapshot)
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("sortId", sortId)
+            .bind("beginSnapshot", snapshot)
+            .execute()
+        val batch =
+            h.prepareBatch(
+                """
+            INSERT INTO hog_sort_field
+                (catalog_id, table_id, sort_id, key_index, source_field_id, direction, null_order)
+            VALUES (:catalogId, :tableId, :sortId, :keyIndex, :sourceFieldId, :direction, :nullOrder)
+            """,
+            )
+        op.fields.forEachIndexed { i, f ->
+            batch
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("sortId", sortId)
+                .bind("keyIndex", i)
+                .bind("sourceFieldId", f.sourceFieldId)
+                .bind("direction", f.direction.wire)
+                .bind("nullOrder", f.nullOrder.wire)
+                .add()
+        }
+        batch.execute()
+        state.sortSpec = SortSpec(sortId, op.fields)
     }
 
     // ---- row lifecycle helpers -------------------------------------------
@@ -440,6 +555,39 @@ class AlterService(private val jdbi: Jdbi) {
             h.createUpdate(
                 """
                 UPDATE hog_partition_spec SET end_snapshot = :snapshot
+                WHERE catalog_id = :catalogId AND table_id = :tableId AND end_snapshot IS NULL
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("snapshot", snapshot)
+                .execute()
+        }
+    }
+
+    /** Same delete-if-created-here-else-end rule for the sort spec (fields cascade). */
+    private fun endOrDeleteSortSpec(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+    ) {
+        val deleted =
+            h.createUpdate(
+                """
+            DELETE FROM hog_sort_spec
+            WHERE catalog_id = :catalogId AND table_id = :tableId
+              AND end_snapshot IS NULL AND begin_snapshot = :snapshot
+            """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("snapshot", snapshot)
+                .execute()
+        if (deleted == 0) {
+            h.createUpdate(
+                """
+                UPDATE hog_sort_spec SET end_snapshot = :snapshot
                 WHERE catalog_id = :catalogId AND table_id = :tableId AND end_snapshot IS NULL
                 """,
             )

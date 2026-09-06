@@ -60,6 +60,27 @@ object OffsetRepo {
             throw e
         }
 
+    fun find(
+        handle: Handle,
+        catalogId: Long,
+        consumerId: String,
+        tableUuid: UUID,
+    ): ConsumerOffset? =
+        handle.createQuery(
+            """
+            SELECT consumer_id, table_uuid, committed_snapshot, updated_at
+            FROM hog_consumer_offset
+            WHERE catalog_id = :catalogId AND consumer_id = :consumerId
+              AND table_uuid = :tableUuid
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("consumerId", consumerId)
+            .bind("tableUuid", tableUuid)
+            .map(offsetMapper)
+            .findOne()
+            .orElse(null)
+
     fun list(
         handle: Handle,
         catalogId: Long,

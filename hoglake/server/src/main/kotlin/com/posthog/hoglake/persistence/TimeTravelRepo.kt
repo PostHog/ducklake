@@ -11,6 +11,18 @@ import java.time.Instant
  * the expiry service and the DDL/commit tails, never here.
  */
 object TimeTravelRepo {
+    /**
+     * The expiry floor with its anchor time: [earliestSnapshotTime] is
+     * the floor snapshot's snapshot_time as captured by the sweep that
+     * advanced the floor (null until expiry first advances it). 410
+     * messages cite it so a reconciling consumer knows WHEN its range
+     * was lost.
+     */
+    data class ExpiryFloor(val earliestSnapshotId: Long, val earliestSnapshotTime: Instant?) {
+        /** ", reached at <time>" suffix for 410 detail messages; empty pre-expiry. */
+        fun reachedAtSuffix(): String = earliestSnapshotTime?.let { ", reached at $it" } ?: ""
+    }
+
     /** The catalog's expiry floor: snapshots below this id are gone. */
     fun earliestSnapshotId(
         handle: Handle,
@@ -21,6 +33,28 @@ object TimeTravelRepo {
         )
             .bind("catalogId", catalogId)
             .mapTo(Long::class.javaObjectType)
+            .one()
+
+    /** The floor id + anchor time pair (one row read on hog_catalog). */
+    fun expiryFloor(
+        handle: Handle,
+        catalogId: Long,
+    ): ExpiryFloor =
+        handle.createQuery(
+            """
+            SELECT earliest_snapshot_id, earliest_snapshot_time
+            FROM hog_catalog WHERE catalog_id = :catalogId
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .map { rs, _ ->
+                ExpiryFloor(
+                    earliestSnapshotId = rs.getLong("earliest_snapshot_id"),
+                    earliestSnapshotTime =
+                        rs.getObject("earliest_snapshot_time", java.time.OffsetDateTime::class.java)
+                            ?.toInstant(),
+                )
+            }
             .one()
 
     /**

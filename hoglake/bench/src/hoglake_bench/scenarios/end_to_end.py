@@ -43,12 +43,17 @@ def _batch(start: int, rows: int) -> pa.Table:
 
 def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
     batches = max(1, args.rows // args.batch_rows)
+    warmup = 1 if batches > 1 else 0
     report = ScenarioReport(
         scenario="end-to-end-writer",
         params={
             "rows": args.rows,
             "batch_rows": args.batch_rows,
-            "batches": batches,
+            "batches": batches,  # measured appends; warmup appends on top
+            "warmup_batches": warmup,
+            "warmup": warmup,
+            "duration": args.duration,
+            "url": args.url,
         },
     )
     bench.ensure_bucket()
@@ -57,13 +62,15 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
     table = ns.create_table("events", E2E_SCHEMA)
     guard = FailureGuard()
 
-    warmup = 1 if batches > 1 else 0
     payload_bytes = [0]
 
     def op(i: int) -> None:
         data = _batch(i * args.batch_rows, args.batch_rows)
         table.append(data, author="hoglake-bench", message=f"batch {i}")
-        payload_bytes[0] += data.nbytes
+        if i >= warmup:
+            # arrow_mb_s: numerator and denominator must cover the SAME
+            # measured window — warmup bytes stay out of both
+            payload_bytes[0] += data.nbytes
 
     loop = run_loop(
         op, ops=batches, warmup=warmup, duration_s=args.duration, guard=guard

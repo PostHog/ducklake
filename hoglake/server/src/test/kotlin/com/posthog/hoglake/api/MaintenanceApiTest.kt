@@ -4,10 +4,14 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.compaction.CompactionConfig
+import com.posthog.hoglake.compaction.CompactionService
+import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.RemovalStore
+import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.testing.PgTestSupport
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
@@ -55,9 +59,20 @@ class MaintenanceApiTest {
             pathStyle = true,
         )
 
+    /** Never contacted either: compaction on a file-less catalog plans zero groups. */
+    private val compactionStore =
+        ObjectStore(
+            endpoint = "http://127.0.0.1:9",
+            region = "us-east-1",
+            accessKey = "unused",
+            secretKey = "unused",
+            pathStyle = true,
+        )
+
     @AfterAll
     fun tearDown() {
         removals.close()
+        compactionStore.close()
         db.close()
     }
 
@@ -69,6 +84,12 @@ class MaintenanceApiTest {
                     OptionsService(db.jdbi),
                     ExpiryService(db.jdbi),
                     CleanupService(db.jdbi, removals),
+                    CompactionService(
+                        db.jdbi,
+                        compactionStore,
+                        CompactionConfig(targetBytes = 512L * 1024 * 1024, minInputFiles = 4, maxGroupsPerRun = 1),
+                    ),
+                    VerifyService(db.jdbi),
                 )
             }
             block(client)
@@ -301,6 +322,98 @@ class MaintenanceApiTest {
             )
             assertApiError(
                 client.postJson("/v1/catalogs/mnt-nope/maintenance/cleanup"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+        }
+
+    // ---- maintenance/verify ------------------------------------------------
+
+    @Test
+    fun `verify endpoint reports all-pass on a healthy catalog and 404s unknowns`() =
+        api { client ->
+            client.createCatalog("mnt-verify")
+
+            val report =
+                body(
+                    client.postJson("/v1/catalogs/mnt-verify/maintenance/verify").also {
+                        assertThat(it.status).isEqualTo(HttpStatusCode.OK)
+                    },
+                )
+            assertThat(report["catalog"].asText()).isEqualTo("mnt-verify")
+            assertThat(report["status"].asText()).isEqualTo("pass")
+            val checks = report["checks"].map { it["check"].asText() }
+            assertThat(checks).containsExactly(
+                "row_id_tiling",
+                "delete_vectors",
+                "orphans",
+                "removal_queue",
+                "snapshot_density",
+                "next_row_id",
+            )
+            for (check in report["checks"]) {
+                assertThat(check["status"].asText()).isEqualTo("pass")
+                assertThat(check["violations"].asLong()).isEqualTo(0)
+                assertThat(check["samples"].isArray).isTrue()
+            }
+
+            assertApiError(
+                client.postJson("/v1/catalogs/mnt-nope/maintenance/verify"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+        }
+
+    // ---- export (B5: spec'd, 501 until built) ------------------------------
+
+    @Test
+    fun `export endpoint answers 501 with the spec's not_implemented ApiError`() =
+        api { client ->
+            client.createCatalog("mnt-export")
+            val r = client.get("/v1/catalogs/mnt-export/export")
+            assertThat(r.status).isEqualTo(HttpStatusCode.NotImplemented)
+            val node = body(r)
+            assertThat(node["error"].asText()).isEqualTo("not_implemented")
+            assertThat(node["detail"].asText())
+                .isEqualTo("catalog export is specified but not yet implemented")
+        }
+
+    // ---- maintenance/compact -----------------------------------------------
+
+    @Test
+    fun `compact endpoint returns a zero result on a file-less catalog and validates like the spec says`() =
+        api { client ->
+            client.createCatalog("mnt-compact")
+
+            val result =
+                body(
+                    client.postJson("/v1/catalogs/mnt-compact/maintenance/compact").also {
+                        assertThat(it.status).isEqualTo(HttpStatusCode.OK)
+                    },
+                )
+            for (field in listOf(
+                "groups_compacted",
+                "files_in",
+                "files_out",
+                "bytes_in",
+                "bytes_out",
+                "skipped_conflicts",
+            )) {
+                assertThat(result[field].asLong()).describedAs(field).isEqualTo(0)
+            }
+
+            assertApiError(
+                client.postJson("/v1/catalogs/mnt-compact/maintenance/compact?batch=0"),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            assertApiError(
+                client.postJson("/v1/catalogs/mnt-compact/maintenance/compact?batch=some"),
+                HttpStatusCode.BadRequest,
+                "bad_request",
+            )
+            assertApiError(
+                client.postJson("/v1/catalogs/mnt-nope/maintenance/compact"),
                 HttpStatusCode.NotFound,
                 "not_found",
             )

@@ -29,13 +29,14 @@ object FileRepo {
                     (rs.getArray("partition_values")?.array as? Array<*>)
                         ?.map { it as String? }
                         ?.takeIf { it.isNotEmpty() },
+                explicitRowIds = rs.getBoolean("explicit_row_ids"),
             )
         }
 
     private const val COLUMNS =
         """f.data_file_id, f.table_id, f.path, f.file_format, f.record_count,
            f.file_size_bytes, f.footer_size, f.row_id_start, f.stats_state,
-           f.begin_snapshot, f.spec_id,
+           f.begin_snapshot, f.spec_id, f.explicit_row_ids,
            (SELECT array_agg(pv.value ORDER BY pv.key_index)
             FROM hog_file_partition_value pv
             WHERE pv.catalog_id = f.catalog_id
@@ -123,6 +124,14 @@ object FileRepo {
      * — ordered by begin_snapshot, row_id_start. No end_snapshot filter:
      * the feed reports what was appended in the range, regardless of
      * later lifecycle.
+     *
+     * Compaction outputs are EXCLUDED (the NOT EXISTS against the
+     * snapshot's 'table_compacted' change row): a compaction rewrites
+     * rows the feed already delivered under their original files/ranges,
+     * so surfacing the output here would re-deliver every merged row as
+     * a fresh append. A consumer replaying across a compaction must see
+     * the ORIGINAL files in their original ranges and never the
+     * compacted file.
      */
     fun changedIn(
         handle: Handle,
@@ -138,6 +147,12 @@ object FileRepo {
             WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
               AND f.begin_snapshot > :fromSnapshot
               AND f.begin_snapshot <= :toSnapshot
+              AND NOT EXISTS (
+                    SELECT 1 FROM hog_snapshot_change c
+                    WHERE c.catalog_id = f.catalog_id
+                      AND c.snapshot_id = f.begin_snapshot
+                      AND c.kind = 'table_compacted'
+                      AND c.object_id = f.table_id)
             ORDER BY begin_snapshot, row_id_start, data_file_id
             """,
         )

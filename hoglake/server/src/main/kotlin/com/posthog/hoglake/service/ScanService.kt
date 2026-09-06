@@ -61,11 +61,12 @@ class ScanService(private val jdbi: Jdbi) {
                     )
                 }
                 if (snapshot != null) {
-                    val earliest = TimeTravelRepo.earliestSnapshotId(h, cat.catalogId)
-                    if (at < earliest) {
+                    val floor = TimeTravelRepo.expiryFloor(h, cat.catalogId)
+                    if (at < floor.earliestSnapshotId) {
                         throw HoglakeException.Expired(
                             "snapshot $at is below the expiry floor (earliest retained " +
-                                "snapshot is $earliest) for catalog '${cat.name}'",
+                                "snapshot is ${floor.earliestSnapshotId}" +
+                                "${floor.reachedAtSuffix()}) for catalog '${cat.name}'",
                         )
                     }
                 }
@@ -84,6 +85,7 @@ class ScanService(private val jdbi: Jdbi) {
             SELECT df.data_file_id, df.table_id, df.path, df.file_format,
                    df.record_count, df.file_size_bytes, df.footer_size,
                    df.row_id_start, df.stats_state, df.begin_snapshot, df.spec_id,
+                   df.explicit_row_ids,
                    pv.partition_values,
                    dv.delete_file_id AS dv_id, dv.path AS dv_path,
                    dv.file_format AS dv_format, dv.delete_count AS dv_delete_count,
@@ -130,6 +132,7 @@ class ScanService(private val jdbi: Jdbi) {
                             beginSnapshot = rs.getLong("begin_snapshot"),
                             specId = specId,
                             partitionValues = values,
+                            explicitRowIds = rs.getBoolean("explicit_row_ids"),
                         )
                     val dvId = rs.getLong("dv_id")
                     val deleteFile =

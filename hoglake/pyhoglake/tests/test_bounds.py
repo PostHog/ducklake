@@ -2,7 +2,7 @@
 
 import struct
 import uuid
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -65,14 +65,14 @@ def test_timestamp_micros():
 def test_timestamptz_converts_to_utc():
     tz = timezone(timedelta(hours=-5))
     dt = datetime(2026, 9, 4, 7, 0, 0, tzinfo=tz)  # == 12:00 UTC
-    utc = datetime(2026, 9, 4, 12, 0, 0, tzinfo=timezone.utc)
+    utc = datetime(2026, 9, 4, 12, 0, 0, tzinfo=UTC)
     assert encode_bound("timestamptz", dt) == encode_bound("timestamptz", utc)
     assert decode_bound("timestamptz", encode_bound("timestamptz", dt)) == utc
 
 
 def test_string_utf8():
     assert encode_bound("string", "ab") == b"\x61\x62"
-    assert encode_bound("string", "héllo") == "héllo".encode("utf-8")
+    assert encode_bound("string", "héllo") == "héllo".encode()
     assert decode_bound("string", b"\x61\x62") == "ab"
 
 
@@ -111,12 +111,14 @@ def test_decimal_minimal_twos_complement(unscaled, expected):
 
 
 def test_decimal_from_decimal_value():
-    assert encode_bound(
-        "decimal", Decimal("12.34"), {"precision": 10, "scale": 2}
-    ) == b"\x04\xd2"
-    assert encode_bound(
-        "decimal", Decimal("-1.00"), {"precision": 10, "scale": 2}
-    ) == b"\x9c"
+    assert (
+        encode_bound("decimal", Decimal("12.34"), {"precision": 10, "scale": 2})
+        == b"\x04\xd2"
+    )
+    assert (
+        encode_bound("decimal", Decimal("-1.00"), {"precision": 10, "scale": 2})
+        == b"\x9c"
+    )
     assert decode_bound("decimal", b"\x04\xd2", {"scale": 2}) == Decimal("12.34")
 
 

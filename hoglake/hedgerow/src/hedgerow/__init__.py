@@ -18,11 +18,14 @@ from .config import (
 )
 from .daemon import CycleResult, Hedgerow
 from .halts import (
+    DataIntegrityError,
     DeletesPresentError,
     FeedExpiredError,
     HaltError,
     IncarnationChangedError,
+    PersistentFailureError,
     SchemaMismatchError,
+    SplitBrainError,
 )
 from .projection import ProjectionPlan, validate_projection
 from .window import Window, plan_window
@@ -32,6 +35,7 @@ __version__ = "0.1.0"
 __all__ = [
     "ConfigError",
     "CycleResult",
+    "DataIntegrityError",
     "DeletesPresentError",
     "DestinationConfig",
     "FeedExpiredError",
@@ -41,14 +45,16 @@ __all__ = [
     "HedgerowConfig",
     "IncarnationChangedError",
     "MetricsConfig",
+    "PersistentFailureError",
     "ProjectionPlan",
     "ReplicationConfig",
     "S3Settings",
     "SchemaMismatchError",
     "SourceConfig",
+    "SplitBrainError",
     "Window",
+    "__version__",
     "load_config",
     "plan_window",
     "validate_projection",
-    "__version__",
 ]

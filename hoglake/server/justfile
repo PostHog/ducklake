@@ -1,6 +1,8 @@
-# hoglake server. All JVM work runs inside the flox env (JDK 21).
+# hoglake server. All JVM work runs inside the flox env (JDK 21),
+# through the checked-in Gradle wrapper (pinned in
+# gradle/wrapper/gradle-wrapper.properties).
 
-_gradle := "flox activate -- gradle"
+_gradle := "flox activate -- ./gradlew"
 
 # Default recipe: list all available recipes
 default:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Any
 
@@ -28,7 +28,7 @@ class CatalogInfo:
     schema_version: int
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "CatalogInfo":
+    def from_wire(cls, d: dict[str, Any]) -> CatalogInfo:
         return cls(**_pick(cls, d))
 
 
@@ -39,7 +39,7 @@ class CatalogOptions:
     snapshot_retention_seconds: int | None = None
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "CatalogOptions":
+    def from_wire(cls, d: dict[str, Any]) -> CatalogOptions:
         return cls(**_pick(cls, d))
 
 
@@ -52,7 +52,7 @@ class ExpiryResult:
     floored_by_consumer: str | None = None
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "ExpiryResult":
+    def from_wire(cls, d: dict[str, Any]) -> ExpiryResult:
         return cls(**_pick(cls, d))
 
 
@@ -63,7 +63,7 @@ class CleanupResult:
     still_referenced: int
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "CleanupResult":
+    def from_wire(cls, d: dict[str, Any]) -> CleanupResult:
         return cls(**_pick(cls, d))
 
 
@@ -73,7 +73,7 @@ class SnapshotChange:
     object_id: int | None = None
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "SnapshotChange":
+    def from_wire(cls, d: dict[str, Any]) -> SnapshotChange:
         return cls(**_pick(cls, d))
 
 
@@ -87,7 +87,7 @@ class Snapshot:
     changes: tuple[SnapshotChange, ...] = ()
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "Snapshot":
+    def from_wire(cls, d: dict[str, Any]) -> Snapshot:
         return cls(
             snapshot_id=d["snapshot_id"],
             snapshot_time=_parse_dt(d["snapshot_time"]),
@@ -108,7 +108,7 @@ class ConsumerOffset:
     updated_at: datetime
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "ConsumerOffset":
+    def from_wire(cls, d: dict[str, Any]) -> ConsumerOffset:
         d = dict(_pick(cls, d))
         d["updated_at"] = _parse_dt(d["updated_at"])
         return cls(**d)
@@ -120,7 +120,7 @@ class TableSummary:
     table_uuid: str
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "TableSummary":
+    def from_wire(cls, d: dict[str, Any]) -> TableSummary:
         return cls(**_pick(cls, d))
 
 
@@ -134,7 +134,7 @@ class Column:
     type_params: dict[str, Any] | None = None
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "Column":
+    def from_wire(cls, d: dict[str, Any]) -> Column:
         return cls(**_pick(cls, d))
 
 
@@ -145,7 +145,7 @@ class PartitionField:
     transform_param: int | None = None
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "PartitionField":
+    def from_wire(cls, d: dict[str, Any]) -> PartitionField:
         return cls(**_pick(cls, d))
 
     def to_wire(self) -> dict[str, Any]:
@@ -164,12 +164,10 @@ class PartitionSpec:
     fields: tuple[PartitionField, ...] = ()
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "PartitionSpec":
+    def from_wire(cls, d: dict[str, Any]) -> PartitionSpec:
         return cls(
             spec_id=d["spec_id"],
-            fields=tuple(
-                PartitionField.from_wire(f) for f in (d.get("fields") or ())
-            ),
+            fields=tuple(PartitionField.from_wire(f) for f in (d.get("fields") or ())),
         )
 
 
@@ -185,7 +183,7 @@ class TableInfo:
     partition_spec: PartitionSpec | None = None
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "TableInfo":
+    def from_wire(cls, d: dict[str, Any]) -> TableInfo:
         spec = d.get("partition_spec")
         return cls(
             name=d["name"],
@@ -247,7 +245,7 @@ class DataFile:
     partition_values: tuple[str | None, ...] | None = None
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "DataFile":
+    def from_wire(cls, d: dict[str, Any]) -> DataFile:
         d = dict(_pick(cls, d))
         if d.get("partition_values") is not None:
             d["partition_values"] = tuple(d["partition_values"])
@@ -265,7 +263,7 @@ class DeleteFile:
     begin_snapshot: int
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "DeleteFile":
+    def from_wire(cls, d: dict[str, Any]) -> DeleteFile:
         return cls(**_pick(cls, d))
 
 
@@ -275,7 +273,7 @@ class ScanFile:
     delete_file: DeleteFile | None = None
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "ScanFile":
+    def from_wire(cls, d: dict[str, Any]) -> ScanFile:
         df = d.get("delete_file")
         return cls(
             data_file=DataFile.from_wire(d["data_file"]),
@@ -292,7 +290,7 @@ class ChangesPlan:
     delete_files: tuple[DeleteFile, ...] = ()
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "ChangesPlan":
+    def from_wire(cls, d: dict[str, Any]) -> ChangesPlan:
         return cls(
             table_uuid=d["table_uuid"],
             from_snapshot=d["from_snapshot"],
@@ -313,7 +311,7 @@ class ViewInfo:
     sql: str
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "ViewInfo":
+    def from_wire(cls, d: dict[str, Any]) -> ViewInfo:
         return cls(**_pick(cls, d))
 
 
@@ -323,5 +321,5 @@ class CommitResult:
     schema_version: int | None = None
 
     @classmethod
-    def from_wire(cls, d: dict[str, Any]) -> "CommitResult":
+    def from_wire(cls, d: dict[str, Any]) -> CommitResult:
         return cls(**_pick(cls, d))

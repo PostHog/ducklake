@@ -2,7 +2,8 @@ import { useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { getTable, listFiles, planScan } from "../api/client";
-import type { Table } from "../api/types";
+import { isInt64String } from "../api/int64";
+import type { Int64, Table } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { StatsStateBadge } from "../components/badges";
@@ -47,37 +48,57 @@ function SnapshotSelector({
   snapshot,
   onChange,
 }: {
-  snapshot: number | undefined;
-  onChange: (s: number | undefined) => void;
+  snapshot: Int64 | undefined;
+  onChange: (s: Int64 | undefined) => void;
 }) {
-  const [draft, setDraft] = useState(snapshot?.toString() ?? "");
+  const [draft, setDraft] = useState(snapshot ?? "");
+  const [invalid, setInvalid] = useState(false);
   return (
     <form
       className="snapshot-selector"
       onSubmit={(e) => {
         e.preventDefault();
         const trimmed = draft.trim();
-        onChange(trimmed === "" ? undefined : Number(trimmed));
+        if (trimmed === "") {
+          setInvalid(false);
+          onChange(undefined);
+          return;
+        }
+        // Snapshot ids are int64; keep them as exact decimal strings — a
+        // Number() round-trip would silently retarget ids above 2^53.
+        if (!isInt64String(trimmed)) {
+          setInvalid(true);
+          return;
+        }
+        setInvalid(false);
+        onChange(trimmed);
       }}
     >
       <label>
         snapshot
         <input
-          type="number"
-          min={0}
+          inputMode="numeric"
           value={draft}
           placeholder="head"
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setInvalid(false);
+          }}
           aria-label="snapshot id"
+          aria-invalid={invalid}
         />
       </label>
       <button type="submit">Go</button>
+      {invalid && (
+        <span className="field-error">snapshot id must be a non-negative integer</span>
+      )}
       {snapshot !== undefined && (
         <button
           type="button"
           className="ghost"
           onClick={() => {
             setDraft("");
+            setInvalid(false);
             onChange(undefined);
           }}
         >
@@ -146,7 +167,7 @@ function FilesTab({
   catalog: string;
   namespace: string;
   table: string;
-  snapshot?: number;
+  snapshot?: Int64;
 }) {
   const { data, isPending, isError, error } = useQuery({
     queryKey: ["files", catalog, namespace, table, snapshot ?? "head"],
@@ -215,7 +236,7 @@ function ScanTab({
   catalog: string;
   namespace: string;
   table: string;
-  snapshot?: number;
+  snapshot?: Int64;
 }) {
   const { data, isPending, isError, error } = useQuery({
     queryKey: ["scan", catalog, namespace, table, snapshot ?? "head"],
@@ -282,9 +303,14 @@ export function TablePage() {
 
   const tabParam = searchParams.get("tab");
   const tab: Tab = TABS.includes(tabParam as Tab) ? (tabParam as Tab) : "schema";
+  // A non-numeric ?snapshot (typo, mangled link) is ignored — treated as
+  // head — rather than becoming NaN on screen and on the wire. Valid ids
+  // stay exact decimal strings (int64: no Number round-trip).
   const snapshotParam = searchParams.get("snapshot");
   const snapshot =
-    snapshotParam !== null && snapshotParam !== "" ? Number(snapshotParam) : undefined;
+    snapshotParam !== null && snapshotParam !== "" && isInt64String(snapshotParam)
+      ? snapshotParam
+      : undefined;
 
   const enabled = Boolean(catalog && namespace && table);
   const tableQuery = useQuery({
@@ -337,7 +363,7 @@ export function TablePage() {
         </div>
         <SnapshotSelector
           snapshot={snapshot}
-          onChange={(s) => setParam("snapshot", s?.toString())}
+          onChange={(s) => setParam("snapshot", s)}
         />
       </div>
       {tab === "schema" &&

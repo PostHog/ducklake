@@ -21,13 +21,13 @@ from __future__ import annotations
 
 import struct
 import uuid as _uuid
-from datetime import date, datetime, time, timezone
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, localcontext
 from typing import Any
 
 _EPOCH_DATE = date(1970, 1, 1)
-_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_EPOCH_NAIVE = datetime(1970, 1, 1)
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
+_EPOCH_NAIVE = datetime(1970, 1, 1)  # noqa: DTZ001  # naive epoch is the codec's intent for timestamp-without-tz
 
 
 def _minimal_twos_complement(n: int) -> bytes:
@@ -51,9 +51,7 @@ def _unscaled(value: Any, scale: int) -> int:
         ctx.prec = 60
         shifted = value.scaleb(scale)
     if shifted != shifted.to_integral_value():
-        raise ValueError(
-            f"decimal value {value} does not fit scale {scale} exactly"
-        )
+        raise ValueError(f"decimal value {value} does not fit scale {scale} exactly")
     return int(shifted)
 
 

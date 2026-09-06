@@ -32,7 +32,7 @@ where it is enforced.
 |---|---|---|
 | 1 | No central scheduler / no flush-cadence coupling | One writer loop, its own clock; the write IS the pacing (`Hedgerow.run_forever`: poll → write → commit-offset → repeat). Nothing external tells the loop when to flush. |
 | 2 | Offsets strictly after durability | Rows-then-offset, always. The offset only ever moves to a fully applied `plan.to_snapshot` (commit-through-complete-windows). Crash between append and offset-commit → the window replays → **duplicates possible: AT-LEAST-ONCE** (see below). |
-| 3 | Incarnation guard | Source and destination `table_uuid`s are pinned at startup; every cycle re-resolves by name and HALTS loudly (nonzero exit, clear message) on any mismatch or disappearance. Never silently continue against a recreated table. |
+| 3 | Incarnation guard | Source and destination `table_uuid`s are pinned at startup; every cycle re-resolves by name and HALTS loudly (nonzero exit, clear message) on any mismatch or disappearance. The guard extends to the **write path**: every append ships the pinned uuid as pyhoglake's `expected_table_uuid` on the commit body, and the destination server enforces it **atomically at commit time** (409, zero writes, on mismatch — see pyhoglake's `append` docs), so a destination drop+recreate mid-window halts the cycle instead of splitting appends across incarnations. Never silently continue against a recreated table. |
 | 4 | 410 is a stop sign | `ExpiredError` from `changes()` → HALT loudly, carrying the server's reconcile instructions. Never skip a gap silently (the retention-clamp lesson). |
 | 5 | Bounded memory | Never more than `max_rows_per_append` rows materialized. Files are processed sequentially; each parquet is streamed batch-by-batch. No queues, no buffers beyond the current batch. |
 | 6 | Fail-fast config validation | Startup resolves both tables and validates the projection (destination columns must exist in the source by NAME and TYPE); refusal messages carry a precise per-column diff. Bad filter values refuse to start too. |
@@ -50,6 +50,18 @@ alternative failure mode (offset ahead of data) silently loses rows.
 Downstream consumers that need exactly-once must deduplicate (e.g. on
 the source's row identity or an event key). The offset never covers rows
 that have not been appended.
+
+Duplicate amplification is **bounded**: a transient failure mid-window
+makes the next cycle re-read the committed offset from the source
+catalog (the authoritative restart point) and replay the window — and
+each replay can duplicate every row appended before the failure, so
+replays are capped at `replication.max_window_replays` (default 3)
+consecutive failures. Every replay logs a loud
+`window replay N: duplicates possible` line; exhausting the budget HALTS
+as a persistent failure (exit 9) instead of duplicating forever.
+Permanent client errors (validation, not-found, already-exists) skip the
+replay budget entirely and halt immediately — a retry would fail
+identically while still re-appending rows.
 
 ## Config reference
 
@@ -76,12 +88,17 @@ destination:                        # may be the same server
 
 filter:                             # optional client-side row filter
   column: team_id                   # may be a column the destination drops
-  equals: 42                        # NULLs never match
+  equals: 42                        # NULLs never match; null is REFUSED
+                                    # (a null filter matches nothing)
 
 replication:
-  poll_interval_s: 5                # sleep when caught up (or after an error)
+  poll_interval_s: 5                # sleep when caught up (or after an error);
+                                    # minimum 0.1 (0 would busy-spin the loop)
   max_snapshot_window: 1000         # snapshots per cycle, max
   max_rows_per_append: 100000       # rows per destination append, max
+  max_window_replays: 3             # transient-failure retries per window;
+                                    # each replay may duplicate the window's
+                                    # rows; exhausting it HALTS (exit 9)
 
 metrics:
   port: 0                           # 0 = disabled; >0 serves /metrics
@@ -103,19 +120,32 @@ Column projection: the destination table's columns define the projected
 set. The source must have all of them (same name, same type); extra
 source columns are dropped; the filter column may be a dropped column.
 Known limitation: files written before a source `add_column` do not
-contain that column and will fail the read — evolve the destination
-first, or start the destination at a post-alter offset.
+contain that column. The parquet read itself does NOT fail — pyarrow
+silently omits a requested column that is absent from the file — but the
+cycle still fails loudly downstream (the projection/filter step raises
+on the missing column), so the offset never advances past unread data;
+after `max_window_replays` retries it halts as persistent. Evolve the
+destination first, or start the destination at a post-alter offset.
 
 Metrics (when enabled): `hedgerow_rows_replicated_total`,
 `hedgerow_cycles_total`, `hedgerow_errors_total`,
 `hedgerow_last_committed_snapshot`, `hedgerow_lag_snapshots`
-(source head − committed offset).
+(source head − committed offset). Caveat: `hedgerow_lag_snapshots` is
+**catalog-scoped** — snapshot ids are dense per *catalog*, and the head
+advances on every commit to ANY table in the source catalog, so on a
+busy shared catalog the lag counts catalog snapshots, not pending data
+for this table. A nonzero lag can be entirely other tables' commits
+(the next cycle drains it as an empty window); use it as a
+staleness/liveness signal, not a volume estimate.
 
-## Runbook: the three halt conditions
+## Runbook: the seven halt conditions
 
 hedgerow HALTS (exits nonzero, no retry) when continuing would be wrong.
 A supervisor must NOT blindly restart these — the same condition will
-halt again. Exit codes distinguish them.
+halt again (or worse, resume into a wrong state). Exit codes distinguish
+them: 3 incarnation changed, 4 changefeed expired, 5 deletes present,
+6 schema mismatch (startup refusal), 7 split-brain offset, 8 data
+integrity, 9 persistent failure.
 
 ### 1. Incarnation changed (exit 3)
 
@@ -124,7 +154,17 @@ resolved uuid Y` (or `... no longer exists`).
 
 The table hedgerow was replicating was dropped (and possibly recreated
 under the same name). The committed consumer offset belongs to the OLD
-incarnation; snapshot ranges and row ids do not carry over. Recovery:
+incarnation; snapshot ranges and row ids do not carry over.
+
+The semantics of this exit tightened with the server-side commit guard:
+a destination recreation is now caught **atomically at commit time**
+(the server 409s any append carrying a stale `expected_table_uuid`,
+with zero writes), so exit 3 guarantees the NEW incarnation accepted
+none of this window's rows — the previous resolve-then-commit race is
+closed. The remaining exposure is only rows appended to an old
+incarnation before it was dropped: they are gone with it, and the
+offset never covers them (it only moves after a fully applied window),
+so the window replays once hedgerow is re-pointed. Recovery:
 decide deliberately what the new table means. If the recreate was
 intentional and you want replication of the new incarnation from
 scratch, point hedgerow at it with a NEW `consumer_id` (or after
@@ -157,8 +197,54 @@ the source, or rebuild the destination from a full scan at a snapshot
 past the deletes and manually commit the offset there. (Delete-aware
 replication is explicitly out of v1's contract.)
 
-(Schema mismatch — exit 6 — is a refusal to start, not a runtime halt:
-fix the destination schema or the source, per the diff in the message.)
+### 4. Schema mismatch (exit 6)
+
+A refusal to start, not a runtime halt: the destination's columns do not
+project from the source. Fix the destination schema or the source, per
+the precise per-column diff in the message.
+
+### 5. Split-brain offset (exit 7)
+
+*Message:* `offset commit for consumer '...' was rejected as a
+regression ... Another writer shares this consumer_id.`
+
+The source catalog refused our offset commit (409) because the stored
+offset is already PAST our window: some other writer — almost always a
+second hedgerow with a copy-pasted `consumer_id` — advanced it. If that
+twin writes to a different destination, the rows between our window and
+the foreign offset were never replicated to OUR destination; adopting
+the foreign offset would make that loss permanent and silent, so
+hedgerow never does. Recovery: find and stop (or rename) the colliding
+consumer, audit which destination actually received which snapshots,
+then set the offset deliberately (or backfill the gap from a scan) and
+restart.
+
+### 6. Data integrity (exit 8)
+
+*Message:* `data file ... delivered N row(s) but the change plan records
+record_count=M.`
+
+A data file yielded a different row count than the server-side metadata
+promised — a truncated/stale object-store read, a reader bug, or file
+content that does not match the catalog. The offset was NOT committed.
+Recovery: verify the file in object storage against the catalog entry
+(`record_count`, `file_size_bytes`); a transient object-store issue
+clears on restart (the window replays), a corrupt or replaced file is a
+source-catalog incident to resolve before resuming.
+
+### 7. Persistent failure (exit 9)
+
+*Message:* `permanent client error ...` or `window replay budget
+exhausted: ... (replication.max_window_replays=N) all failed`.
+
+Either a permanent client error (validation/not-found/already-exists —
+retrying fails identically), or `max_window_replays` consecutive
+transient failures. Every replay attempt may have appended duplicate
+rows (each was logged `window replay N: duplicates possible`); the
+offset never moved. Recovery: fix the underlying cause (the halt names
+the last error), expect up to `1 + max_window_replays` copies of the
+window's rows in the destination worst-case, and restart — the window
+replays once more from the committed offset.
 
 ## Development
 

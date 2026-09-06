@@ -23,7 +23,7 @@ import json
 import math
 import struct
 import uuid as _uuid
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, localcontext
 from pathlib import Path
 
@@ -40,7 +40,7 @@ VECTORS = DOC["vectors"]
 
 _EPOCH_DATE = date(1970, 1, 1)
 _EPOCH_NAIVE = datetime(1970, 1, 1)
-_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _parse_value(vec):
@@ -122,8 +122,19 @@ def test_vector_file_header_contract():
     assert DOC["format"] == "hoglake-bounds-vectors"
     assert DOC["version"] == 1
     assert set(DOC["value_conventions"]) >= {
-        "boolean", "int", "long", "float", "double", "date", "time",
-        "timestamp", "timestamptz", "string", "uuid", "binary", "decimal",
+        "boolean",
+        "int",
+        "long",
+        "float",
+        "double",
+        "date",
+        "time",
+        "timestamp",
+        "timestamptz",
+        "string",
+        "uuid",
+        "binary",
+        "decimal",
     }
     assert len(VECTORS) >= 40
     for vec in VECTORS:
@@ -159,15 +170,34 @@ def test_python_codec_matches_vector(vec):
 def test_all_coltypes_are_covered():
     covered = {v["type"] for v in VECTORS}
     assert covered == {
-        "boolean", "int", "long", "float", "double", "date", "time",
-        "timestamp", "timestamptz", "string", "uuid", "binary", "decimal",
+        "boolean",
+        "int",
+        "long",
+        "float",
+        "double",
+        "date",
+        "time",
+        "timestamp",
+        "timestamptz",
+        "string",
+        "uuid",
+        "binary",
+        "decimal",
     }
 
 
 def test_fixed_width_vectors_have_fixed_width_hex():
     widths = {
-        "boolean": 1, "int": 4, "long": 8, "float": 4, "double": 8,
-        "date": 4, "time": 8, "timestamp": 8, "timestamptz": 8, "uuid": 16,
+        "boolean": 1,
+        "int": 4,
+        "long": 8,
+        "float": 4,
+        "double": 8,
+        "date": 4,
+        "time": 8,
+        "timestamp": 8,
+        "timestamptz": 8,
+        "uuid": 16,
     }
     for vec in VECTORS:
         w = widths.get(vec["type"])

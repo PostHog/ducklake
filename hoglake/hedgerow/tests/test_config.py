@@ -84,9 +84,7 @@ def test_missing_top_level_section(key):
         HedgerowConfig.parse(raw)
 
 
-@pytest.mark.parametrize(
-    "key", ["url", "catalog", "namespace", "table", "consumer_id"]
-)
+@pytest.mark.parametrize("key", ["url", "catalog", "namespace", "table", "consumer_id"])
 def test_missing_source_key(key):
     raw = _valid()
     del raw["source"][key]
@@ -131,14 +129,27 @@ def test_filter_equals_may_be_falsy():
     assert HedgerowConfig.parse(raw).filter.equals == 0
 
 
+def test_filter_equals_null_refused():
+    # BUG-5 regression: `equals:` / `equals: null` matches nothing —
+    # silent 100% drop. Refused at parse time.
+    raw = _valid()
+    raw["filter"] = {"column": "team_id", "equals": None}
+    with pytest.raises(ConfigError, match="non-null"):
+        HedgerowConfig.parse(raw)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
         ("poll_interval_s", -1),
+        ("poll_interval_s", 0),  # would busy-spin the loop; min 0.1
+        ("poll_interval_s", 0.05),
         ("poll_interval_s", "fast"),
         ("max_snapshot_window", 0),
         ("max_rows_per_append", 0),
         ("max_rows_per_append", 1.5),
+        ("max_window_replays", -1),
+        ("max_window_replays", 1.5),
     ],
 )
 def test_replication_bounds(field, value):
@@ -148,11 +159,32 @@ def test_replication_bounds(field, value):
         HedgerowConfig.parse(raw)
 
 
+def test_max_window_replays_default_and_parse():
+    raw = _valid()
+    assert HedgerowConfig.parse(raw).replication.max_window_replays == 3
+    raw["replication"]["max_window_replays"] = 0  # halt on first failure
+    assert HedgerowConfig.parse(raw).replication.max_window_replays == 0
+
+
 def test_type_errors_are_precise():
     raw = _valid()
     raw["source"]["url"] = 12
     with pytest.raises(ConfigError, match="source.url must be a non-empty string"):
         HedgerowConfig.parse(raw)
+
+
+@pytest.mark.parametrize("key", ["access_key", "secret_key"])
+def test_credential_values_never_appear_in_errors(key):
+    # a mistyped credential (e.g. YAML parsed it as an int) must not leak
+    # the value into logs via the error message — type name only.
+    raw = _valid()
+    raw["source"]["s3"][key] = 981276345
+    with pytest.raises(ConfigError) as ei:
+        HedgerowConfig.parse(raw)
+    msg = str(ei.value)
+    assert "981276345" not in msg
+    assert f"source.s3.{key}" in msg
+    assert "int" in msg
 
 
 def test_s3_path_style_must_be_bool():

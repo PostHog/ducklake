@@ -10,10 +10,40 @@ from pyhoglake import Catalog, Table
 
 from ..context import Bench
 from ..fabricate import BENCH_SCHEMA, append_payload
-from ..runner import FailureGuard, InvariantViolation, run_loop
+from ..runner import FailureGuard, InsufficientSamples, InvariantViolation, run_loop
 from ..stats import Metric
 
 RATIO_FLAG_THRESHOLD = 1.5
+
+# Every stage that feeds a regression ratio must have at least this many
+# measured samples, or the run aborts (exit 3) instead of emitting a
+# vacuous ratio from thin air.
+MIN_GUARDED_SAMPLES = 20
+
+# Every guarded stage runs this many identical, discarded warm ops
+# before measurement, so both sides of a ratio are compared at the same
+# thermal state (a cold fresh-catalog baseline vs a seed-warmed
+# preseeded stage hides real O(catalog) regressions behind cold-cache
+# inflation of the baseline).
+THERMAL_WARM_OPS = 40
+
+
+def require_samples(
+    count: int, what: str, floor: int = MIN_GUARDED_SAMPLES
+) -> None:
+    """Abort loudly when a guarded stage measured too few ops for a
+    trustworthy ratio — never let a ratio compute from ~0 samples."""
+    if count < floor:
+        raise InsufficientSamples(
+            f"insufficient samples for a trustworthy ratio: {what} "
+            f"measured {count} ops, floor is {floor} — raise --ops or "
+            "--duration instead of trusting a ratio built on noise"
+        )
+
+
+def notice(message: str) -> None:
+    """Loud stderr notice for skipped checks / truncated phases."""
+    print(f"NOTICE: {message}", file=sys.stderr, flush=True)
 
 
 @dataclass

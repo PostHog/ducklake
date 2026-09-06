@@ -9,11 +9,18 @@ directory and does not touch the fork's `src/`.
 **Never push broken code.** Before every commit and push:
 
 ```bash
-just test-all        # server suite (Docker required) + pyhoglake suite
-just server lint     # ktlint check (server Kotlin style gate)
+cd server && flox activate -- ./gradlew :test         # server suite via the wrapper (Docker required)
+cd server && flox activate -- ./gradlew :ktlintCheck  # ktlint check (server Kotlin style gate)
+just pyhoglake test  # pyhoglake suite
 just webui test      # vitest (no server needed)
 just hedgerow test   # unit; integration needs a live server
 ```
+
+The server builds through the **checked-in Gradle wrapper**
+(`server/gradlew`, pinned in
+`server/gradle/wrapper/gradle-wrapper.properties`) — never a
+system-installed gradle. The `just server ...` recipes route through it
+too, so `just test-all` (server + pyhoglake) stays equivalent.
 
 For the full end-to-end pass (client/hedgerow integration tests against
 a real server): `just server compose-up && just server run` in another
@@ -24,7 +31,11 @@ ran.
 The server suite includes the **schema equivalence gate**
 (`just server schema-check`): fold(migrations) must equal `schema.sql`.
 If you touch a migration, update `schema.sql` in the same change or
-this fails.
+this fails. It also includes the **mapper-coverage gate**
+(`MapperCoverageGateIntegrationTest`): every hog_* table's live columns
+must equal the set declared in `persistence/HogSchemaColumns.kt` — a
+new column means updating the row mapper(s) named there AND the
+declaration, or the gate fails naming the table and column.
 
 Prefer fixup commits over amending and force-pushing.
 
@@ -39,7 +50,7 @@ React console, Python replication daemon:
 
 | Component | What | Stack | Tests |
 |---|---|---|---|
-| `server/` | The control plane: DDL, commits (OCC), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, metrics, audit | Kotlin 2.2 / JDK 21 (flox) / Ktor / JDBI / Flyway | JUnit5 + Testcontainers (PG16, MinIO) + kotest-property |
+| `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, verify, metrics, audit | Kotlin 2.2 / JDK 21 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit5 + Testcontainers (PG16, MinIO) + kotest-property |
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
 | `webui/` | Lakekeeper-style management console | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
@@ -60,17 +71,33 @@ spec and the implementations together.
    file, tile `[0, total)` per table, never reused — the lineage
    guarantee. `table_uuid` changes on drop+recreate; consumers key on
    it and must SEE incarnation changes (hedgerow halts on them).
+   Compaction preserves ids by materializing them: outputs carry an
+   explicit physical `_hog_row_id` int64 column under the **reserved
+   parquet field id 2147483646** (never allocatable to a real column),
+   flagged by `hog_data_file.explicit_row_ids` — when set,
+   `row_id_start` is only min(input ids), not positional. Sorting on
+   rewrite is safe *only* because of this; positional reassignment of
+   merged rows is the predecessor's rowid-remap bug and must never
+   return.
 3. **One live deletion vector per data file** (unique partial index);
    supersessions only grow (`delete_count` monotone); a DV newer than
    your `read_snapshot` is a 409, never a lost update.
 4. **Physical deletion is never authorized by the queue**: cleanup
    liveness-checks every path against live references at drain time;
    `still_referenced > 0` is an invariant violation, alerted, not
-   deleted.
+   deleted. Draining soft-deletes: settled `hog_file_removal` rows keep
+   `drained_at`/`drained_outcome` (the queryable forensics ledger,
+   purged past `HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS`, default 30d);
+   undrained rows accumulate `attempts`/`last_attempt_at`.
 5. **Expiry never passes head or (when `consumer_floor`) the min
    consumer offset**, and names the pinning consumer. Ranges below
    `earliest_snapshot_id` are 410 Gone — consumers reconcile, never
-   silently skip.
+   silently skip; the floor advance captures
+   `hog_catalog.earliest_snapshot_time` so 410s can say WHEN the floor
+   was reached. A fifth sweep step deletes versioned DDL rows
+   (`hog_table_version`/`hog_column`/`hog_partition_spec`/`hog_sort_spec`/
+   `hog_view`) whose `end_snapshot <= earliest_snapshot_id` — invisible
+   at every retained snapshot, so DDL churn cannot grow them unbounded.
 6. **Versioned-row visibility**: a row is visible at S iff
    `begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot)`.
    Every read path uses exactly this predicate.
@@ -97,8 +124,18 @@ spec and the implementations together.
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
   conflict-rule review in `CommitService`.
 - **Errors**: services throw `HoglakeException.*`; the API maps them
-  (404/409/410/422; parse failures 400). New failure modes get a typed
-  exception, not a status code sprinkled in a route.
+  (404/409/410/422; commit admission timeout 503 + Retry-After; parse
+  failures 400). New failure modes get a typed exception, not a status
+  code sprinkled in a route.
+- **Background loops are coroutines**: every periodic job (hydrator,
+  expiry, cleanup, compaction, metrics sampler) registers with
+  `BackgroundLoops` (one supervisor scope owned by
+  `App.startBackground()`) — never a raw daemon thread. Contracts:
+  `intervalMs <= 0` = disabled; a failed iteration is logged + counted
+  (`hoglake_background_loop_failures_total{loop}`) and the loop (and
+  its siblings) keeps running; shutdown is structured and bounded
+  (cancel + join, 5s hard cap). Tests drive the services'
+  `runOnce`/`sampleOnce` entry points directly, not the scheduler.
 - **Multi-agent work**: partition by package/file ownership; frozen
   shared files (build files, Model.kt, migrations, spec) change only
   through the integrating session; agents report needed changes rather
@@ -114,17 +151,39 @@ spec and the implementations together.
 
 ## Known deferrals / open items
 
-- **Compaction (M4) — UNBLOCKED (decision 2026-09-05)**: Hardwood
-  1.1.0.Beta1 reads `PARQUET:field_id` but drops it on write (verified
-  to bytecode), so the compaction rewrite writer is **parquet-java**,
-  quarantined in the compaction module — the Hadoop dependency tree
-  does not leak elsewhere. Hardwood stays for footer reads (the
-  hydrator; read side is correct and tested). An upstream Hardwood
-  field-id-write fix is being pursued; when it lands, swap the
-  compaction writer back and drop parquet-java. pyarrow (pyhoglake)
-  writes field ids correctly already.
+- **Compaction (M4) — LANDED**: `server/compaction/` — planning is
+  metadata-only (live, DV-free, same spec + partition values, under
+  target bytes; adjacency NOT required), rewrite via **parquet-java**
+  (the project's one parquet library — decision 2026-09-05: Hardwood is
+  out entirely; parquet-java handles footer reads in the hydrator AND
+  the compaction writer), commit under the catalog lock with input
+  re-verification. Deferred: DV-bearing files are never compacted
+  (rewriting deleted rows away would change row-id semantics),
+  heterogeneous-schema groups stay uncompacted, background loop
+  defaults OFF (`HOGLAKE_COMPACTION_INTERVAL_MS=0`), aborted-group
+  uploads orphan in the bucket (lifecycle rules are the backstop).
+- **Field ids are a contract**: the hydrator's footer read flags files
+  whose parquet schema has any leaf without `PARQUET:field_id`
+  (`hog_data_file.missing_field_ids`; gauge
+  `hoglake_missing_field_id_files{catalog}`; the reserved `_hog_row_id`
+  id 2147483646 is fine). While a flagged file is LIVE, `rename_column`
+  is refused with 409 `idless_files_present` (id-less files bind
+  columns by name; renaming would silently NULL their history in
+  readers). `rename_table` is unaffected. Files registered with inline
+  stats never pass through the hydrator, so only deferred-stats files
+  get checked — a known gap until a verify endpoint exists.
+- **Maintenance verify — LANDED**: `POST
+  /v1/catalogs/{c}/maintenance/verify` (gaps.md B3, absorbing B4) — the
+  QE suite's global-invariant SQL as a metadata-only, read-only
+  endpoint (REPEATABLE READ MVCC snapshot, no catalog lock): row-id
+  tiling (explicit_row_ids-aware), DV uniqueness/monotonicity/bounds,
+  orphaned live rows on dropped tables, still-referenced removal-queue
+  entries, true snapshot density, next_row_id consistency.
 - **CDC publications to Kafka (the WAL tap)**: fully specified in the
   OpenAPI (501s) + README; not implemented.
+- **DR/export**: `GET /v1/catalogs/{c}/export` specified in the OpenAPI
+  (snapshot range + live-file manifest + consumer offsets, consistent
+  at head); 501 stub until built (gaps.md B5).
 - **Iceberg REST facade + Trino**: design obligations in
   [iceberg-federation.md](iceberg-federation.md) /
   [trino-integration.md](trino-integration.md); v1 schema already

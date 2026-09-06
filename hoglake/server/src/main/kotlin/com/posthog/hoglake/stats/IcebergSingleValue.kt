@@ -160,6 +160,93 @@ object IcebergSingleValue {
                 }
         }
 
+    /**
+     * Inverse of [encode] — mirrors pyhoglake's `decode_bound` (the two
+     * codecs are kept bit-identical by the shared vector file
+     * pyhoglake/tests/vectors/bounds_vectors.json). Returns the natural
+     * JVM value for each type: Boolean, Int (int/date-days), Long
+     * (long/time/timestamp micros), Float, Double, String, UUID,
+     * ByteArray (binary), BigInteger (decimal UNSCALED — the scale is
+     * carried by the column type, exactly like [encodeDecimalUnscaled]).
+     * The invariant `encode(type, decode(type, b)) contentEquals b`
+     * holds for every well-formed encoding.
+     */
+    fun decode(
+        type: ColType,
+        data: ByteArray,
+    ): Any =
+        when (type) {
+            ColType.BOOLEAN -> {
+                expectLength(type, data, 1)
+                data[0] != 0.toByte()
+            }
+            ColType.INT, ColType.DATE -> {
+                expectLength(type, data, 4)
+                ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).int
+            }
+            ColType.LONG, ColType.TIME, ColType.TIMESTAMP, ColType.TIMESTAMPTZ -> {
+                expectLength(type, data, 8)
+                ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).long
+            }
+            ColType.FLOAT -> {
+                expectLength(type, data, 4)
+                Float.fromBits(ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).int)
+            }
+            ColType.DOUBLE -> {
+                expectLength(type, data, 8)
+                Double.fromBits(ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).long)
+            }
+            ColType.STRING -> String(data, Charsets.UTF_8)
+            ColType.UUID_T -> {
+                expectLength(type, data, 16)
+                val buf = ByteBuffer.wrap(data)
+                UUID(buf.long, buf.long)
+            }
+            ColType.BINARY -> data.copyOf()
+            ColType.DECIMAL -> {
+                require(data.isNotEmpty()) { "empty decimal encoding" }
+                BigInteger(data)
+            }
+        }
+
+    /**
+     * Typed comparison of two [decode]d values for [type]. STRING
+     * compares as UTF-8 bytes unsigned (== code-point order — Java's
+     * String.compareTo is UTF-16 unit order, which disagrees above the
+     * BMP); UUID/BINARY compare bytes unsigned; everything else through
+     * its natural Comparable. This is what makes compaction's
+     * bounds-merge correct where a raw byte compare of the ENCODINGS
+     * would not be (signed little-endian ints do not sort bytewise).
+     */
+    @Suppress("UNCHECKED_CAST")
+    fun compareValues(
+        type: ColType,
+        a: Any,
+        b: Any,
+    ): Int =
+        when (type) {
+            ColType.STRING ->
+                java.util.Arrays.compareUnsigned(
+                    (a as String).toByteArray(Charsets.UTF_8),
+                    (b as String).toByteArray(Charsets.UTF_8),
+                )
+            ColType.BINARY ->
+                java.util.Arrays.compareUnsigned(a as ByteArray, b as ByteArray)
+            ColType.UUID_T ->
+                java.util.Arrays.compareUnsigned(encodeUuid(a as UUID), encodeUuid(b as UUID))
+            else -> (a as Comparable<Any>).compareTo(b)
+        }
+
+    private fun expectLength(
+        type: ColType,
+        data: ByteArray,
+        expected: Int,
+    ) {
+        require(data.size == expected) {
+            "cannot decode ${type.wire}: expected $expected bytes, got ${data.size}"
+        }
+    }
+
     private inline fun <reified T> expect(
         type: ColType,
         value: Any,

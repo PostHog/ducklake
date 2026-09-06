@@ -90,9 +90,9 @@ compose stack; treat them as shape, not capacity planning:
 
 | Guard | Predecessor pathology | Hoglake, measured |
 |---|---|---|
-| Commit latency vs catalog size | 5–7s stats load per attempt at 59K tables; 190–264s single-table commits | **Flat**: p50 ratio ~1.0 with 10K preseeded snapshots (guard flags > 1.5×) |
+| Commit latency vs catalog size | 5–7s stats load per attempt at 59K tables; 190–264s single-table commits | **Flat**: p50 ratio ~1.0 with 10K preseeded snapshots AND with 150–500 live tables (`wide-catalog`); guard verified against seeded regressions (an injected 2.5× tax flags at 2.18× under thermal-equalized baselines; residual JVM-warmth headroom documented — a true 2.5× still flags at ~1.6 live) |
 | Snapshot expiry | ~14ms/snapshot (~50h per 15M backlog) | **14,462 snapshots/s** (~200×), 14,885 files queued/s |
-| Concurrent appends | Superlinear collapse on busy catalogs; commit-storm convoys | 0 conflicts at K=1–8; per-writer p99 grows linearly (3.3→22.5ms); aggregate plateaus ~380 commits/s at the advisory-lock tail (~2.5ms hold) |
+| Concurrent appends | Superlinear collapse on busy catalogs; commit-storm convoys | 0 conflicts at K=1–8; per-writer p99 grows linearly (3.3→22.5ms); aggregate plateaus ~380 commits/s — consistent with the serialized commit tail, though the harness hasn't isolated client-side share of that ceiling |
 | Delete races | Generic conflicts, lost-update risk | 0 lost updates under deliberate hot-file contention; retry-to-success p50 5.6ms |
 | Changefeed reads | Cost scaled with snapshot span/catalog | Latency correlates 0.998 with rows returned, not catalog size |
 | DDL churn | Dropped-table stats taxed every commit forever | Post-churn commit p50 ratio 0.64 — no residual tax |
@@ -412,7 +412,7 @@ Not decided; criteria that matter, given the above:
 
 | Criterion | JVM | Rust | Go |
 |---|---|---|---|
-| Parquet write quality | parquet-java (the pain you know); **[Hardwood](https://github.com/hardwood-hq/hardwood) to investigate** — modern minimal-dependency parquet reader/writer (no Hadoop/Avro tree, multithreaded, GraalVM-ready; 1.1.0.Beta1 as of 2026-08) | arrow-rs/parquet-rs: excellent | weakest of the three |
+| Parquet write quality | parquet-java (the pain you know — settled on it 2026-09-05: Hardwood was evaluated and dropped; its 1.1.0.Beta1 writer lost `PARQUET:field_id`, and field ids are a registration contract here) | arrow-rs/parquet-rs: excellent | weakest of the three |
 | Iceberg REST facade leverage | iceberg-java: best | iceberg-rust: maturing | iceberg-go: partial |
 | Trino affinity (future native connector) | native | via REST only | via REST only |
 | Postgres story | mature | sqlx/tokio-postgres: mature | mature |
@@ -434,7 +434,14 @@ arrow-java is a container/interchange library with thin compute
 kernels vs arrow-rs — fine while the server shovels Arrow rather than
 computing over it; (3) parquet-java, which the footer-shipping commit
 protocol confines to footer parsing during hydration (thrift metadata
-decode, not data pages) — and which Hardwood may replace outright.
+decode, not data pages) plus the compaction rewrite writer. That
+hydration footer read also enforces the **field-id registration
+contract**: every leaf of a registered file's parquet schema must
+carry a `PARQUET:field_id` (files bind to catalog columns by id, never
+by name); files without ids are flagged
+(`hog_data_file.missing_field_ids`) and block column renames while
+live, since a name-bound file would silently lose the renamed column's
+history in readers.
 
 ## Phases
 

@@ -25,9 +25,10 @@ lives at `src/main/resources/openapi/hoglake.yaml` and is served at
                       └─────────────────────────┘
 ```
 
-The server never opens a data file to admit it, never writes data
-files, and touches object storage in exactly two places: the hydrator's
-footer reads and cleanup's physical deletes.
+The server never opens a data file to admit it, and touches object
+storage in exactly three places: the hydrator's footer reads, cleanup's
+physical deletes, and compaction's rewrite (the one background job that
+reads and writes data files — always outside the commit path).
 
 ## The data model
 
@@ -111,15 +112,25 @@ mechanically.
 
 Stats may also be **deferred**: a file registers with only
 `record_count` (mandatory — row-id assignment needs it) and
-`stats_state='pending'`. The **hydrator** (`hydrator/Hydrator.kt`)
-sweeps pending files in the background: two ranged S3 reads fetch the
-parquet footer (never data pages), stats aggregate across row groups,
-columns map by embedded field id (name fallback with a warning), bounds
-encode by catalog type, and the file flips to `provided` — or `failed`,
-loudly, if the footer contradicts the registration (a lying
-`record_count` is fraud, not a discrepancy). One bad file never wedges
-a sweep. Until hydrated, a pending file simply matches every scan:
-correctness holds, pruning quality lags.
+`stats_state='pending'`. The **hydrator** (`hydrator/Hydrator.kt`,
+parquet-java) sweeps pending files in the background: a ranged S3 read
+fetches the parquet footer (never data pages), stats aggregate across
+row groups, columns map by embedded field id (name fallback with a
+warning), bounds encode by catalog type, and the file flips to
+`provided` — or `failed`, loudly, if the footer contradicts the
+registration (a lying `record_count` is fraud, not a discrepancy). One
+bad file never wedges a sweep. Until hydrated, a pending file simply
+matches every scan: correctness holds, pruning quality lags.
+
+The footer read doubles as the **field-id contract check**: any leaf
+without a `PARQUET:field_id` flags the row
+(`hog_data_file.missing_field_ids`, gauged as
+`hoglake_missing_field_id_files{catalog}`; the reserved `_hog_row_id`
+id on compacted files is fine). Id-less files bind columns by name, so
+while one is LIVE the table's `rename_column` fails with 409
+`idless_files_present` — renaming would silently NULL that column's
+history in readers. `rename_table` is unaffected, and the flag clears
+from relevance when the file is compacted away, dropped, or expired.
 
 ### Row lineage
 
@@ -217,18 +228,60 @@ offset**, so expiry can never outrun a lagging consumer; the pinning
 consumer is named in the result and the audit line). Then: unreachable
 file rows are deleted (FK cascades take their stats and partition
 values) with their paths queued, and snapshots are removed with **range
-deletes**, never id lists. `earliest_snapshot_id` advances;
-requests reaching below it get **410 Gone** with reconcile
-instructions — a consumer is told its feed has a hole rather than
-silently skipping one.
+deletes**, never id lists. `earliest_snapshot_id` advances — capturing
+the new floor snapshot's `snapshot_time` into
+`hog_catalog.earliest_snapshot_time` in the same update, so once the
+rows below the floor are gone the catalog can still say WHEN the floor
+was reached; requests reaching below it get **410 Gone** with
+reconcile instructions citing that time — a consumer is told its feed
+has a hole (and since when) rather than silently skipping one. A fifth
+step applies the same reachability rule to the accumulating versioned
+DDL tables (`hog_table_version`, `hog_column`, `hog_partition_spec`,
+`hog_sort_spec`, `hog_view`): rows with
+`end_snapshot <= earliest_snapshot_id` are invisible at every retained
+snapshot and are deleted (spec fields cascade), so DDL churn cannot
+grow the metadata without bound.
 
 Physical deletion is decoupled and paranoid
 (`service/CleanupService.kt`): the queue is a *suggestion*. At drain
 time every path is re-checked against live references — a
 still-referenced path is skipped and counted as an **invariant
 violation** (alertable), never deleted. Missing objects count as done.
-S3 deletes run in sub-batches whose queue rows commit independently, so
-a mid-drain failure never rolls back completed work.
+S3 deletes run in sub-batches whose ledger updates commit
+independently, so a mid-drain failure never rolls back completed work.
+
+Draining **soft-deletes**: a settled `hog_file_removal` row keeps its
+place with `drained_at` + `drained_outcome` (`'deleted'` for a
+physical removal, `'absent'` for verified-already-gone), so "what did
+cleanup touch, when, after how many attempts" is queryable instead of
+dying with the row; skips and transient failures bump
+`attempts`/`last_attempt_at` and stay queued. The drain reads only
+undrained rows (partial index), and each sweep purges drained rows
+older than `HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS` (default 30
+days) so the ledger never becomes its own unbounded-growth problem.
+
+### Sort orders and compaction
+
+A table may carry a versioned **sort order** (`hog_sort_spec` /
+`hog_sort_field`, set via the `set_sort_order` alter op) — advisory for
+writers (the server never verifies file sortedness), binding for
+compaction. **Compaction** (`compaction/CompactionService.kt`,
+`POST /maintenance/compact` + an off-by-default loop) merges small live
+files: candidates are DV-free, share (spec_id, partition_values), and
+group greedily under a byte target — row-id adjacency is NOT required,
+which is why outputs materialize their row ids as an explicit
+`_hog_row_id` int64 column (reserved field id 2147483646, flagged by
+`data_file.explicit_row_ids`) instead of relying on position. That
+makes sorting on rewrite safe — the predecessor's sorted-compaction
+rowid remap is structurally impossible. The rewrite (parquet-java —
+the project's one parquet library, shared with the hydrator's footer
+reads) happens
+entirely before the commit transaction; the commit re-verifies each
+input is still live and DV-free (plan-to-commit races skip the group),
+end-snapshots inputs (time travel keeps them; expiry reclaims them
+later), aggregates stats from typed decoded bounds, and the changefeed
+excludes compacted outputs so consumers never see merged rows re-appear
+as fresh appends.
 
 ### Views
 
@@ -244,7 +297,9 @@ transaction (`observability/`):
 
 - **`/metrics`** (Prometheus): per-catalog health gauges sampled by a
   background loop in one batched query pass — head snapshot and age,
-  expiry floor, removal-queue depth, pending-stats count, live table
+  expiry floor, removal-queue depth (undrained entries only),
+  pending-stats count, live id-less-file count
+  (`hoglake_missing_field_id_files`), live table
   count, per-consumer lag (cardinality-capped) — plus source-side
   counters: commits by outcome, snapshots expired, files removed,
   hydrations by result. HTTP server metrics come with the Ktor
@@ -261,7 +316,8 @@ transaction (`observability/`):
 ### Background assembly
 
 `App.kt` wires services into Ktor and `startBackground()` runs the
-loops — hydrator, expiry, cleanup, metrics sampler — each an
+loops — hydrator, expiry, cleanup, compaction (default off), metrics
+sampler — each an
 independent daemon with its own interval knob (`Config.kt`, all
 env-sourced, `<= 0` disables), per-catalog failure isolation, and a
 close handle. `Main.kt` = migrate (under an advisory lock, so replicas
@@ -299,6 +355,7 @@ just run        # server on :8080
   - `persistence/` — JDBI repositories; all SQL parameterized.
   - `service/` — DDL, alter, scan, views, options, expiry, cleanup.
   - `commit/` — the commit path (OCC, lock tail, row-id assignment).
+  - `compaction/` — small-file merging (the only parquet-java user).
   - `hydrator/` — deferred-stats hydration.
   - `stats/` — Iceberg single-value bounds codec.
   - `observability/` — metrics, audit, request ids.

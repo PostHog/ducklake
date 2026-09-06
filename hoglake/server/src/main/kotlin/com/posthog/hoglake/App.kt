@@ -13,6 +13,8 @@ import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.api.installViewRoutes
 import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.compaction.CompactionConfig
+import com.posthog.hoglake.compaction.CompactionService
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.observability.Audit
@@ -27,6 +29,7 @@ import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.service.ViewService
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -56,14 +59,29 @@ class App private constructor(
     val jdbi: Jdbi,
 ) {
     private val catalogService = CatalogService(jdbi)
-    private val commitService = CommitService(jdbi)
+    private val commitService = CommitService(jdbi, commitLockTimeoutMs = cfg.commitLockTimeoutMs)
     private val alterService = AlterService(jdbi)
     private val scanService = ScanService(jdbi)
     private val viewService = ViewService(jdbi)
     private val optionsService = OptionsService(jdbi)
     private val expiryService = ExpiryService(jdbi)
+    private val verifyService = VerifyService(jdbi)
     private val removalStore = RemovalStore(cfg)
-    private val cleanupService = CleanupService(jdbi, removalStore)
+    private val cleanupService =
+        CleanupService(jdbi, removalStore, ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds)
+
+    /** Shared read/put store: hydrator footer reads + compaction rewrites. */
+    private val objectStore = ObjectStore(cfg)
+    private val compactionService =
+        CompactionService(
+            jdbi,
+            objectStore,
+            CompactionConfig(
+                targetBytes = cfg.compactionTargetBytes,
+                minInputFiles = cfg.compactionMinInputFiles,
+                maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
+            ),
+        )
 
     /**
      * The process meter registry: Ktor http server metrics land here via
@@ -113,7 +131,12 @@ class App private constructor(
             // lines emitted inside request handling carry request_id.
             mdc(Audit.REQUEST_ID_MDC) { call -> call.requestId }
         }
-        app.install(MicrometerMetrics) { registry = meterRegistry }
+        app.install(MicrometerMetrics) {
+            registry = meterRegistry
+            // Unmatched request paths must NOT each mint a `route` tag —
+            // hostile path scans would otherwise grow series without bound.
+            distinctNotRegisteredRoutes = false
+        }
         app.install(StatusPages) { installErrorMapping() }
         app.routing {
             // Prometheus scrape endpoint — unauthenticated like /healthz,
@@ -153,28 +176,35 @@ class App private constructor(
         app.installAlterRoutes(alterService)
         app.installScanRoutes(scanService)
         app.installViewRoutes(viewService)
-        app.installMaintenanceRoutes(optionsService, expiryService, cleanupService)
+        app.installMaintenanceRoutes(optionsService, expiryService, cleanupService, compactionService, verifyService)
         app.installPublicationRoutes()
     }
 
     /**
-     * Start the background pieces (the hydrator sweep loop over its own
-     * ObjectStore). The returned handle stops the loop and closes the
-     * store; cfg.hydratorIntervalMs <= 0 leaves the loop off.
+     * Start the background loops as coroutines under one supervisor
+     * scope ([BackgroundLoops]): structured, bounded cancellation on
+     * close, per-loop failure isolation, `intervalMs <= 0` = disabled.
+     * The returned handle stops every loop and closes the stores.
      */
     fun startBackground(): AutoCloseable {
-        val store = ObjectStore(cfg)
-        val hydratorLoop = Hydrator(jdbi, store).startLoop(cfg.hydratorIntervalMs)
-        val expiryLoop = expiryService.startLoop(cfg.expiryIntervalMs, cfg.expiryBatchSize)
-        val cleanupLoop = cleanupService.startLoop(cfg.cleanupIntervalMs, cfg.cleanupBatchSize)
-        val metricsLoop = catalogMetrics.startLoop(cfg.metricsIntervalMs)
+        val loops = BackgroundLoops()
+        val hydrator = Hydrator(jdbi, objectStore)
+        loops.register("hydrator", cfg.hydratorIntervalMs) { hydrator.runOnce() }
+        loops.register("expiry", cfg.expiryIntervalMs) {
+            expiryService.runOnceAllCatalogs(cfg.expiryBatchSize)
+        }
+        loops.register("cleanup", cfg.cleanupIntervalMs) {
+            cleanupService.runOnceAllCatalogs(cfg.cleanupBatchSize)
+        }
+        // Default interval 0 = off for now; the manual trigger stays live.
+        loops.register("compaction", cfg.compactionIntervalMs) {
+            compactionService.runOnceAllCatalogs()
+        }
+        loops.register("metrics", cfg.metricsIntervalMs) { catalogMetrics.sampleOnce() }
         return AutoCloseable {
-            metricsLoop.close()
-            cleanupLoop.close()
-            expiryLoop.close()
-            hydratorLoop.close()
+            loops.close()
             removalStore.close()
-            store.close()
+            objectStore.close()
         }
     }
 }

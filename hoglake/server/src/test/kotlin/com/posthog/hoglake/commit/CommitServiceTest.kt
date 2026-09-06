@@ -584,6 +584,204 @@ class CommitServiceTest {
         }
     }
 
+    // ------------------------------------------------------------------
+    // expected_table_uuid: the atomic incarnation guard
+    // ------------------------------------------------------------------
+
+    private fun tableUuid(
+        catalogId: Long,
+        tableId: Long,
+    ): java.util.UUID =
+        jdbi.withHandle<java.util.UUID, Exception> { h ->
+            h.createQuery(
+                "SELECT table_uuid FROM hog_table WHERE catalog_id = ? AND table_id = ?",
+            ).bind(0, catalogId).bind(1, tableId)
+                .map { rs, _ -> rs.getObject(1) as java.util.UUID }.one()
+        }
+
+    @Test
+    fun `expected_table_uuid matching the live incarnation commits normally`() {
+        val fx = seed()
+        val (tableId, _) = fx.tables.getValue("events")
+        val result =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "events",
+                                listOf(file("s3://b/guarded.parquet", 3)),
+                                expectedTableUuid = tableUuid(fx.catalogId, tableId),
+                            ),
+                        ),
+                ),
+            )
+        assertThat(result.snapshotId).isEqualTo(1)
+        assertThat(dataFiles(fx.catalogId)).hasSize(1)
+    }
+
+    @Test
+    fun `expected_table_uuid mismatch is CommitConflict with zero writes`() {
+        val fx = seed(tableNames = listOf("events", "persons"))
+        val (eventsId, _) = fx.tables.getValue("events")
+        val (personsId, _) = fx.tables.getValue("persons")
+        val actual = tableUuid(fx.catalogId, eventsId)
+        val stale = java.util.UUID.randomUUID()
+
+        assertThatThrownBy {
+            service.commit(
+                "cat",
+                CommitRequest(
+                    appends =
+                        listOf(
+                            // Unguarded append to another table in the same
+                            // commit: the guard must roll back EVERYTHING.
+                            TableAppend("ns", "persons", listOf(file("s3://b/p.parquet", 5))),
+                            TableAppend(
+                                "ns",
+                                "events",
+                                listOf(file("s3://b/e.parquet", 3)),
+                                expectedTableUuid = stale,
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessage("table 'ns.events' is uuid $actual, expected $stale: the table was recreated")
+
+        // Zero writes: no snapshot, no files, no allocator movement.
+        assertThat(snapshotIds(fx.catalogId)).isEmpty()
+        assertThat(dataFiles(fx.catalogId)).isEmpty()
+        assertThat(allocators(fx.catalogId)).isEqualTo(0L to 1L)
+        assertThat(tableStats(fx.catalogId, personsId)).isEqualTo(Triple(0L, 0L, 0L))
+    }
+
+    @Test
+    fun `expected_table_uuid guards deletes too`() {
+        val fx = seed()
+        service.commit(
+            "cat",
+            CommitRequest(
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/f.parquet", 10)))),
+            ),
+        ) // snapshot 1
+        val fileId = dataFiles(fx.catalogId).single().dataFileId
+
+        assertThatThrownBy {
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = 1,
+                    deletes =
+                        listOf(
+                            com.posthog.hoglake.model.TableDeletes(
+                                "ns",
+                                "events",
+                                listOf(
+                                    com.posthog.hoglake.model.DeleteFileRegistration(
+                                        fileId,
+                                        "s3://b/dv.puffin",
+                                        2,
+                                        16,
+                                    ),
+                                ),
+                                expectedTableUuid = java.util.UUID.randomUUID(),
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("the table was recreated")
+        // Only the append snapshot exists; no DV row was written.
+        assertThat(snapshotIds(fx.catalogId)).containsExactly(1L)
+    }
+
+    @Test
+    fun `recreation race - stale guard conflicts, absent guard keeps name-only resolution`() {
+        val fx = seed()
+        val (oldTableId, _) = fx.tables.getValue("events")
+        val oldUuid = tableUuid(fx.catalogId, oldTableId)
+
+        // Simulate drop + recreate under the same name (the replication
+        // daemon's live-reproduced race window), via direct SQL like the
+        // rest of this fixture.
+        val newTableId =
+            jdbi.withHandle<Long, Exception> { h ->
+                h.execute(
+                    "UPDATE hog_table SET dropped_snapshot = 1 WHERE catalog_id = ? AND table_id = ?",
+                    fx.catalogId,
+                    oldTableId,
+                )
+                h.execute(
+                    "UPDATE hog_table_version SET end_snapshot = 1 " +
+                        "WHERE catalog_id = ? AND table_id = ?",
+                    fx.catalogId,
+                    oldTableId,
+                )
+                val id =
+                    h.createQuery(
+                        "UPDATE hog_catalog SET next_table_id = next_table_id + 1, " +
+                            "last_snapshot_id = 2 WHERE catalog_id = ? RETURNING next_table_id - 1",
+                    ).bind(0, fx.catalogId).mapTo(Long::class.java).one()
+                h.execute(
+                    "INSERT INTO hog_table (catalog_id, table_id, created_snapshot, next_field_id) " +
+                        "VALUES (?, ?, 2, 2)",
+                    fx.catalogId,
+                    id,
+                )
+                h.execute(
+                    "INSERT INTO hog_table_version (catalog_id, table_id, begin_snapshot, " +
+                        "namespace_id, name) VALUES (?, ?, 2, ?, 'events')",
+                    fx.catalogId,
+                    id,
+                    fx.namespaceId,
+                )
+                h.execute(
+                    "INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version) VALUES (?, 1, 0)",
+                    fx.catalogId,
+                )
+                h.execute(
+                    "INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version) VALUES (?, 2, 0)",
+                    fx.catalogId,
+                )
+                h.execute("INSERT INTO hog_table_stats (catalog_id, table_id) VALUES (?, ?)", fx.catalogId, id)
+                id
+            }
+
+        // Guarded with the OLD incarnation's uuid: atomic conflict.
+        assertThatThrownBy {
+            service.commit(
+                "cat",
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "events",
+                                listOf(file("s3://b/stale.parquet", 1)),
+                                expectedTableUuid = oldUuid,
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("was recreated")
+        assertThat(dataFiles(fx.catalogId)).isEmpty()
+
+        // Absent guard: today's behavior — name resolution lands the append
+        // in the NEW incarnation (the documented default the guard opts
+        // out of).
+        service.commit(
+            "cat",
+            CommitRequest(
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/blind.parquet", 1)))),
+            ),
+        )
+        assertThat(dataFiles(fx.catalogId).single().tableId).isEqualTo(newTableId)
+    }
+
     @Test
     fun `readSnapshot ahead of head is Validation`() {
         seed()

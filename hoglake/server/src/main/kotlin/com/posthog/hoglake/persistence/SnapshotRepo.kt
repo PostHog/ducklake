@@ -47,7 +47,7 @@ object SnapshotRepo {
         catalogId: Long,
         snapshotId: Long,
         kind: ChangeKind,
-        objectId: Long?,
+        objectId: Long,
     ) {
         handle.createUpdate(
             """
@@ -89,6 +89,32 @@ object SnapshotRepo {
             .list()
 
     /**
+     * One page of snapshots with id < [before], ordered by id DESC
+     * (newest first), without change rows. [limit] is the raw SQL LIMIT
+     * — the service passes limit+1 to detect hasMore.
+     */
+    fun pageBefore(
+        handle: Handle,
+        catalogId: Long,
+        before: Long,
+        limit: Int,
+    ): List<Snapshot> =
+        handle.createQuery(
+            """
+            SELECT snapshot_id, snapshot_time, schema_version, author, commit_message
+            FROM hog_snapshot
+            WHERE catalog_id = :catalogId AND snapshot_id < :before
+            ORDER BY snapshot_id DESC
+            LIMIT :limit
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("before", before)
+            .bind("limit", limit)
+            .map(snapshotMapper)
+            .list()
+
+    /**
      * Change rows for a contiguous snapshot-id range, grouped by
      * snapshot id. The caller's page IS contiguous by construction
      * (ordered scan from `> after`), so a range predicate is exact.
@@ -114,7 +140,7 @@ object SnapshotRepo {
                 rs.getLong("snapshot_id") to
                     SnapshotChange(
                         kind = ChangeKind.fromWire(rs.getString("kind")),
-                        objectId = rs.getObject("object_id")?.let { (it as Number).toLong() },
+                        objectId = rs.getLong("object_id"),
                     )
             }
             .list()

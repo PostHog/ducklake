@@ -72,8 +72,15 @@ class ExpiryGuardIntegrationTest {
                     .execute()
             }
             h.createUpdate(
-                "UPDATE hog_catalog SET earliest_snapshot_id = 4 WHERE catalog_id = :cid",
-            ).bind("cid", catalogId).execute()
+                """
+                UPDATE hog_catalog
+                   SET earliest_snapshot_id = 4, earliest_snapshot_time = :t
+                 WHERE catalog_id = :cid
+                """,
+            )
+                .bind("t", timeOf(4).atOffset(ZoneOffset.UTC))
+                .bind("cid", catalogId)
+                .execute()
         }
     }
 
@@ -89,6 +96,7 @@ class ExpiryGuardIntegrationTest {
             .isInstanceOf(HoglakeException.Expired::class.java)
             .hasMessageContaining("from_snapshot 2")
             .hasMessageContaining("earliest retained snapshot is 4")
+            .hasMessageContaining("reached at ${timeOf(4)}")
             .hasMessageContaining("full scan")
 
         assertThatThrownBy { svc.changes(cat, "ns", "t", fromSnapshot = 0) }
@@ -106,10 +114,12 @@ class ExpiryGuardIntegrationTest {
             .isInstanceOf(HoglakeException.Expired::class.java)
             .hasMessageContaining("snapshot 3")
             .hasMessageContaining("earliest retained snapshot is 4")
+            .hasMessageContaining("reached at ${timeOf(4)}")
         assertThatThrownBy { svc.listFiles(cat, "ns", "t", snapshot = 3) }
             .isInstanceOf(HoglakeException.Expired::class.java)
         assertThatThrownBy { scan.planScan(cat, "ns", "t", snapshot = 3) }
             .isInstanceOf(HoglakeException.Expired::class.java)
+            .hasMessageContaining("reached at ${timeOf(4)}")
 
         // At the floor and above: fine.
         assertThat(svc.getTable(cat, "ns", "t", snapshot = 4).name).isEqualTo("t")
@@ -126,6 +136,14 @@ class ExpiryGuardIntegrationTest {
             .isInstanceOf(HoglakeException.Validation::class.java)
         assertThatThrownBy { svc.getTable(cat, "ns", "t", snapshot = 99) }
             .isInstanceOf(HoglakeException.Validation::class.java)
+    }
+
+    @Test
+    fun `catalog info carries the floor time - and null before expiry ever ran`() {
+        assertThat(svc.getCatalog(cat).earliestSnapshotTime).isEqualTo(timeOf(4))
+        val fresh = svc.createCatalog("floor-fresh", "s3://bucket/fresh")
+        assertThat(fresh.earliestSnapshotTime).isNull()
+        assertThat(svc.getCatalog("floor-fresh").earliestSnapshotTime).isNull()
     }
 
     @Test

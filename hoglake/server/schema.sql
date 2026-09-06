@@ -33,6 +33,12 @@ CREATE TABLE hog_catalog (
         CHECK (snapshot_retention_seconds IS NULL OR snapshot_retention_seconds > 0),
     consumer_floor   boolean NOT NULL DEFAULT true,
     earliest_snapshot_id bigint NOT NULL DEFAULT 0,
+    -- snapshot_time of the snapshot earliest_snapshot_id points at,
+    -- captured by the expiry sweep in the same UPDATE that advances the
+    -- floor. Survives the snapshot rows below the floor (their times die
+    -- with them), so a 410 can say WHEN the floor was reached. NULL =
+    -- expiry has never advanced the floor.
+    earliest_snapshot_time timestamptz,
     next_view_id     bigint NOT NULL DEFAULT 1,
     created_at       timestamptz NOT NULL DEFAULT now()
 );
@@ -55,8 +61,13 @@ CREATE TABLE hog_snapshot_change (
                     'namespace_created', 'namespace_dropped',
                     'table_created', 'table_dropped', 'table_altered',
                     'table_inserted_into', 'table_deleted_from',
+                    'table_compacted',
                     'view_created', 'view_dropped')),
-    object_id   bigint,  -- table_id or namespace_id; NULL only for catalog-level kinds
+    -- table_id, namespace_id, or view_id. Every kind in the vocabulary
+    -- names an object; a NULL here would be a conflict row the conflict
+    -- index silently never matches (NULL never equals) — an invisible
+    -- OCC bypass — so the DB refuses it outright.
+    object_id   bigint NOT NULL,
     FOREIGN KEY (catalog_id, snapshot_id)
         REFERENCES hog_snapshot ON DELETE CASCADE
 );
@@ -72,7 +83,10 @@ CREATE INDEX hog_snapshot_change_by_snapshot
 CREATE TABLE hog_namespace (
     catalog_id   bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
     namespace_id bigint NOT NULL,
-    name         text NOT NULL,
+    -- Identifier policy (shared with table/view/column names; enforced
+    -- service-side too): letter/underscore start, then [A-Za-z0-9_-],
+    -- max 128 chars.
+    name         text NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_-]{0,127}$'),
     dropped      boolean NOT NULL DEFAULT false,
     created_at   timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (catalog_id, namespace_id)
@@ -100,7 +114,7 @@ CREATE TABLE hog_table_version (
     begin_snapshot bigint NOT NULL,
     end_snapshot   bigint,
     namespace_id   bigint NOT NULL,
-    name           text   NOT NULL,
+    name           text   NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_-]{0,127}$'),
     PRIMARY KEY (catalog_id, table_id, begin_snapshot),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     FOREIGN KEY (catalog_id, namespace_id) REFERENCES hog_namespace ON DELETE CASCADE,
@@ -120,7 +134,7 @@ CREATE TABLE hog_column (
     field_id       bigint NOT NULL,
     begin_snapshot bigint NOT NULL,
     end_snapshot   bigint,
-    name           text   NOT NULL,
+    name           text   NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_-]{0,127}$'),
     -- Closed type set: every member has a defined Iceberg mapping
     -- (iceberg-federation.md §2). Extend by migration, never ad hoc.
     col_type       text   NOT NULL CHECK (col_type IN (
@@ -129,13 +143,18 @@ CREATE TABLE hog_column (
                        'timestamptz', 'string', 'uuid', 'binary')),
     type_params    jsonb,          -- e.g. {"precision":38,"scale":9} for decimal
     nullable       boolean NOT NULL DEFAULT true,
-    ordinal        int    NOT NULL,
+    ordinal        int    NOT NULL CHECK (ordinal >= 0),
     PRIMARY KEY (catalog_id, table_id, field_id, begin_snapshot),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
 );
 CREATE INDEX hog_column_live
     ON hog_column (catalog_id, table_id) WHERE end_snapshot IS NULL;
+-- Writers stamp parquet field order from ordinals: a duplicate live
+-- ordinal is a silent corruption vector, so the DB refuses it.
+CREATE UNIQUE INDEX hog_column_live_ordinal
+    ON hog_column (catalog_id, table_id, ordinal)
+    WHERE end_snapshot IS NULL;
 
 -- Table-level rollup + the row-id allocator. One row per table, created
 -- with the table.
@@ -172,6 +191,20 @@ CREATE TABLE hog_data_file (
     stats_state     text   NOT NULL DEFAULT 'provided'
                     CHECK (stats_state IN ('provided', 'pending', 'failed')),
     spec_id         bigint,
+    -- Compaction outputs merge inputs whose row-id ranges need not be
+    -- contiguous, so their row ids cannot be positional: the file carries
+    -- an explicit physical int64 column `_hog_row_id` (reserved parquet
+    -- field id 2147483646) holding each row's id, and this flag tells
+    -- readers so. When true, row_id_start is only min(input row ids) —
+    -- its positional meaning (row_id_start + offset) is void.
+    explicit_row_ids boolean NOT NULL DEFAULT false,
+    -- Field-id contract flag, set by the hydrator's footer read: true
+    -- when any leaf of the file's parquet schema lacks a PARQUET:field_id
+    -- (such files bind columns by NAME; renaming a column would silently
+    -- NULL their history in readers, so AlterService refuses renames
+    -- while a live flagged file exists). The reserved `_hog_row_id` id
+    -- 2147483646 counts as an id like any other.
+    missing_field_ids boolean NOT NULL DEFAULT false,
     PRIMARY KEY (catalog_id, data_file_id),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
@@ -257,6 +290,38 @@ CREATE TABLE hog_file_partition_value (
         REFERENCES hog_data_file ON DELETE CASCADE
 );
 
+-- ---- Sort orders ----
+-- Versioned sort spec, mirroring the partition-spec pair: header +
+-- ordered fields. ADVISORY for writers (the server never verifies file
+-- sortedness) and BINDING for compaction rewrites, which sort merged
+-- rows by the live spec — safe only because compaction outputs carry
+-- explicit row ids (hog_data_file.explicit_row_ids above).
+CREATE TABLE hog_sort_spec (
+    catalog_id     bigint NOT NULL,
+    table_id       bigint NOT NULL,
+    sort_id        bigint NOT NULL,
+    begin_snapshot bigint NOT NULL,
+    end_snapshot   bigint,
+    PRIMARY KEY (catalog_id, table_id, sort_id),
+    FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
+    CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
+);
+CREATE INDEX hog_sort_spec_live
+    ON hog_sort_spec (catalog_id, table_id) WHERE end_snapshot IS NULL;
+
+CREATE TABLE hog_sort_field (
+    catalog_id      bigint NOT NULL,
+    table_id        bigint NOT NULL,
+    sort_id         bigint NOT NULL,
+    key_index       int    NOT NULL CHECK (key_index >= 0),
+    source_field_id bigint NOT NULL,
+    direction       text   NOT NULL CHECK (direction IN ('asc', 'desc')),
+    null_order      text   NOT NULL CHECK (null_order IN ('nulls_first', 'nulls_last')),
+    PRIMARY KEY (catalog_id, table_id, sort_id, key_index),
+    FOREIGN KEY (catalog_id, table_id, sort_id)
+        REFERENCES hog_sort_spec ON DELETE CASCADE
+);
+
 -- ---- Row-level deletes: deletion vectors ----
 -- One DV file per data file per range; a new DV supersedes the old
 -- (end_snapshot) and must cover it (delete_count monotonic — DVs only
@@ -293,7 +358,7 @@ CREATE TABLE hog_view (
     view_id        bigint NOT NULL,
     view_uuid      uuid   NOT NULL DEFAULT gen_random_uuid(),
     namespace_id   bigint NOT NULL,
-    name           text   NOT NULL,
+    name           text   NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_-]{0,127}$'),
     dialect        text   NOT NULL DEFAULT 'trino',
     sql            text   NOT NULL,
     begin_snapshot bigint NOT NULL,
@@ -306,16 +371,32 @@ CREATE TABLE hog_view (
 CREATE UNIQUE INDEX hog_view_live_name
     ON hog_view (catalog_id, namespace_id, name) WHERE end_snapshot IS NULL;
 
--- The file-removal queue. Physical deletion is decoupled from metadata
--- deletion, batched, and ALWAYS liveness-checked at drain time — a
--- queue entry is a suggestion, never an authorization (README.md §8).
+-- The file-removal queue AND ledger. Physical deletion is decoupled
+-- from metadata deletion, batched, and ALWAYS liveness-checked at drain
+-- time — a queue entry is a suggestion, never an authorization
+-- (README.md §8). Draining SOFT-deletes: a completed entry keeps its
+-- row (drained_at + drained_outcome) so "what did cleanup touch, when,
+-- after how many attempts" stays queryable; the cleanup sweep purges
+-- drained rows past a retention window so the ledger itself never
+-- accumulates without bound.
 CREATE TABLE hog_file_removal (
     removal_id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     catalog_id   bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
     path         text   NOT NULL,
     file_kind    text   NOT NULL CHECK (file_kind IN ('data', 'delete')),
     reason       text   NOT NULL CHECK (reason IN ('snapshot_expiry', 'table_drop_gc')),
-    scheduled_at timestamptz NOT NULL DEFAULT now()
+    scheduled_at timestamptz NOT NULL DEFAULT now(),
+    -- Drain bookkeeping: attempts counts every touch that did NOT drain
+    -- the row (still-referenced skips, transient S3 failures).
+    attempts        int NOT NULL DEFAULT 0,
+    last_attempt_at timestamptz,
+    -- Soft-delete: non-null once the entry is settled. 'deleted' = the
+    -- object was physically removed; 'absent' = it was verified already
+    -- gone. Outcome and timestamp travel together.
+    drained_at      timestamptz,
+    drained_outcome text CHECK (drained_outcome IN ('deleted', 'absent')),
+    CHECK ((drained_at IS NULL) = (drained_outcome IS NULL))
 );
 CREATE INDEX hog_file_removal_drain
-    ON hog_file_removal (catalog_id, removal_id);
+    ON hog_file_removal (catalog_id, removal_id)
+    WHERE drained_at IS NULL;
