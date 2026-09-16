@@ -66,6 +66,20 @@ private:
 	unique_ptr<BaseStatistics> CreateGeometryStats() const;
 };
 
+//! Cardinality-only table stats.
+//!
+//! Deliberately excludes column_stats. Catalog listings
+//! (duckdb_tables() / information_schema.tables) call TableCatalogEntry::GetStorageInfo
+//! for EVERY table purely to fill estimated_size, and the full stats load joins
+//! ducklake_table_column_stats — one metadata round-trip per table, returning every
+//! column's min/max/extra_stats. On a catalog with thousands of tables that is
+//! thousands of sequential round-trips for a single integer per table.
+struct DuckLakeTableCardinality {
+	idx_t record_count = 0;
+	idx_t table_size_bytes = 0;
+	idx_t next_row_id = 0;
+};
+
 //! These are the global, table-wide stats
 struct DuckLakeTableStats {
 	idx_t record_count = 0;

@@ -159,6 +159,10 @@ optional_idx DuckLakeTableStatsCacheEntry::GetEstimatedCacheMemory() const {
 	return estimate;
 }
 
+optional_idx DuckLakeTableCardinalityCacheEntry::GetEstimatedCacheMemory() const {
+	return sizeof(DuckLakeTableCardinality);
+}
+
 optional_idx DuckLakeSchemaCacheEntry::GetEstimatedCacheMemory() const {
 	return EstimateCatalogSetMemory(catalog_set);
 }
@@ -822,6 +826,47 @@ shared_ptr<DuckLakeTableStats> DuckLakeCatalog::GetTableStats(DuckLakeTransactio
 	return shared_ptr<DuckLakeTableStats>(std::move(entry), &raw->stats);
 }
 
+shared_ptr<DuckLakeTableCardinality> DuckLakeCatalog::GetTableCardinality(DuckLakeTransaction &transaction,
+                                                                         TableIndex table_id) {
+	return GetTableCardinality(transaction, transaction.GetSnapshot(), table_id);
+}
+
+shared_ptr<DuckLakeTableCardinality> DuckLakeCatalog::GetTableCardinality(DuckLakeTransaction &transaction,
+                                                                         DuckLakeSnapshot snapshot,
+                                                                         TableIndex table_id) {
+	auto &cache = GetObjectCacheInstance();
+	auto key = CardinalityCacheKey(snapshot.next_file_id, table_id);
+	auto cached = cache.Get<DuckLakeTableCardinalityCacheEntry>(key);
+	if (cached) {
+		auto *raw = cached.get();
+		return shared_ptr<DuckLakeTableCardinality>(std::move(cached), &raw->cardinality);
+	}
+
+	// Cache miss. A catalog listing asks for every table in turn, so load the whole
+	// catalog's cardinalities in ONE query and cache all of them: the remaining tables
+	// in the listing are then cache hits. Loading these one-by-one is what made a
+	// listing cost one metadata round-trip per table.
+	auto cardinalities = transaction.GetMetadataManager().GetAllTableCardinalities(snapshot);
+
+	shared_ptr<DuckLakeTableCardinality> result;
+	for (auto &info : cardinalities) {
+		DuckLakeTableCardinality cardinality;
+		cardinality.record_count = info.record_count;
+		cardinality.next_row_id = info.next_row_id;
+		cardinality.table_size_bytes = info.table_size_bytes;
+
+		auto entry = make_shared_ptr<DuckLakeTableCardinalityCacheEntry>(cardinality);
+		auto *raw = entry.get();
+		if (info.table_id == table_id) {
+			result = shared_ptr<DuckLakeTableCardinality>(entry, &raw->cardinality);
+		}
+		cache.Put(CardinalityCacheKey(snapshot.next_file_id, info.table_id), std::move(entry));
+	}
+	// A table with no stats row at this snapshot yields no entry; callers treat that as
+	// "unknown cardinality", matching the pre-existing GetTableStats behaviour.
+	return result;
+}
+
 optional_ptr<SchemaCatalogEntry> DuckLakeCatalog::LookupSchema(CatalogTransaction transaction,
                                                                const EntryLookupInfo &schema_lookup,
                                                                OnEntryNotFound if_not_found) {
@@ -1076,12 +1121,21 @@ string DuckLakeCatalog::StatsCacheKey(idx_t next_file_id, TableIndex table_id) c
 	                          next_file_id, table_id.index);
 }
 
+string DuckLakeCatalog::CardinalityCacheKey(idx_t next_file_id, TableIndex table_id) const {
+	return StringUtil::Format("ducklake:%s:%s:%s:cardinality:%llu:table:%llu", GetName(), MetadataPath(), instance_id,
+	                          next_file_id, table_id.index);
+}
+
 string DuckLakeCatalog::SchemaCacheKey(idx_t schema_version) const {
 	return StringUtil::Format("ducklake:%s:%s:%s:schema:%llu", GetName(), MetadataPath(), instance_id, schema_version);
 }
 
 void DuckLakeCatalog::InvalidateTableStatsCache(idx_t next_file_id, TableIndex table_id) {
 	GetObjectCacheInstance().Delete(StatsCacheKey(next_file_id, table_id));
+}
+
+void DuckLakeCatalog::InvalidateTableCardinalityCache(idx_t next_file_id, TableIndex table_id) {
+	GetObjectCacheInstance().Delete(CardinalityCacheKey(next_file_id, table_id));
 }
 
 void DuckLakeCatalog::InvalidateSchemaCache(idx_t schema_version) {

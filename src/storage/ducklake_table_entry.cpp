@@ -442,6 +442,24 @@ shared_ptr<DuckLakeTableStats> DuckLakeTableEntry::GetTableStats(ClientContext &
 	return GetTableStats(transaction);
 }
 
+shared_ptr<DuckLakeTableCardinality> DuckLakeTableEntry::GetTableCardinality(ClientContext &context) {
+	auto &transaction = DuckLakeTransaction::Get(context, ParentCatalog());
+	return GetTableCardinality(transaction);
+}
+
+shared_ptr<DuckLakeTableCardinality> DuckLakeTableEntry::GetTableCardinality(DuckLakeTransaction &transaction) {
+	// Same visibility guards as GetTableStats: persisted stats do not describe a
+	// transaction-local table, nor a table with uncommitted inserts in this transaction.
+	if (IsTransactionLocal()) {
+		return nullptr;
+	}
+	auto &dl_catalog = catalog.Cast<DuckLakeCatalog>();
+	if (transaction.HasTransactionLocalInserts(GetTableId())) {
+		return nullptr;
+	}
+	return dl_catalog.GetTableCardinality(transaction, GetTableId());
+}
+
 shared_ptr<DuckLakeTableStats> DuckLakeTableEntry::GetTableStats(DuckLakeTransaction &transaction) {
 	if (IsTransactionLocal()) {
 		// no stats for transaction local tables
@@ -1480,9 +1498,14 @@ DuckLakeColumnInfo DuckLakeTableEntry::GetAddColumnInfo() const {
 }
 
 TableStorageInfo DuckLakeTableEntry::GetStorageInfo(ClientContext &context) {
+	// duckdb_tables() (and therefore information_schema.tables) calls this for EVERY
+	// table just to populate estimated_size, and reads only the cardinality. Go through
+	// the cardinality-only path so a listing never loads column statistics: the full
+	// stats load joins ducklake_table_column_stats per table, which turned listing a
+	// large catalog into thousands of sequential metadata round-trips.
 	TableStorageInfo storage_info;
-	auto table_stats = GetTableStats(context);
-	storage_info.cardinality = table_stats ? table_stats->record_count : 0;
+	auto cardinality = GetTableCardinality(context);
+	storage_info.cardinality = cardinality ? cardinality->record_count : 0;
 	return storage_info;
 }
 

@@ -23,6 +23,7 @@
 
 namespace duckdb {
 struct DuckLakeGlobalStatsInfo;
+struct DuckLakeTableCardinalityInfo;
 class ColumnList;
 class DuckLakeFieldData;
 struct DuckLakeFileListEntry;
@@ -42,6 +43,25 @@ struct DuckLakeTableStatsCacheEntry : public ObjectCacheEntry {
 
 	static string ObjectType() {
 		return "ducklake_table_stats";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override;
+};
+
+//! Per-table cardinality cache entry, keyed by <next_file_id, table_id>.
+//! Separate from DuckLakeTableStatsCacheEntry so a catalog listing never has to
+//! materialize column statistics it does not read.
+struct DuckLakeTableCardinalityCacheEntry : public ObjectCacheEntry {
+	explicit DuckLakeTableCardinalityCacheEntry(DuckLakeTableCardinality cardinality_p)
+	    : cardinality(cardinality_p) {
+	}
+
+	DuckLakeTableCardinality cardinality;
+
+	static string ObjectType() {
+		return "ducklake_table_cardinality";
 	}
 	string GetObjectType() override {
 		return ObjectType();
@@ -164,6 +184,12 @@ public:
 	shared_ptr<DuckLakeTableStats> GetTableStats(DuckLakeTransaction &transaction, TableIndex table_id);
 	shared_ptr<DuckLakeTableStats> GetTableStats(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot,
 	                                             TableIndex table_id);
+	//! Cardinality-only lookup for catalog listings. On a cache miss this loads the
+	//! cardinality of EVERY table in one query and caches all of them, so listing a
+	//! catalog of N tables costs one round-trip rather than N.
+	shared_ptr<DuckLakeTableCardinality> GetTableCardinality(DuckLakeTransaction &transaction, TableIndex table_id);
+	shared_ptr<DuckLakeTableCardinality> GetTableCardinality(DuckLakeTransaction &transaction,
+	                                                         DuckLakeSnapshot snapshot, TableIndex table_id);
 
 	optional_ptr<CatalogEntry> GetEntryById(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot,
 	                                        SchemaIndex schema_id);
@@ -266,6 +292,8 @@ public:
 
 	//! Invalidate the cached table stats entry for a given stats cache key.
 	void InvalidateTableStatsCache(idx_t next_file_id, TableIndex table_id);
+	//! Invalidate the cached table cardinality entry for a given cache key.
+	void InvalidateTableCardinalityCache(idx_t next_file_id, TableIndex table_id);
 	//! Invalidate the cached schema entry for a given schema_version.
 	void InvalidateSchemaCache(idx_t schema_version);
 
@@ -279,6 +307,7 @@ private:
 	void PinSchemaForQuery(DuckLakeTransaction &transaction, shared_ptr<DuckLakeSchemaCacheEntry> entry);
 	void LoadNameMaps(DuckLakeTransaction &transaction);
 	string StatsCacheKey(idx_t next_file_id, TableIndex table_id) const;
+	string CardinalityCacheKey(idx_t next_file_id, TableIndex table_id) const;
 	string SchemaCacheKey(idx_t schema_version) const;
 	string SchemaPinStateKey() const;
 	ObjectCache &GetObjectCacheInstance();

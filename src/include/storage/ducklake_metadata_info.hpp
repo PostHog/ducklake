@@ -293,6 +293,13 @@ struct DuckLakeGlobalStatsInfo {
 	vector<DuckLakeGlobalColumnStatsInfo> column_stats;
 };
 
+struct DuckLakeTableCardinalityInfo {
+	TableIndex table_id;
+	idx_t record_count;
+	idx_t next_row_id;
+	idx_t table_size_bytes;
+};
+
 struct SnapshotChangeInfo {
 	string changes_made;
 };
