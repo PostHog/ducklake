@@ -1002,6 +1002,36 @@ ORDER BY table_id;
 	return TransformGlobalStats(*result);
 }
 
+vector<DuckLakeTableCardinalityInfo> DuckLakeMetadataManager::GetAllTableCardinalities(DuckLakeSnapshot snapshot) {
+	// One query for the whole catalog, and deliberately NO join against
+	// ducklake_table_column_stats: callers of this path (catalog listings) want only
+	// record_count. Joining column stats turns a listing into one round-trip per table
+	// and ships every column's min/max/extra_stats for a single integer per table.
+	string query = R"(
+SELECT table_id, record_count, next_row_id, file_size_bytes
+FROM {METADATA_CATALOG}.ducklake_table_stats
+WHERE record_count IS NOT NULL
+  AND file_size_bytes IS NOT NULL
+ORDER BY table_id;
+)";
+
+	auto result = PassthroughQuery(snapshot, query);
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to read table cardinalities from DuckLake: ");
+	}
+
+	vector<DuckLakeTableCardinalityInfo> cardinalities;
+	for (auto &row : *result) {
+		DuckLakeTableCardinalityInfo info;
+		info.table_id = TableIndex(row.GetValue<uint64_t>(0));
+		info.record_count = row.GetValue<uint64_t>(1);
+		info.next_row_id = row.GetValue<uint64_t>(2);
+		info.table_size_bytes = row.GetValue<uint64_t>(3);
+		cardinalities.push_back(info);
+	}
+	return cardinalities;
+}
+
 string DuckLakeMetadataManager::GetFileSelectList(const string &prefix) {
 	static const vector<string> column_list {
 	    "path", "path_is_relative", "file_size_bytes", "footer_size", "encryption_key",
@@ -5130,6 +5160,7 @@ WHERE NOT EXISTS (
 	for (auto &snapshot : snapshots) {
 		for (auto &table_id : stats_table_ids) {
 			catalog.InvalidateTableStatsCache(snapshot.next_file_id, table_id);
+			catalog.InvalidateTableCardinalityCache(snapshot.next_file_id, table_id);
 		}
 	}
 }

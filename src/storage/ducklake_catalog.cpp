@@ -159,6 +159,14 @@ optional_idx DuckLakeTableStatsCacheEntry::GetEstimatedCacheMemory() const {
 	return estimate;
 }
 
+optional_idx DuckLakeTableCardinalityCacheEntry::GetEstimatedCacheMemory() const {
+	// Include the per-entry map overhead, not just the payload: this is one entry
+	// covering the whole catalog, so undercounting it hides real memory.
+	static constexpr idx_t ESTIMATED_BYTES_PER_MAP_NODE = 64;
+	return sizeof(DuckLakeTableCardinalityCacheEntry) +
+	       cardinalities.size() * (sizeof(idx_t) + sizeof(DuckLakeTableCardinality) + ESTIMATED_BYTES_PER_MAP_NODE);
+}
+
 optional_idx DuckLakeSchemaCacheEntry::GetEstimatedCacheMemory() const {
 	return EstimateCatalogSetMemory(catalog_set);
 }
@@ -822,6 +830,50 @@ shared_ptr<DuckLakeTableStats> DuckLakeCatalog::GetTableStats(DuckLakeTransactio
 	return shared_ptr<DuckLakeTableStats>(std::move(entry), &raw->stats);
 }
 
+shared_ptr<DuckLakeTableCardinality> DuckLakeCatalog::GetTableCardinality(DuckLakeTransaction &transaction,
+                                                                         TableIndex table_id) {
+	return GetTableCardinality(transaction, transaction.GetSnapshot(), table_id);
+}
+
+shared_ptr<DuckLakeTableCardinality> DuckLakeCatalog::GetTableCardinality(DuckLakeTransaction &transaction,
+                                                                         DuckLakeSnapshot snapshot,
+                                                                         TableIndex table_id) {
+	auto &cache = GetObjectCacheInstance();
+	auto key = CardinalityCacheKey(snapshot.next_file_id);
+	auto cached = cache.Get<DuckLakeTableCardinalityCacheEntry>(key);
+	if (!cached) {
+		// Miss: load the WHOLE catalog's cardinalities in one query and cache the map.
+		// Loading these one-by-one is what made a listing cost one metadata round-trip
+		// per table.
+		auto cardinalities = transaction.GetMetadataManager().GetAllTableCardinalities(snapshot);
+
+		unordered_map<idx_t, DuckLakeTableCardinality> by_table;
+		by_table.reserve(cardinalities.size());
+		for (auto &info : cardinalities) {
+			DuckLakeTableCardinality cardinality;
+			cardinality.record_count = info.record_count;
+			cardinality.next_row_id = info.next_row_id;
+			cardinality.table_size_bytes = info.table_size_bytes;
+			by_table.emplace(info.table_id.index, cardinality);
+		}
+
+		cached = make_shared_ptr<DuckLakeTableCardinalityCacheEntry>(std::move(by_table));
+		cache.Put(key, cached);
+	}
+
+	// Absent from a LOADED map means the table has no ducklake_table_stats row at this
+	// snapshot -- a definitive "unknown cardinality", NOT a cache miss. Returning
+	// without re-querying is the point: re-querying per missing table would cost one
+	// full-catalog scan per never-written table.
+	auto *raw = cached.get();
+	auto entry = raw->cardinalities.find(table_id.index);
+	if (entry == raw->cardinalities.end()) {
+		return nullptr;
+	}
+	// Alias into the cache entry so the map outlives the returned pointer.
+	return shared_ptr<DuckLakeTableCardinality>(std::move(cached), &entry->second);
+}
+
 optional_ptr<SchemaCatalogEntry> DuckLakeCatalog::LookupSchema(CatalogTransaction transaction,
                                                                const EntryLookupInfo &schema_lookup,
                                                                OnEntryNotFound if_not_found) {
@@ -1076,12 +1128,24 @@ string DuckLakeCatalog::StatsCacheKey(idx_t next_file_id, TableIndex table_id) c
 	                          next_file_id, table_id.index);
 }
 
+string DuckLakeCatalog::CardinalityCacheKey(idx_t next_file_id) const {
+	return StringUtil::Format("ducklake:%s:%s:%s:cardinality:%llu", GetName(), MetadataPath(), instance_id,
+	                          next_file_id);
+}
+
 string DuckLakeCatalog::SchemaCacheKey(idx_t schema_version) const {
 	return StringUtil::Format("ducklake:%s:%s:%s:schema:%llu", GetName(), MetadataPath(), instance_id, schema_version);
 }
 
 void DuckLakeCatalog::InvalidateTableStatsCache(idx_t next_file_id, TableIndex table_id) {
 	GetObjectCacheInstance().Delete(StatsCacheKey(next_file_id, table_id));
+}
+
+void DuckLakeCatalog::InvalidateTableCardinalityCache(idx_t next_file_id, TableIndex table_id) {
+	// The map is one entry for the whole snapshot, so one table's invalidation drops
+	// it wholesale. That is correct (never stale) and cheap: the next lookup reloads
+	// every table in a single query.
+	GetObjectCacheInstance().Delete(CardinalityCacheKey(next_file_id));
 }
 
 void DuckLakeCatalog::InvalidateSchemaCache(idx_t schema_version) {

@@ -94,6 +94,9 @@ public:
 	void SetPartitionData(unique_ptr<DuckLakePartition> partition_data);
 	void SetSortData(unique_ptr<DuckLakeSort> sort_data);
 	shared_ptr<DuckLakeTableStats> GetTableStats(ClientContext &context);
+	//! Cardinality-only stats, for catalog listings that read no column statistics.
+	shared_ptr<DuckLakeTableCardinality> GetTableCardinality(ClientContext &context);
+	shared_ptr<DuckLakeTableCardinality> GetTableCardinality(DuckLakeTransaction &transaction);
 	shared_ptr<DuckLakeTableStats> GetTableStats(DuckLakeTransaction &transaction);
 	idx_t GetNetDataFileRowCount(DuckLakeTransaction &transaction);
 	idx_t GetNetInlinedRowCount(DuckLakeTransaction &transaction);

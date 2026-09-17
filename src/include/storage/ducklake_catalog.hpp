@@ -23,6 +23,7 @@
 
 namespace duckdb {
 struct DuckLakeGlobalStatsInfo;
+struct DuckLakeTableCardinalityInfo;
 class ColumnList;
 class DuckLakeFieldData;
 struct DuckLakeFileListEntry;
@@ -42,6 +43,37 @@ struct DuckLakeTableStatsCacheEntry : public ObjectCacheEntry {
 
 	static string ObjectType() {
 		return "ducklake_table_stats";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override;
+};
+
+//! The WHOLE snapshot's table cardinalities, cached as ONE entry keyed by
+//! next_file_id. Separate from DuckLakeTableStatsCacheEntry so a catalog listing
+//! never has to materialize column statistics it does not read.
+//!
+//! Deliberately one entry rather than one per table. A table with no
+//! ducklake_table_stats row (created, never written) has no per-table entry to
+//! cache, so per-table caching would re-run the full-catalog query for every such
+//! table -- K never-written tables would cost K+1 full scans instead of 1, which
+//! is worse than the per-table queries this path replaced. Caching the map also
+//! makes the hit/miss decision atomic: with per-table entries plus a
+//! "loaded" sentinel, an ObjectCache eviction of individual entries while the
+//! sentinel survived would silently report cardinality 0 for a table that has
+//! stats.
+struct DuckLakeTableCardinalityCacheEntry : public ObjectCacheEntry {
+	explicit DuckLakeTableCardinalityCacheEntry(unordered_map<idx_t, DuckLakeTableCardinality> cardinalities_p)
+	    : cardinalities(std::move(cardinalities_p)) {
+	}
+
+	//! Keyed by TableIndex::index. Absent means "no stats row at this snapshot",
+	//! which is a definitive answer, not a cache miss.
+	unordered_map<idx_t, DuckLakeTableCardinality> cardinalities;
+
+	static string ObjectType() {
+		return "ducklake_table_cardinality";
 	}
 	string GetObjectType() override {
 		return ObjectType();
@@ -164,6 +196,13 @@ public:
 	shared_ptr<DuckLakeTableStats> GetTableStats(DuckLakeTransaction &transaction, TableIndex table_id);
 	shared_ptr<DuckLakeTableStats> GetTableStats(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot,
 	                                             TableIndex table_id);
+	//! Cardinality-only lookup for catalog listings. On a cache miss this loads the
+	//! cardinality of EVERY table in one query and caches the whole map, so listing a
+	//! catalog of N tables costs one round-trip rather than N -- including tables
+	//! that have no stats row at all.
+	shared_ptr<DuckLakeTableCardinality> GetTableCardinality(DuckLakeTransaction &transaction, TableIndex table_id);
+	shared_ptr<DuckLakeTableCardinality> GetTableCardinality(DuckLakeTransaction &transaction,
+	                                                         DuckLakeSnapshot snapshot, TableIndex table_id);
 
 	optional_ptr<CatalogEntry> GetEntryById(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot,
 	                                        SchemaIndex schema_id);
@@ -266,6 +305,10 @@ public:
 
 	//! Invalidate the cached table stats entry for a given stats cache key.
 	void InvalidateTableStatsCache(idx_t next_file_id, TableIndex table_id);
+	//! Invalidate the cached cardinality map for a snapshot. Takes a table_id only
+	//! to mirror InvalidateTableStatsCache's call sites; the whole map is dropped
+	//! because it is a single cache entry.
+	void InvalidateTableCardinalityCache(idx_t next_file_id, TableIndex table_id);
 	//! Invalidate the cached schema entry for a given schema_version.
 	void InvalidateSchemaCache(idx_t schema_version);
 
@@ -279,6 +322,7 @@ private:
 	void PinSchemaForQuery(DuckLakeTransaction &transaction, shared_ptr<DuckLakeSchemaCacheEntry> entry);
 	void LoadNameMaps(DuckLakeTransaction &transaction);
 	string StatsCacheKey(idx_t next_file_id, TableIndex table_id) const;
+	string CardinalityCacheKey(idx_t next_file_id) const;
 	string SchemaCacheKey(idx_t schema_version) const;
 	string SchemaPinStateKey() const;
 	ObjectCache &GetObjectCacheInstance();
