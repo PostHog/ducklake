@@ -1,0 +1,81 @@
+# name: test/sql/general/table_cardinality_batch.test
+# description: cardinality lookups for catalog listings are batched into one metadata query and cached, including negative results for tables with no stats row
+# group: [general]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/table_cardinality_batch_files', METADATA_CATALOG 'ducklake_meta')
+
+# one table with a stats row, two without (created but never written)
+statement ok
+CREATE TABLE ducklake.has_stats AS FROM range(100);
+
+statement ok
+CREATE TABLE ducklake.no_stats_a (i INTEGER);
+
+statement ok
+CREATE TABLE ducklake.no_stats_b (i INTEGER);
+
+# the DuckLakeMetadata log records every metadata query; use it to count how often the
+# catalog-wide cardinality query runs. Note: count raw duckdb_logs() entries rather than
+# duckdb_logs_parsed(), whose context join does not survive truncate_duckdb_logs().
+statement ok
+CALL enable_logging('DuckLakeMetadata');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# first listing: the catalog-wide cardinality query runs exactly ONCE for all three tables,
+# even though two of them have no stats row
+query I
+SELECT sum(estimated_size) FROM duckdb_tables() WHERE database_name = 'ducklake'
+----
+100
+
+query II
+SELECT count(*) > 0, count(*) FILTER (message LIKE '%SELECT table_id, record_count, next_row_id, file_size_bytes%') FROM duckdb_logs()
+----
+true	1
+
+# second listing: fully served from the cache - the cardinality query does NOT run again.
+# Without negative caching of missing stats rows, the two never-written tables would each
+# re-run the catalog-wide query here.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT sum(estimated_size) FROM duckdb_tables() WHERE database_name = 'ducklake'
+----
+100
+
+query II
+SELECT count(*) > 0, count(*) FILTER (message LIKE '%SELECT table_id, record_count, next_row_id, file_size_bytes%') FROM duckdb_logs()
+----
+true	0
+
+# invalidation: an INSERT creates the stats row for no_stats_a (and a new snapshot), so the
+# next listing must re-load and see the fresh value rather than the cached absence
+statement ok
+INSERT INTO ducklake.no_stats_a VALUES (1), (2), (3);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT table_name, estimated_size FROM duckdb_tables() WHERE database_name = 'ducklake' ORDER BY table_name
+----
+has_stats	100
+no_stats_a	3
+no_stats_b	0
+
+query II
+SELECT count(*) > 0, count(*) FILTER (message LIKE '%SELECT table_id, record_count, next_row_id, file_size_bytes%') FROM duckdb_logs()
+----
+true	1
