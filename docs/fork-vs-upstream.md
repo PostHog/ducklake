@@ -41,7 +41,7 @@ New `publish-github-release` job (tag pushes only): downloads the linux amd64/ar
 
 ### 3. Action SHA pinning in existing workflows
 
-`Catalogs.yml`, `ConfigTests.yml`, `Debug.yml`, `DeletionVectors.yml`, `DuckLakeVersion.yml`, `MinIO.yml`, `NoInline.yml`: tags replaced with full-length SHAs (e.g. `actions/checkout@f43a0e5... # v3.6.0`, `ikalnytskyi/action-setup-postgres@10ab8a5... # v7`).
+`Catalogs.yml`, `ConfigTests.yml`, `Debug.yml`, `DeletionVectors.yml`, `DuckLakeVersion.yml`, `NoInline.yml`, `SeaweedFS.yml`: tags replaced with full-length SHAs (e.g. `actions/checkout@f43a0e5... # v3.6.0`, `ikalnytskyi/action-setup-postgres@10ab8a5... # v7`).
 
 ### 4. Tooling and repo hygiene
 
