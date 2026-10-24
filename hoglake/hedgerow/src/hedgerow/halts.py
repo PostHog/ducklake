@@ -79,3 +79,18 @@ class PersistentFailureError(HaltError):
     halting instead of retrying forever."""
 
     exit_code = 9
+
+
+class UnsafeParquetCodecError(HaltError):
+    """The data file carries a column chunk in a codec whose decoder we
+    will not run (today: BROTLI). Apache Arrow statically links a Brotli
+    built from google/brotli v1.0.9 (cpp/thirdparty/versions.txt), which
+    predates the fix for CVE-2026-111497: a crafted Brotli stream drives an
+    out-of-bounds write inside the decoder's own state, so a parquet file
+    is attacker-controlled input to memory-unsafe C++ that runs in this
+    process. pyarrow exposes no runtime switch and the wheel we install
+    cannot be rebuilt here, so the file is unreadable — safely. Retrying
+    can never change that, and continuing past it would mean matching the
+    change plan's row count on fewer bytes: HALT, loudly, with the fix."""
+
+    exit_code = 10

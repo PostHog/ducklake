@@ -480,3 +480,37 @@ def test_source_recreate_between_resolve_and_changes_is_caught():
         env.daemon.run_once()
     assert env.offset() is None
     assert env.dest_table.total_rows == 0
+
+
+def test_brotli_compressed_parquet_halts_instead_of_decoding():
+    """CVE-2026-111497 ("Node2Shell"): the Brotli that Apache Arrow bundles
+    (google/brotli v1.0.9, per cpp/thirdparty/versions.txt) predates the fix,
+    so a crafted stream drives an out-of-bounds write inside the decoder's
+    own state — from a parquet page, inside this process. A BROTLI column
+    chunk is therefore data we must not decompress: the reader HALTs from
+    the footer alone (no page decoded, nothing retried) and names the
+    remedy. Control: a codec we do bundle safely still streams."""
+    table = pa.table({"id": pa.array(range(16), pa.int64())})
+
+    def reader_for(compression):
+        sink = io.BytesIO()
+        pq.write_table(table, sink, compression=compression)
+        raw = sink.getvalue()
+
+        class _LocalFS:
+            def open_input_file(self, key):
+                return pa.BufferReader(raw)
+
+        return make_s3_batch_reader(_LocalFS())
+
+    from hedgerow import HaltError, UnsafeParquetCodecError
+
+    # a halt, not a transient error: the loop must not replay the window
+    assert issubclass(UnsafeParquetCodecError, HaltError)
+    with pytest.raises(UnsafeParquetCodecError, match="BROTLI"):
+        list(reader_for("BROTLI")("s3://fake/brotli.parquet", ["id"], 4096))
+
+    rows = sum(
+        b.num_rows for b in reader_for("ZSTD")("s3://fake/zstd.parquet", ["id"], 4096)
+    )
+    assert rows == 16
