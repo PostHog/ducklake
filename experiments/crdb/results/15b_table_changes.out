@@ -1,0 +1,10 @@
+┌─────────────┬───────┬──────────────────┐
+│ snapshot_id │ rowid │   change_type    │
+│    int64    │ int64 │     varchar      │
+├─────────────┼───────┼──────────────────┤
+│           3 │     0 │ update_postimage │
+│           2 │     0 │ insert           │
+│           2 │     1 │ insert           │
+│           3 │     0 │ update_preimage  │
+│           4 │     1 │ delete           │
+└─────────────┴───────┴──────────────────┘

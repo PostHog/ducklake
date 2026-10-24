@@ -1,0 +1,8 @@
+Catalog Error: Table Function with name flush_inlined_data does not exist!
+Did you mean "main.ducklake_flush_inlined_data"?
+┌───────┬───────────┐
+│   i   │     s     │
+│ int32 │  varchar  │
+├───────┼───────────┤
+│     1 │ inline-me │
+└───────┴───────────┘
