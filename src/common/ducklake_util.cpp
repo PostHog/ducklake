@@ -528,4 +528,18 @@ void DuckLakeUtil::CopyExtensionSettings(ClientContext &from, ClientContext &to)
 	}
 }
 
+void DuckLakeUtil::ValidateParquetCompression(const string &codec) {
+	// CVE-2026-111497 ("Node2Shell"): the Brotli decoder bundled in DuckDB - and in every other
+	// stock reader of our data files - predates the upstream fix (google/brotli 1.0.10 / 1.1.1 /
+	// 1.2.1). A crafted stream writes out of bounds inside the decoder's own state, so a
+	// brotli-compressed parquet file is not safe to READ. Writing one manufactures input that
+	// downstream readers (fixtures, pyarrow, Node, older DuckDB builds) will decode in memory-unsafe
+	// code, so refuse to produce it at all. zstd is both smaller and safe: use that.
+	if (StringUtil::CIEquals(codec, "brotli")) {
+		throw NotImplementedException("parquet_compression 'brotli' is no longer supported: files it produces "
+		                              "are unsafe to read (CVE-2026-111497 - the Brotli decoder in DuckDB and "
+		                              "other readers predates the upstream fix). Rewrite with 'zstd' instead.");
+	}
+}
+
 } // namespace duckdb

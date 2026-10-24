@@ -41,6 +41,17 @@ CALL ducklake.set_option('parquet_compression', 'lz4', schema => 's1')
 statement ok
 CALL ducklake.set_option('parquet_compression', 'gzip', schema => 's1', table_name => 't1')
 
+# brotli is refused outright: CVE-2026-111497 makes the files it writes unsafe to read
+statement error
+CALL ducklake.set_option('parquet_compression', 'brotli')
+----
+CVE-2026-111497
+
+statement error
+CALL ducklake.set_option('parquet_compression', 'BROTLI', table_name => 't1')
+----
+CVE-2026-111497
+
 # non-existent schema/table
 statement error
 CALL ducklake.set_option('parquet_compression', 'gzip', table_name => 'nonexistent_table')
