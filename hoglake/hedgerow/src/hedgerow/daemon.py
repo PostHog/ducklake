@@ -79,6 +79,7 @@ from .halts import (
     IncarnationChangedError,
     PersistentFailureError,
     SplitBrainError,
+    UnsafeParquetCodecError,
 )
 from .metrics import NullMetrics, build_metrics
 from .projection import ProjectionPlan, validate_projection
@@ -119,6 +120,47 @@ class CycleResult:
         return self.lag_snapshots > 0
 
 
+# Codecs we refuse to hand to pyarrow. Arrow statically links a Brotli from
+# google/brotli v1.0.9 (cpp/thirdparty/versions.txt pins
+# ARROW_BROTLI_BUILD_VERSION=v1.0.9), i.e. before the CVE-2026-111497 fix
+# (1.0.10 / 1.1.1 / 1.2.1). A crafted Brotli stream overflows the decoder's
+# own state, so a parquet column chunk is attacker-controlled input to
+# memory-unsafe C++ running in this process. pyarrow gives us no runtime
+# switch and we cannot rebuild the wheel here: refuse the FILE, not the
+# frame, so the failure is loud and never retried.
+_UNSAFE_PARQUET_CODECS = frozenset({"BROTLI"})
+
+
+def _codec_name(chunk) -> str:
+    """pyarrow spells codecs either bare (``BROTLI``) or qualified
+    (``Compression.BROTLI``) depending on version; normalize both."""
+    return str(chunk.compression).rsplit(".", 1)[-1].upper()
+
+
+def _reject_unsafe_parquet_codecs(pf: pq.ParquetFile, path: str) -> None:
+    """Scan the footer (metadata only — no page is decoded) and HALT on a
+    column chunk we will not decompress. A window is one change set: one
+    unsafe file means the whole window is unsafe, and skipping it would
+    cover rows that were never read."""
+    metadata = pf.metadata
+    if metadata is None:  # pragma: no cover — footer always parsed here
+        return
+    for rg in range(metadata.num_row_groups):
+        row_group = metadata.row_group(rg)
+        for column in range(row_group.num_columns):
+            chunk = row_group.column(column)
+            codec = _codec_name(chunk)
+            if codec in _UNSAFE_PARQUET_CODECS:
+                raise UnsafeParquetCodecError(
+                    f"{path}: row group {rg} column {chunk.path_in_schema!r} "
+                    f"is {codec}-compressed; refusing to decode it "
+                    "(CVE-2026-111497: Arrow's bundled Brotli decoder is "
+                    "memory-unsafe and has no fixed wheel yet). Rewrite the "
+                    "table with parquet_compression='zstd' "
+                    "(or 'snappy') and replay this window."
+                )
+
+
 def make_s3_batch_reader(fs) -> BatchReader:
     """Default reader: stream a parquet file from object storage
     batch-by-batch (bounded memory, lesson #5 — never the whole file)."""
@@ -131,6 +173,7 @@ def make_s3_batch_reader(fs) -> BatchReader:
         key = path[len("s3://") :]
         with fs.open_input_file(key) as fh:
             pf = pq.ParquetFile(fh)
+            _reject_unsafe_parquet_codecs(pf, path)
             yield from pf.iter_batches(batch_size=batch_size, columns=list(columns))
 
     return read

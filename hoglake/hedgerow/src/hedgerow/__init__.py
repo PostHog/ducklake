@@ -26,6 +26,7 @@ from .halts import (
     PersistentFailureError,
     SchemaMismatchError,
     SplitBrainError,
+    UnsafeParquetCodecError,
 )
 from .projection import ProjectionPlan, validate_projection
 from .window import Window, plan_window
@@ -52,6 +53,7 @@ __all__ = [
     "SchemaMismatchError",
     "SourceConfig",
     "SplitBrainError",
+    "UnsafeParquetCodecError",
     "Window",
     "__version__",
     "load_config",
