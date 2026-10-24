@@ -42,6 +42,8 @@ public:
 	static string ValueToSQL(DuckLakeMetadataManager &metadata_manager, ClientContext &context, const Value &val);
 
 	static ParsedCatalogEntry ParseCatalogEntry(const string &input);
+	//! Throw if this parquet codec may not be used to WRITE data files (see CVE-2026-111497)
+	static void ValidateParquetCompression(const string &codec);
 	static string JoinPath(FileSystem &fs, const string &a, const string &b);
 
 	static shared_ptr<DynamicFilterData> GetOptionalDynamicFilterData(const TableFilter &filter);

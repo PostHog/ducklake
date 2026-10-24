@@ -510,6 +510,9 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	auto &table_id = copy_input.table_id;
 	string parquet_compression;
 	if (catalog.TryGetConfigOption("parquet_compression", parquet_compression, schema_id, table_id)) {
+		// a catalog written before brotli was refused (or by another client) can still carry it; refuse
+		// to keep producing files nobody can safely read
+		DuckLakeUtil::ValidateParquetCompression(parquet_compression);
 		info->options["compression"].emplace_back(parquet_compression);
 	}
 	string parquet_version;
